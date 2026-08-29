@@ -20,7 +20,7 @@ cargo install --path .
 
 # 2. Add your keys (https://ollama.com/settings/keys)
 mkdir -p ~/.config/omlx
-printf '%s\n' 'omk-key-one...' 'omk-key-two...' > ~/.config/omlx/keys
+printf '%s\n' 'your-key-one...' 'your-key-two...' > ~/.config/omlx/keys
 chmod 600 ~/.config/omlx/keys
 
 # 3. Point any Ollama client at it
@@ -45,9 +45,9 @@ Optionally set a per-key concurrency limit with a `:N` suffix — the number of
 cloud models that account may run at once (free=1, pro=3, max=10):
 
 ```
-omk-free-account...:1
-omk-pro-account...:3        # default when no suffix is given
-omk-max-account...:10
+your-free-key...:1
+your-pro-key...:3           # default when no suffix is given
+your-max-key...:10
 ```
 
 The proxy keeps at most N requests in flight per key (matching Ollama

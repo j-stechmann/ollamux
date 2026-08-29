@@ -37,7 +37,7 @@ impl std::fmt::Display for ParseError {
         match self {
             ParseError::NotFound(p) => write!(
                 f,
-                "no keys found: set OMLX_KEYS or create {} (one `omk-...` key per line)",
+                "no keys found: set OMLX_KEYS or create {} (one API key per line)",
                 p.display()
             ),
             ParseError::BadLine(line) => {
@@ -101,12 +101,6 @@ impl Keys {
                 }
                 _ => (line, DEFAULT_CONCURRENCY),
             };
-            if !key.starts_with("omk-") {
-                eprintln!(
-                    "omlx: warning: key {:?} does not look like an API key (expected prefix `omk-`)",
-                    redact(key)
-                );
-            }
             entries.push((key.to_string(), conc.max(1)));
         }
         if let Some(src) = warn_source {
@@ -155,10 +149,6 @@ pub fn suffix(key: &str) -> String {
     key[key.len() - n..].to_string()
 }
 
-fn redact(key: &str) -> String {
-    format!("…omk-{}", suffix(key))
-}
-
 fn config_path() -> Result<PathBuf, ParseError> {
     if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
         if !xdg.is_empty() {
@@ -187,11 +177,11 @@ mod tests {
 
     #[test]
     fn colon_only_splits_on_digit_tail() {
-        let k = Keys::parse("omk-abc:3", None).unwrap();
+        let k = Keys::parse("key-abc:3", None).unwrap();
         assert_eq!(k.entries.first().unwrap().1, 3);
         // A colon in the middle of a key is not a splitter.
-        let k = Keys::parse("omk-abc:def", None).unwrap();
-        assert_eq!(k.entries.first().unwrap().0, "omk-abc:def");
+        let k = Keys::parse("key-abc:def", None).unwrap();
+        assert_eq!(k.entries.first().unwrap().0, "key-abc:def");
         assert_eq!(k.entries.first().unwrap().1, DEFAULT_CONCURRENCY);
     }
 
@@ -203,7 +193,7 @@ mod tests {
 
     #[test]
     fn suffix_is_last_four() {
-        assert_eq!(suffix("omk-abcdefgh"), "efgh");
+        assert_eq!(suffix("key-abcdefgh"), "efgh");
         assert_eq!(suffix("abc"), "abc");
     }
 }
