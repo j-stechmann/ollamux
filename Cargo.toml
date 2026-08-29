@@ -1,0 +1,18 @@
+[package]
+name = "omlx"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Key-rotating reverse proxy for the Ollama Cloud API"
+license = "MIT"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tiny_http = { version = "0.12", default-features = false }
+ureq = { version = "2", default-features = false, features = ["tls", "gzip"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
