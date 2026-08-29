@@ -34,6 +34,9 @@ pub enum ParseError {
         line: String,
         tail: String,
     },
+    /// A keys source was found but yielded zero keys (all lines blank or
+    /// `#` comments, or the env var held nothing usable).
+    Empty(String),
     Io(std::io::Error),
 }
 
@@ -52,6 +55,7 @@ impl std::fmt::Display for ParseError {
                 f,
                 "invalid concurrency {tail:?} in key line (want `KEY:N`, N = 1..=u32::MAX): {line:?}"
             ),
+            ParseError::Empty(msg) => write!(f, "no keys: {msg}"),
             ParseError::Io(e) => write!(f, "reading keys: {e}"),
         }
     }
@@ -78,7 +82,7 @@ impl Keys {
         if let Ok(raw) = std::env::var("OMLX_KEYS") {
             let keys = Self::parse(&raw, None)?;
             if keys.entries.is_empty() {
-                return Err(ParseError::BadLine("OMLX_KEYS is set but empty".into()));
+                return Err(ParseError::Empty("OMLX_KEYS is set but empty".into()));
             }
             return Ok(keys);
         }
@@ -103,7 +107,7 @@ impl Keys {
     /// rather than serving 503s for every request.
     fn require_nonempty(keys: Keys, msg: &str) -> Result<Keys, ParseError> {
         if keys.entries.is_empty() {
-            Err(ParseError::BadLine(msg.to_string()))
+            Err(ParseError::Empty(msg.to_string()))
         } else {
             Ok(keys)
         }
@@ -199,7 +203,7 @@ fn config_path() -> Result<PathBuf, ParseError> {
         }
     }
     let home = std::env::var("HOME").map_err(|_| {
-        ParseError::BadLine("HOME not set and OMLX_KEYS unset; cannot locate keys".into())
+        ParseError::Empty("HOME not set and OMLX_KEYS unset; cannot locate keys".into())
     })?;
     Ok(PathBuf::from(home).join(".config/omlx/keys"))
 }

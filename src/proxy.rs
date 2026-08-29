@@ -379,9 +379,11 @@ impl Server {
                 Attempt::Retryable(format!("upstream {status}"))
             }
             _ => {
-                // Other 4xx (client's fault) is relayed verbatim; the URL is
-                // our only upstream, so a 3xx reached here unfollowed is
-                // relayed too; neither is a key-health signal.
+                // Other 4xx (client's fault) is relayed verbatim; it is not
+                // a key-health signal. Nothing reaches here for 3xx: with
+                // redirects disabled, ureq returns a 3xx as Ok (unit.rs
+                // breaks the loop before the >=400 mapping), so redirects
+                // relay via the success path in `attempt` instead.
                 Self::relay_error(
                     RelayCx {
                         pool: &self.pool,
