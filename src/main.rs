@@ -22,6 +22,15 @@ struct Config {
 }
 
 fn main() {
+    // FIRST THING, before any thread can exist (theirs or ours): block
+    // SIGINT. POSIX threads inherit the caller's mask, so every thread
+    // spawned later (tiny_http's accept thread, omlx workers, the sigwait
+    // thread) starts with SIGINT blocked and the signal stays
+    // process-pending for `sigwait`. Doing this after spawning left those
+    // threads eligible for default delivery: instant death, no drain.
+    #[cfg(unix)]
+    block_sigint_before_threading();
+
     let cfg = match parse_args(std::env::args().skip(1)) {
         Ok(Some(cfg)) => cfg,
         Ok(None) => return, // --help / --version already printed
@@ -38,6 +47,10 @@ fn main() {
             std::process::exit(1);
         }
     };
+    if keys.is_empty() {
+        eprintln!("omlx: no keys configured; refusing to start");
+        std::process::exit(1);
+    }
 
     let pool = Arc::new(omlx::Pool::new(
         keys.entries.clone(),
@@ -64,11 +77,9 @@ fn main() {
     );
     eprintln!("omlx: point clients at http://{addr} (OLLAMA_HOST or base_url …/v1)");
 
-    // --- worker threads ---
     let stop = Arc::new(AtomicBool::new(false));
     spawn_workers(tiny.clone(), proxy.clone(), stop.clone());
 
-    // --- ctrl-c ---
     let stop_ctrl = stop.clone();
     install_sigint(move || {
         stop_ctrl.store(true, Ordering::SeqCst);
@@ -133,8 +144,21 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Config>, Stri
         verbose: false,
     };
     let mut it = args;
+    // Splits `--opt=value` into (`--opt`, Some(`value`)); plain `--opt`
+    // yields (arg, None) and its value comes from the next argv entry.
+    fn split_kv(arg: &str) -> (&str, Option<&str>) {
+        match arg.split_once('=') {
+            Some((k, v)) if k.starts_with("--") => (k, Some(v)),
+            _ => (arg, None),
+        }
+    }
     while let Some(arg) = it.next() {
-        match arg.as_str() {
+        let (flag, inline) = split_kv(&arg);
+        let mut value = || match inline {
+            Some(v) => Ok(v.to_string()),
+            None => it.next().ok_or(format!("missing value for {flag}")),
+        };
+        match flag {
             "-h" | "--help" => {
                 print_help();
                 return Ok(None);
@@ -143,11 +167,9 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Config>, Stri
                 println!("omlx {}", omlx::VERSION);
                 return Ok(None);
             }
-            "-a" | "--addr" => cfg.addr = it.next().ok_or("missing value for --addr")?,
+            "-a" | "--addr" => cfg.addr = value()?,
             "-k" | "--keys" => {
-                cfg.keys_path = Some(std::path::PathBuf::from(
-                    it.next().ok_or("missing value for --keys")?,
-                ));
+                cfg.keys_path = Some(std::path::PathBuf::from(value()?));
             }
             "-v" | "--verbose" => cfg.verbose = true,
             _other => return Err(format!("unknown argument: {arg:?}")),
@@ -189,6 +211,36 @@ ENDPOINTS:
 }
 
 // --- SIGINT via sigwait (no external crates, no async-signal-unsafe work) ---
+//
+// Correct delivery requires SIGINT blocked in every thread. `main` calls
+// `block_sigint_before_threading()` before spawning; POSIX guarantees each
+// `spawn`ed thread inherits that mask, so the signal can only ever become
+// process-pending and is consumed exclusively by the `sigwait` below.
+
+#[cfg(unix)]
+fn block_sigint_before_threading() {
+    #[repr(C)]
+    struct SigSet([u64; 16]);
+
+    unsafe extern "C" {
+        fn sigemptyset(set: *mut SigSet) -> i32;
+        fn sigaddset(set: *mut SigSet, signum: i32) -> i32;
+        fn pthread_sigmask(how: i32, set: *const SigSet, old: *mut SigSet) -> i32;
+    }
+
+    const SIGINT: i32 = 2;
+    const SIG_BLOCK: i32 = 0;
+
+    unsafe {
+        let mut set = SigSet([0; 16]);
+        sigemptyset(&mut set);
+        sigaddset(&mut set, SIGINT);
+        let rc = pthread_sigmask(SIG_BLOCK, &set, std::ptr::null_mut());
+        if rc != 0 {
+            eprintln!("omlx: warning: cannot block SIGINT ({rc}); ctrl-c will hard-exit");
+        }
+    }
+}
 
 fn install_sigint<F>(notify: F)
 where
@@ -212,6 +264,8 @@ fn sigint_thread<F: Fn()>(notify: F) {
     const SIG_BLOCK: i32 = 0;
 
     unsafe {
+        // Idempotent belt-and-braces: this thread also blocks SIGINT in
+        // case it was EVER started from a non-blocked context (e.g. tests).
         let mut set = SigSet([0; 16]);
         sigemptyset(&mut set);
         sigaddset(&mut set, SIGINT);

@@ -35,27 +35,56 @@ const SNIPPET: u64 = 256;
 const UPSTREAM: &str = "https://ollama.com";
 
 /// No-auth upstream paths: single attempt; never rotate, never mark keys.
+/// Stored WITH a leading slash; route() passes trimmed paths, so matching
+/// normalizes both (an earlier build compared trimmed to untrimmed and the
+/// fast path never fired).
 const NO_AUTH_PATHS: &[&str] = &["/api/tags", "/api/version", "/v1/models"];
+
+fn is_no_auth_path(path: &str) -> bool {
+    NO_AUTH_PATHS
+        .iter()
+        .any(|p| p.trim_start_matches('/') == path)
+}
 
 static REQ_ID: AtomicUsize = AtomicUsize::new(1);
 
 pub struct Server {
     pub pool: Arc<Pool>,
     agent: ureq::Agent,
+    /// Base URL of the upstream ("https://ollama.com"); injectable so tests
+    /// can run hermetically against a local server.
+    upstream: String,
 }
 
 impl Server {
     pub fn new(pool: Arc<Pool>) -> Server {
+        Self::with_upstream(pool, UPSTREAM)
+    }
+
+    /// Test seam: point the proxy at a different (e.g. local) upstream.
+    /// HTTPS-only enforcement follows the scheme of `upstream`.
+    #[doc(hidden)]
+    pub fn with_upstream(pool: Arc<Pool>, upstream: &str) -> Server {
         let slots = pool.total_slots().max(4) as usize;
+        let https_only = upstream.starts_with("https://");
         let agent = ureq::AgentBuilder::new()
             .timeout_connect(UP_CONNECT_TIMEOUT)
             .timeout_read(UP_READ_TIMEOUT)
             .timeout_write(UP_WRITE_TIMEOUT)
+            // Failover semantics require 3xx to be an error, not a followed
+            // redirect: a hop to a CDN login page or another host must be
+            // classified/relayed explicitly, and Authorization must never
+            // ride an off-site redirect.
+            .redirects(0)
             .max_idle_connections(slots.next_power_of_two() * 2)
             .max_idle_connections_per_host(slots)
-            .https_only(true)
+            .https_only(https_only)
             .build();
-        Server { pool, agent }
+        Server {
+            pool,
+            agent,
+            upstream: upstream.trim_end_matches('/').to_string(),
+        }
     }
 
     /// Serve one request.
@@ -63,9 +92,13 @@ impl Server {
         let id = REQ_ID.fetch_add(1, Ordering::Relaxed);
         let started = Instant::now();
         let method = req.method().as_str().to_string();
-        let path = req.url().split('?').next().unwrap_or("").to_string();
+        let full_url = req.url().to_string();
+        let (path, query) = match full_url.split_once('?') {
+            Some((p, q)) => (p.to_string(), Some(q.to_string())),
+            None => (full_url, None),
+        };
 
-        let (status, retries, key) = self.route(req, &path);
+        let (status, retries, key) = self.route(req, &path, query.as_deref());
 
         eprintln!(
             "omlx: #{id} {method} {path} -> {status}{}{} dur={}ms",
@@ -80,7 +113,12 @@ impl Server {
     }
 
     /// Returns (client-visible status, retries used, key suffix if proxied).
-    fn route(&self, req: tiny_http::Request, path: &str) -> (u16, usize, Option<String>) {
+    fn route(
+        &self,
+        req: tiny_http::Request,
+        path: &str,
+        query: Option<&str>,
+    ) -> (u16, usize, Option<String>) {
         let path = path.trim_start_matches('/');
         if path == "_keys" {
             let body = serde_json::to_value(self.pool.info()).unwrap_or_default();
@@ -96,8 +134,11 @@ impl Server {
             json_response(req, 200, &body.to_string(), None);
             return (200, 0, None);
         }
-        if path.starts_with("api/") || path.starts_with("v1/") {
-            return self.proxy(req, path);
+        if path.starts_with("api/") {
+            return self.proxy(req, path, query, false);
+        }
+        if path.starts_with("v1/") {
+            return self.proxy(req, path, query, true);
         }
         // Hintful 404: top confusion is expecting a local Ollama server.
         json_response(
@@ -111,9 +152,14 @@ impl Server {
 
     // ----- proxy core -----
 
-    fn proxy(&self, mut req: tiny_http::Request, path: &str) -> (u16, usize, Option<String>) {
-        let is_v1 = path.starts_with("v1");
-        let no_auth = NO_AUTH_PATHS.contains(&path);
+    fn proxy(
+        &self,
+        mut req: tiny_http::Request,
+        sub_path: &str,
+        query: Option<&str>,
+        is_v1: bool,
+    ) -> (u16, usize, Option<String>) {
+        let no_auth = is_no_auth_path(sub_path);
 
         // 1. Buffer the body (needed for replay across failover attempts).
         let body = match read_body(&mut req) {
@@ -141,8 +187,9 @@ impl Server {
         if no_auth {
             let cx = AttemptCx {
                 body: &body,
-                path,
-                key: 0,
+                sub_path,
+                query,
+                key: None,
                 no_auth: true,
                 streaming,
                 retries: 0,
@@ -167,8 +214,9 @@ impl Server {
 
         let mut cx = AttemptCx {
             body: &body,
-            path,
-            key,
+            sub_path,
+            query,
+            key: Some(key),
             no_auth,
             streaming,
             retries,
@@ -176,11 +224,11 @@ impl Server {
         loop {
             match self.attempt(&cx, &mut req) {
                 Attempt::Sent(status) => {
-                    if status < 400 {
-                        self.pool.mark_ok(key);
+                    if let Some(k) = cx.key {
+                        self.pool.settle(k, status < 400);
                     }
-                    let sfx = self.pool.suffix_of(key);
-                    return (status, retries, Some(sfx));
+                    let sfx = cx.key.map(|k| self.pool.suffix_of(k));
+                    return (status, retries, sfx);
                 }
                 Attempt::Retryable(reason) => {
                     if retries + 1 >= MAX_ATTEMPTS || no_auth {
@@ -199,7 +247,7 @@ impl Server {
                         Ok((p, k)) => {
                             permit = p;
                             key = k;
-                            cx.key = k;
+                            cx.key = Some(k);
                             cx.retries = retries;
                         }
                         Err(rej) => {
@@ -218,23 +266,28 @@ impl Server {
     fn attempt(&self, cx: &AttemptCx, req: &mut tiny_http::Request) -> Attempt {
         let AttemptCx {
             body,
-            path,
+            sub_path,
+            query,
             key,
             no_auth,
             streaming,
             retries,
-            ..
-        } = *cx;
-        let url = format!("{UPSTREAM}/{path}");
+        } = cx;
+        let url = match query {
+            Some(q) if !q.is_empty() => format!("{}/{sub_path}?{q}", self.upstream),
+            _ => format!("{}/{sub_path}", self.upstream),
+        };
         let mut call = self.agent.request(req.method().as_str(), &url);
         for (name, value) in curated_request_headers(req) {
             call = call.set(&name, &value);
         }
-        if !no_auth {
-            call = call.set(
-                "Authorization",
-                &format!("Bearer {}", self.pool.secret_of(key)),
-            );
+        if let Some(k) = key {
+            if !*no_auth {
+                call = call.set(
+                    "Authorization",
+                    &format!("Bearer {}", self.pool.secret_of(*k)),
+                );
+            }
         }
         // Force identity: with decompression enabled, ureq transparently
         // decompresses and silently rewrites framing.
@@ -249,10 +302,10 @@ impl Server {
         let status = resp.status();
         let headers = curated_response_headers(&resp);
         let reader = resp.into_reader();
-        if streaming {
-            self.stream_chunked(take(req), status, &headers, reader, key, retries)
+        if *streaming {
+            self.stream_chunked(take(req), status, &headers, reader, *key, *retries)
         } else {
-            self.respond_buffered(take(req), status, &headers, reader, key, retries)
+            self.respond_buffered(take(req), status, &headers, reader, *key, *retries)
         }
     }
 
@@ -269,7 +322,9 @@ impl Server {
         let retry_after = resp.header("retry-after").map(str::to_string);
         let mut reader = resp.into_reader();
 
-        // Small snippet for logs / auth verdicts.
+        // Small snippet for logs / auth verdicts. The consumed bytes are
+        // passed along so `relay_error` can re-prepend them: relaying the
+        // remainder alone would hand clients a truncated error body.
         let mut snippet = Vec::new();
         let _ = (&mut reader).take(SNIPPET).read_to_end(&mut snippet);
         let snip = String::from_utf8_lossy(&snippet).into_owned();
@@ -279,19 +334,24 @@ impl Server {
             retries,
             no_auth,
             ..
-        } = *cx;
-        if no_auth {
+        } = cx;
+        let tries = *retries;
+        if *no_auth {
             // Nothing to learn about key health; relay verbatim.
             return Self::relay_error(
-                &self.pool,
-                take(req),
-                status,
-                &headers,
+                RelayCx {
+                    pool: &self.pool,
+                    req: take(req),
+                    status,
+                    headers: &headers,
+                    prefix: snippet,
+                    key: *key,
+                    retries: tries,
+                },
                 reader,
-                key,
-                retries,
             );
         }
+        let key = key.expect("classify on non-auth attempt always has a key");
 
         let unauthorized = match status {
             401 => true,
@@ -319,33 +379,42 @@ impl Server {
                 Attempt::Retryable(format!("upstream {status}"))
             }
             _ => {
-                // Other 4xx (client's fault) and 3xx (we don't follow):
-                // relay verbatim; not a key-health signal.
+                // Other 4xx (client's fault) is relayed verbatim; it is not
+                // a key-health signal. Nothing reaches here for 3xx: with
+                // redirects disabled, ureq returns a 3xx as Ok (unit.rs
+                // breaks the loop before the >=400 mapping), so redirects
+                // relay via the success path in `attempt` instead.
                 Self::relay_error(
-                    &self.pool,
-                    take(req),
-                    status,
-                    &headers,
+                    RelayCx {
+                        pool: &self.pool,
+                        req: take(req),
+                        status,
+                        headers: &headers,
+                        prefix: snippet,
+                        key: Some(key),
+                        retries: tries,
+                    },
                     reader,
-                    key,
-                    retries,
                 )
             }
         }
     }
 
     /// Relay small bodies (error statuses, no-auth endpoints): buffer and
-    /// answer via tiny_http with correct framing.
-    fn relay_error(
-        pool: &Pool,
-        req: tiny_http::Request,
-        status: u16,
-        headers: &[(String, String)],
-        mut reader: impl Read,
-        key: usize,
-        retries: usize,
-    ) -> Attempt {
-        let mut owned = Vec::new();
+    /// answer via tiny_http with correct framing. `prefix` holds the bytes
+    /// consumed for the log snippet so the body is relayed verbatim.
+    fn relay_error(cx: RelayCx<'_>, mut reader: impl Read) -> Attempt {
+        let RelayCx {
+            pool,
+            req,
+            status,
+            headers,
+            prefix,
+            key,
+            retries,
+        } = cx;
+        let mut owned = prefix;
+        owned.reserve(1024);
         let read_err = reader.read_to_end(&mut owned).is_err();
         let mut resp = tiny_http::Response::from_data(owned).with_status_code(status);
         for (n, v) in headers {
@@ -353,9 +422,10 @@ impl Server {
                 resp = resp.with_header(h);
             }
         }
-        resp = resp
-            .with_header(hv("X-Omlx-Key", &pool.suffix_of(key)))
-            .with_header(hv("X-Omlx-Retries", &retries.to_string()));
+        if let Some(k) = key {
+            resp = resp.with_header(hv("X-Omlx-Key", &pool.suffix_of(k)));
+        }
+        resp = resp.with_header(hv("X-Omlx-Retries", &retries.to_string()));
         let _ = req.respond(resp);
         Attempt::Sent(if read_err { 502 } else { status })
     }
@@ -369,22 +439,20 @@ impl Server {
         status: u16,
         headers: &[(String, String)],
         reader: impl Read + Send + 'static,
-        key: usize,
+        key: Option<usize>,
         retries: usize,
     ) -> Attempt {
+        let mut hs: Vec<tiny_http::Header> = headers
+            .iter()
+            .filter_map(|(n, v)| tiny_http::Header::from_bytes(n.as_bytes(), v.as_bytes()).ok())
+            .collect();
+        if let Some(k) = key {
+            hs.push(hv("X-Omlx-Key", &self.pool.suffix_of(k)));
+        }
+        hs.push(hv("X-Omlx-Retries", &retries.to_string()));
         let resp = tiny_http::Response::new(
             tiny_http::StatusCode(status),
-            {
-                let mut hs: Vec<tiny_http::Header> = headers
-                    .iter()
-                    .filter_map(|(n, v)| {
-                        tiny_http::Header::from_bytes(n.as_bytes(), v.as_bytes()).ok()
-                    })
-                    .collect();
-                hs.push(hv("X-Omlx-Key", &self.pool.suffix_of(key)));
-                hs.push(hv("X-Omlx-Retries", &retries.to_string()));
-                hs
-            },
+            hs,
             Box::new(reader),
             None,
             None,
@@ -405,21 +473,28 @@ impl Server {
         status: u16,
         headers: &[(String, String)],
         reader: impl Read,
-        key: usize,
+        key: Option<usize>,
         retries: usize,
     ) -> Attempt {
+        let http10 = req.http_version() < &tiny_http::HTTPVersion(1, 1);
         let mut w = req.into_writer();
-        let sfx = self.pool.suffix_of(key);
         let mut head = format!("HTTP/1.1 {status} {}\r\n", reason_phrase(status));
-        head.push_str(&format!(
-            "X-Omlx-Key: {sfx}\r\nX-Omlx-Retries: {retries}\r\n"
-        ));
+        if let Some(k) = key {
+            head.push_str(&format!("X-Omlx-Key: {}\r\n", self.pool.suffix_of(k)));
+        }
+        head.push_str(&format!("X-Omlx-Retries: {retries}\r\n"));
         for (n, v) in headers {
             if !n.eq_ignore_ascii_case("content-length") {
                 head.push_str(&format!("{n}: {v}\r\n"));
             }
         }
-        head.push_str("Transfer-Encoding: chunked\r\n\r\n");
+        if http10 {
+            // HTTP/1.0 has no chunked framing: rely on connection close to
+            // delimit the body (tiny_http keeps the writer open for us).
+            head.push_str("Connection: close\r\n\r\n");
+        } else {
+            head.push_str("Transfer-Encoding: chunked\r\n\r\n");
+        }
         if w.write_all(head.as_bytes()).is_err() || w.flush().is_err() {
             return Attempt::Sent(500);
         }
@@ -429,10 +504,14 @@ impl Server {
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
-                    let ok = w.write_all(format!("{n:x}\r\n").as_bytes()).is_ok()
-                        && w.write_all(&buf[..n]).is_ok()
-                        && w.write_all(b"\r\n").is_ok()
-                        && w.flush().is_ok();
+                    let ok = if http10 {
+                        w.write_all(&buf[..n]).is_ok() && w.flush().is_ok()
+                    } else {
+                        w.write_all(format!("{n:x}\r\n").as_bytes()).is_ok()
+                            && w.write_all(&buf[..n]).is_ok()
+                            && w.write_all(b"\r\n").is_ok()
+                            && w.flush().is_ok()
+                    };
                     if !ok {
                         // Client disconnected mid-stream.
                         return Attempt::Sent(200);
@@ -442,26 +521,43 @@ impl Server {
                     // Upstream died mid-stream: cannot failover after the
                     // first byte; terminate the chunked body so the client
                     // sees a (truncated) complete response.
-                    let _ = w.write_all(b"0\r\n\r\n");
-                    let _ = w.flush();
+                    if !http10 {
+                        let _ = w.write_all(b"0\r\n\r\n");
+                        let _ = w.flush();
+                    }
                     eprintln!("omlx: upstream died mid-stream: {e}");
                     return Attempt::Sent(502);
                 }
             }
         }
-        let _ = w.write_all(b"0\r\n\r\n");
-        let _ = w.flush();
+        if !http10 {
+            let _ = w.write_all(b"0\r\n\r\n");
+            let _ = w.flush();
+        }
         Attempt::Sent(status)
     }
 }
 
-/// Per-attempt context, threaded through dispatch → classify.
+/// Per-attempt context, threaded through dispatch → classify. `key` is
+/// `None` for credential-less attempts (no-auth endpoints).
 struct AttemptCx<'a> {
     body: &'a [u8],
-    path: &'a str,
-    key: usize,
+    sub_path: &'a str,
+    query: Option<&'a str>,
+    key: Option<usize>,
     no_auth: bool,
     streaming: bool,
+    retries: usize,
+}
+
+/// Bundled args for `relay_error_impl` (keeps the clippy arg count sane).
+struct RelayCx<'a> {
+    pool: &'a Pool,
+    req: tiny_http::Request,
+    status: u16,
+    headers: &'a [(String, String)],
+    prefix: Vec<u8>,
+    key: Option<usize>,
     retries: usize,
 }
 
