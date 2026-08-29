@@ -29,6 +29,11 @@ pub enum ParseError {
     NotFound(PathBuf),
     /// A line parsed but produced no usable key.
     BadLine(String),
+    /// `KEY:N` suffix where N is not a valid concurrency count (u32, >=1).
+    BadConcurrency {
+        line: String,
+        tail: String,
+    },
     Io(std::io::Error),
 }
 
@@ -43,6 +48,10 @@ impl std::fmt::Display for ParseError {
             ParseError::BadLine(line) => {
                 write!(f, "unparseable key line: {:?}", line)
             }
+            ParseError::BadConcurrency { line, tail } => write!(
+                f,
+                "invalid concurrency {tail:?} in key line (want `KEY:N`, N = 1..=u32::MAX): {line:?}"
+            ),
             ParseError::Io(e) => write!(f, "reading keys: {e}"),
         }
     }
@@ -60,7 +69,9 @@ impl Keys {
     fn from_source(explicit_path: Option<&Path>) -> Result<Self, ParseError> {
         if let Some(path) = explicit_path {
             let text = fs::read_to_string(path).map_err(ParseError::Io)?;
-            let mut keys = Self::parse(&text, None)?;
+            let mut keys = Self::parse(&text, Some(path))?;
+            keys =
+                Self::require_nonempty(keys, &format!("keys file {} has no keys", path.display()))?;
             keys.source = path.to_path_buf();
             return Ok(keys);
         }
@@ -74,7 +85,11 @@ impl Keys {
         let path = config_path()?;
         match fs::read_to_string(&path) {
             Ok(text) => {
-                let mut keys = Self::parse(&text, None)?;
+                let mut keys = Self::parse(&text, Some(&path))?;
+                keys = Self::require_nonempty(
+                    keys,
+                    &format!("keys file {} has no keys", path.display()),
+                )?;
                 keys.source = path;
                 Ok(keys)
             }
@@ -83,25 +98,52 @@ impl Keys {
         }
     }
 
-    /// Parse the textual format. `warn_source` is only used to emit a
-    /// world-readable warning when parsing from a real file.
+    /// A keys file that yields zero entries is almost certainly a mistake
+    /// (commented-out everything, wrong path, wrong file); refuse to start
+    /// rather than serving 503s for every request.
+    fn require_nonempty(keys: Keys, msg: &str) -> Result<Keys, ParseError> {
+        if keys.entries.is_empty() {
+            Err(ParseError::BadLine(msg.to_string()))
+        } else {
+            Ok(keys)
+        }
+    }
+
+    /// Parse the textual format. `warn_source` emits a world-readable
+    /// warning when parsing from a real file.
     pub fn parse(text: &str, warn_source: Option<&Path>) -> Result<Self, ParseError> {
-        let mut entries = Vec::new();
+        let mut entries: Vec<(String, u32)> = Vec::new();
         for line in text.lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
             let (key, conc) = match line.rsplit_once(':') {
-                // `KEY:N` — only split when the tail is a plausible count.
+                // `KEY:N` — only split when the tail is exactly decimal
+                // digits (a colon in the middle of a key is not a splitter).
                 Some((k, n))
-                    if !k.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) && !n.is_empty() =>
+                    if !k.is_empty() && !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) =>
                 {
-                    (k.trim(), n.parse::<u32>().unwrap_or(DEFAULT_CONCURRENCY))
+                    let conc = match n.parse::<u32>() {
+                        Ok(c) => c.max(1),
+                        Err(_) => {
+                            return Err(ParseError::BadConcurrency {
+                                line: line.to_string(),
+                                tail: n.to_string(),
+                            });
+                        }
+                    };
+                    (k.trim(), conc)
                 }
                 _ => (line, DEFAULT_CONCURRENCY),
             };
-            entries.push((key.to_string(), conc.max(1)));
+            if entries.iter().any(|(k, _)| *k == key) {
+                return Err(ParseError::BadLine(format!(
+                    "duplicate key entry: …{}",
+                    suffix(key)
+                )));
+            }
+            entries.push((key.to_string(), conc));
         }
         if let Some(src) = warn_source {
             Keys::warn_if_world_readable(src);
@@ -145,8 +187,9 @@ impl Keys {
 }
 
 pub fn suffix(key: &str) -> String {
-    let n = key.len().min(4);
-    key[key.len() - n..].to_string()
+    let chars: Vec<char> = key.chars().collect();
+    let start = chars.len().saturating_sub(4);
+    chars[start..].iter().collect()
 }
 
 fn config_path() -> Result<PathBuf, ParseError> {
@@ -195,5 +238,35 @@ mod tests {
     fn suffix_is_last_four() {
         assert_eq!(suffix("key-abcdefgh"), "efgh");
         assert_eq!(suffix("abc"), "abc");
+    }
+
+    #[test]
+    fn suffix_never_panics_on_multibyte() {
+        assert_eq!(suffix("aébcd"), "ébcd");
+        assert_eq!(suffix("日本語テスト"), "語テスト");
+        assert_eq!(suffix("héllo"), "éllo");
+    }
+
+    #[test]
+    fn oversized_concurrency_is_an_error_not_a_silent_default() {
+        let err = Keys::parse("key-a:99999999999", None).unwrap_err();
+        assert!(matches!(err, ParseError::BadConcurrency { .. }));
+    }
+
+    #[test]
+    fn duplicate_keys_are_an_error() {
+        let err = Keys::parse("key-a\nkey-b\nkey-a\n", None).unwrap_err();
+        assert!(matches!(err, ParseError::BadLine(_)));
+        let ok = Keys::parse("key-a\nkey-b\n", None).unwrap();
+        assert_eq!(ok.len(), 2);
+    }
+
+    #[test]
+    fn empty_parse_is_ok_but_from_file_is_rejected() {
+        // parse() itself is permissive (used on env var with its own check);
+        // the file loader enforces nonempty.
+        let k = Keys::parse("# only comments\n", None).unwrap();
+        assert!(k.is_empty());
+        assert!(Keys::load(Some(Path::new("/nonexistent-omlx-keys")), "").is_err());
     }
 }

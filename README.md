@@ -74,7 +74,9 @@ model list, not local models.
 - **401/403 Unauthorized** (invalid key): the key is marked dead until
   restart; the request retries on the next key.
 - **5xx / network errors**: retry the next key; three consecutive failures
-  put a key in cooldown. Successes reset the counter.
+  put a key in cooldown. Successes reset the counter. (Merely *admitting* a
+  request to a key never resets its strike counter — only confirmed
+  upstream successes do.)
 - Everything else (e.g. a 400 from a malformed request) is passed through
   untouched — that's your bug, not a key problem.
 - Failover happens *before the first response byte*, so streaming responses
@@ -114,7 +116,21 @@ it to evade per-user limits you're not entitled to.
 ## Development
 
 ```sh
-cargo test          # unit + integration (integration hits real ollama.com lightly)
+cargo test          # unit + integration (hermetic: local upstream)
+cargo test --features net   # also hits real ollama.com lightly
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
+
+## Reliability notes
+
+- Invalid/concurrency counts in the keys file are startup errors, not
+  silently defaulted: `KEY:99999999999` refuses to start, duplicate key
+  lines are rejected (they would double-count slots), and a keys file
+  with only comments refuses to start.
+- Non-ASCII key lines are fine (suffixes use character boundaries).
+- Upstream redirects are not followed (the proxy classifies or relays
+  them verbatim); query strings are forwarded to upstream untouched.
+- Relayed upstream error bodies are byte-exact (no truncation).
+- SIGINT shutdown is signal-mask based: the first ctrl-c starts the
+  drain, the second force-quits (exit code 130).

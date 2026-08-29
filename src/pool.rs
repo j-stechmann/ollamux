@@ -36,10 +36,10 @@ pub enum State {
 struct Health {
     state: State,
     cooldown_until: Option<Instant>,
-    /// Consecutive strikes; reset on any success (review: must not be sticky).
+    /// Consecutive strikes; reset on any confirmed upstream success.
     strikes: u32,
     fails: u64,
-    releases: u64,
+    successes: u64,
     last_error: Option<String>,
 }
 
@@ -68,7 +68,7 @@ impl KeyState {
                 cooldown_until: None,
                 strikes: 0,
                 fails: 0,
-                releases: 0,
+                successes: 0,
                 last_error: None,
             }),
         }
@@ -150,7 +150,7 @@ pub struct KeyInfo {
     pub cooldown_left_s: Option<u64>,
     pub strikes: u32,
     pub fails: u64,
-    pub releases: u64,
+    pub successes: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
 }
@@ -265,15 +265,20 @@ impl Pool {
         }
     }
 
-    pub fn mark_ok(&self, key: usize) {
+    /// A confirmed upstream success: clears strikes/cooldown and counts.
+    pub fn settle(&self, key: usize, ok: bool) {
         let st = &self.states[key];
         let mut h = lock(&st.health);
-        h.state = State::Up;
-        h.cooldown_until = None;
-        h.strikes = 0;
-        h.releases += 1;
+        if ok {
+            h.state = State::Up;
+            h.cooldown_until = None;
+            h.strikes = 0;
+            h.successes += 1;
+        }
         drop(h);
-        self.rr.store(key, Ordering::Relaxed);
+        if ok {
+            self.rr.store(key, Ordering::Relaxed);
+        }
     }
 
     // ----- introspection -----
@@ -316,7 +321,7 @@ impl Pool {
                     },
                     strikes: h.strikes,
                     fails: h.fails,
-                    releases: h.releases,
+                    successes: h.successes,
                     last_error: h.last_error.clone(),
                 }
             })
@@ -392,8 +397,13 @@ impl Pool {
     }
 
     /// Admit one request: pick the best healthy key and take (or wait for)
-    /// one of its slots. Body buffering happens *after* this, so bounded
-    /// admission bounds memory (review #3).
+    /// one of its slots. The request body is buffered *before* this call, so
+    /// bounded admission bounds memory only from here on; the 16 MiB body
+    /// cap plus the (worker-count × body cap) bound covers the pre-admission
+    /// phase. Admission deliberately does NOT touch key health: strikes and
+    /// cooldowns may only be cleared by a confirmed upstream success
+    /// (`settle`), otherwise a permanently-failing key would have its
+    /// strike counter wiped by every new arrival.
     pub fn admit(&self, timeout: Duration) -> Result<(Permit<'_>, usize), Reject> {
         if self.is_empty() {
             return Err(Reject {
@@ -410,33 +420,38 @@ impl Pool {
                 retry_after_s: None,
             });
         }
-        // Any Up keys at all?
-        let any_up = self.states.iter().any(|st| st.state() == State::Up);
-        if !any_up {
+        let cands = self.candidates();
+        let cands = if cands.is_empty() {
+            // Racing with concurrent health transitions (another worker just
+            // marked the last Up key dead/cooling): re-read the pool state
+            // once and classify honestly instead of panicking.
+            if self.states.iter().all(|st| st.state() == State::Dead) {
+                return Err(Reject {
+                    status: 403,
+                    reason: "all API keys are dead (invalid credentials) — see /_keys",
+                    retry_after_s: None,
+                });
+            }
             let secs = self
                 .next_retry_in()
                 .map(|d| d.as_secs().max(1))
-                .unwrap_or(60);
+                .unwrap_or(2);
             return Err(Reject {
                 status: 429,
                 reason: "all keys cooling down — see /_keys",
                 retry_after_s: Some(secs),
             });
-        }
-        let cands = self.candidates();
-        debug_assert!(!cands.is_empty());
+        } else {
+            cands
+        };
         for &key in &cands {
             if let Some(p) = self.try_acquire(key) {
-                self.mark_ok(key);
                 return Ok((p, key));
             }
         }
         // All Up keys at capacity: wait on the least-loaded one.
         match self.acquire_on(cands[0], timeout) {
-            Ok(p) => {
-                self.mark_ok(cands[0]);
-                Ok((p, cands[0]))
-            }
+            Ok(p) => Ok((p, cands[0])),
             Err(WaitRejected::Full) => Err(Reject {
                 status: 429,
                 reason: "overloaded: all keys busy and the wait queue is full",
@@ -501,8 +516,8 @@ mod tests {
         p.mark_strike(0, "e3");
         assert_eq!(p.state_of(0), State::Cooldown);
         std::thread::sleep(Duration::from_millis(20));
-        // mark_ok clears everything
-        p.mark_ok(0);
+        // settle(ok) clears everything
+        p.settle(0, true);
         let h = lock(&p.states[0].health);
         assert_eq!(h.strikes, 0);
         assert_eq!(h.state, State::Up);
@@ -637,6 +652,7 @@ mod tests {
                     let (permit, _) = p.admit(Duration::from_millis(500)).unwrap();
                     std::thread::sleep(Duration::from_millis(20));
                     drop(permit);
+                    p.settle(0, true);
                 })
             })
             .collect();
@@ -644,6 +660,30 @@ mod tests {
             h.join().unwrap();
         }
         assert_eq!(p.states[0].in_use(), 0);
-        assert!(p.states[0].health.lock().unwrap().releases >= 16);
+        assert!(p.states[0].health.lock().unwrap().successes >= 16);
+    }
+
+    #[test]
+    fn admission_does_not_reset_strikes() {
+        // A key that keeps failing must reach the cooldown even under
+        // steady arrival of new requests: taking a slot (admission) must
+        // never wipe strikes — only a confirmed success may.
+        let p = pool(1, 8);
+        let (_permit, _) = p.admit(Duration::from_millis(100)).unwrap();
+        p.mark_strike(0, "boom1");
+        let (_permit2, _) = p.admit(Duration::from_millis(100)).unwrap();
+        p.mark_strike(0, "boom2");
+        assert_eq!(p.state_of(0), State::Up);
+        // Admission between strikes; strikes must still be 2.
+        let (_permit3, _) = p.admit(Duration::from_millis(100)).unwrap();
+        assert_eq!(lock(&p.states[0].health).strikes, 2);
+        p.mark_strike(0, "boom3");
+        assert_eq!(
+            p.state_of(0),
+            State::Cooldown,
+            "3 strikes must cool the key"
+        );
+        assert_eq!(lock(&p.states[0].health).strikes, 0);
+        assert_eq!(lock(&p.states[0].health).successes, 0);
     }
 }
