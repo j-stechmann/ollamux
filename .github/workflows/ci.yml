@@ -37,7 +37,8 @@ jobs:
     steps:
       - name: Install tooling
         run: |
-          pacman -Syu --noconfirm git makepkg
+          pacman -Syu --noconfirm git
+          # makepkg ships with pacman (already in the base-devel image)
       - uses: actions/checkout@v5
       - name: PKGBUILD validity + .SRCINFO freshness
         run: |

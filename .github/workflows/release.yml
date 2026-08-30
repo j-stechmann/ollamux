@@ -274,7 +274,7 @@ jobs:
           fi
       - name: install tooling
         if: ${{ steps.secret.outputs.available == 'true' }}
-        run: pacman -Syu --noconfirm git openssh
+        run: pacman -Syu --noconfirm git openssh pacman-contrib
       - uses: actions/checkout@v5
         if: ${{ steps.secret.outputs.available == 'true' }}
       - name: configure ssh
@@ -285,7 +285,7 @@ jobs:
           printf '%s\n' "$AUR_SSH_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
           ssh-keyscan -H aur.archlinux.org >> ~/.ssh/known_hosts
-          # makepkg is in the base-devel container; ensure PATH sanity
+          # makepkg comes with pacman; updpkgsums is in pacman-contrib
           command -v updpkgsums makepkg
       - name: update PKGBUILD + checksums from release assets
         if: ${{ steps.secret.outputs.available == 'true' }}
