@@ -3,6 +3,10 @@ name: Release
 on:
   push:
     tags: ['v*']
+  # Manual re-run: `gh workflow run release.yml --ref v0.1.0` re-publishes
+  # an existing tag (e.g. after adding AUR/COPR/crates.io secrets later;
+  # secret-gated jobs skip when their secrets are absent).
+  workflow_dispatch: {}
 
 permissions:
   contents: read
@@ -225,6 +229,8 @@ jobs:
             ghcr.io/${{ github.repository }}:latest
 
   # ---- 7. AUR push (omlx source + omlx-bin), real makepkg ------------
+  # Skips cleanly when AUR_SSH_KEY is not configured (e.g. AUR signups
+  # closed); add the secret later and re-run this job via workflow_dispatch.
   aur:
     needs: [release]
     runs-on: ubuntu-latest
@@ -237,13 +243,25 @@ jobs:
           - pkg: omlx-bin
     permissions:
       contents: read
+    env:
+      AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
     steps:
+      - name: check for AUR secret
+        id: secret
+        run: |
+          if [ -z "$AUR_SSH_KEY" ]; then
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::AUR_SSH_KEY not set — skipping AUR publish (add the secret + re-run this job to publish)"
+          else
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          fi
       - name: install tooling
+        if: ${{ steps.secret.outputs.available == 'true' }}
         run: pacman -Syu --noconfirm git openssh
       - uses: actions/checkout@v5
+        if: ${{ steps.secret.outputs.available == 'true' }}
       - name: configure ssh
-        env:
-          AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
+        if: ${{ steps.secret.outputs.available == 'true' }}
         run: |
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
@@ -253,6 +271,7 @@ jobs:
           # makepkg is in the base-devel container; ensure PATH sanity
           command -v updpkgsums makepkg
       - name: update PKGBUILD + checksums from release assets
+        if: ${{ steps.secret.outputs.available == 'true' }}
         env:
           PKG: ${{ matrix.pkg }}
         run: |
@@ -263,12 +282,14 @@ jobs:
           # refresh checksums: downloads the actual release assets
           updpkgsums
       - name: regenerate .SRCINFO
+        if: ${{ steps.secret.outputs.available == 'true' }}
         env:
           PKG: ${{ matrix.pkg }}
         run: |
           cd "packaging/aur/$PKG"
           makepkg --printsrcinfo > .SRCINFO
       - name: push to AUR
+        if: ${{ steps.secret.outputs.available == 'true' }}
         env:
           PKG: ${{ matrix.pkg }}
         run: |
@@ -295,6 +316,7 @@ jobs:
           fi
 
   # ---- 8. COPR (SRPM upload) -----------------------------------------
+  # Skips cleanly when COPR_CONFIG is not configured.
   copr:
     needs: [rpm]
     runs-on: ubuntu-latest
@@ -302,13 +324,23 @@ jobs:
     continue-on-error: true
     permissions:
       contents: read
+    env:
+      COPR_CONFIG: ${{ secrets.COPR_CONFIG }}
     steps:
       - uses: actions/download-artifact@v4
         with:
           name: rpm
+      - name: check for COPR config
+        id: secret
+        run: |
+          if [ -z "$COPR_CONFIG" ]; then
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::COPR_CONFIG not set — skipping COPR build (add the secret + re-run this job to publish)"
+          else
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          fi
       - name: copr-cli config
-        env:
-          COPR_CONFIG: ${{ secrets.COPR_CONFIG }}
+        if: ${{ steps.secret.outputs.available == 'true' }}
         run: |
           mkdir -p ~/.config
           printf '%s\n' "$COPR_CONFIG" > ~/.config/copr
@@ -316,9 +348,11 @@ jobs:
           pipx install copr-cli
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: copr build
+        if: ${{ steps.secret.outputs.available == 'true' }}
         run: copr-cli build j-stechmann/omlx *.src.rpm
 
   # ---- 9. crates.io --------------------------------------------------
+  # Skips cleanly when CARGO_REGISTRY_TOKEN is not configured.
   cratesio:
     needs: [release]
     runs-on: ubuntu-latest
@@ -326,9 +360,25 @@ jobs:
     continue-on-error: true
     permissions:
       contents: read
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
     steps:
+      - name: check for crates.io token
+        id: secret
+        run: |
+          if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::CARGO_REGISTRY_TOKEN not set — skipping crates.io publish (add the secret + re-run this job to publish)"
+          else
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          fi
       - uses: actions/checkout@v5
+        if: ${{ steps.secret.outputs.available == 'true' }}
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo publish --locked
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        if: ${{ steps.secret.outputs.available == 'true' }}
+      - name: dry-run
+        if: ${{ steps.secret.outputs.available == 'true' }}
+        run: cargo publish --locked --dry-run
+      - name: publish
+        if: ${{ steps.secret.outputs.available == 'true' }}
+        run: cargo publish --locked

@@ -18,7 +18,13 @@ must configure once.
 | `../Containerfile`          | Static musl → scratch container image           |
 | `../scripts/vendor-source.sh` | Source tarball + vendored crates + checksums  |
 
-## Release prerequisites (one-time, secrets)
+## Release prerequisites (one-time, secrets — all optional)
+
+**Every publishing channel auto-skips while its secret is missing**:
+a release without any secrets still produces binaries, source/vendor
+tarballs, the .deb, .rpm/.src.rpm, the GitHub release and the ghcr.io
+container — the `aur`, `copr` and `cratesio` jobs print a notice and
+succeed as no-ops. Add a secret later and re-run (see below).
 
 1. **AUR push key** — create a dedicated key pair, register the public
    key on your aur.archlinux.org account, put the *private* key into the
@@ -36,15 +42,30 @@ must configure once.
    and save the whole file as repo secret `COPR_CONFIG` (it's written to
    `~/.config/copr` verbatim by CI).
 
-3. **crates.io** — create a publish-scoped token (no expiration needed;
-   scoped to the `omlx` package), save as secret `CARGO_REGISTRY_TOKEN`.
-   Publish runs last and is `continue-on-error` (recoverable by hand:
-   `cargo publish --locked`).
+3. **crates.io** — create a publish-scoped token, save as secret
+   `CARGO_REGISTRY_TOKEN` (a `--dry-run` publish gates the real one).
 
 4. **GHCR** — nothing to configure. CI pushes
    `ghcr.io/j-stechmann/omlx:<tag>` using `GITHUB_TOKEN` (job has
    `packages: write`). After the first release, flip package visibility
    to public in GitHub package settings if you want anonymous pulls.
+
+## Publishing a deferred channel later
+
+The workflow has `workflow_dispatch`, so once secrets are in place:
+
+```sh
+gh workflow run release.yml --ref v0.1.0
+```
+
+This re-runs the whole pipeline against the tag; build jobs redo
+(cache-warmed), and the now-unlocked `aur`/`copr`/`cratesio` jobs
+publish. Note: `workflow_dispatch` requires the trigger to exist in the
+workflow file *at that ref* — if you re-ran a tag cut before this
+feature existed, move the tag (`git tag -f`) or cut a `v0.1.1`.
+You can also re-run just the failed/skipped jobs from the Actions UI
+("Re-run failed jobs") after adding the secret, as long as the run is
+recent.
 
 ## Releasing
 
@@ -53,10 +74,9 @@ git tag -a v0.1.0 -m "omlx 0.1.0"
 git push origin v0.1.0
 ```
 
-Everything else (binaries, deb, rpm+srpm, container, AUR, COPR,
-crates.io, release assets) is automated. Watch the Actions run; the
-`aur` job needs `AUR_SSH_KEY` and `copr` needs `COPR_CONFIG`, so the
-very first release fails there if you skipped step 1–2.
+Everything else is automated; publishing channels run *if and only if*
+their secret exists (see above). Watch the Actions run; the first
+release works end-to-end even with zero secrets configured.
 
 After the release, update the *repo copy* of both PKGBUILDs
 (`pkgver`, checksums, regenerated `.SRCINFO`) so CI's freshness check
