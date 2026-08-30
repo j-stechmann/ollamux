@@ -413,7 +413,7 @@ impl Pool {
         if self.is_empty() {
             return Err(Reject {
                 status: 503,
-                reason: "no keys configured",
+                reason: "ollamux has no API keys configured; set OLLAMUX_KEYS or create ~/.config/ollamux/keys (one key per line, https://ollama.com/settings/keys), then restart",
                 retry_after_s: None,
             });
         }
@@ -421,7 +421,7 @@ impl Pool {
         if self.states.iter().all(|st| st.state() == State::Dead) {
             return Err(Reject {
                 status: 403,
-                reason: "all API keys are dead (invalid credentials) — see /_keys",
+                reason: "all ollamux API keys were rejected by https://ollama.com as invalid (401/403): check the keys at https://ollama.com/settings/keys and restart ollamux — dead keys stay dead until restart. Per-key state: GET /_keys",
                 retry_after_s: None,
             });
         }
@@ -433,7 +433,7 @@ impl Pool {
             if self.states.iter().all(|st| st.state() == State::Dead) {
                 return Err(Reject {
                     status: 403,
-                    reason: "all API keys are dead (invalid credentials) — see /_keys",
+                    reason: "all ollamux API keys were rejected by https://ollama.com as invalid (401/403): check the keys at https://ollama.com/settings/keys and restart ollamux — dead keys stay dead until restart. Per-key state: GET /_keys",
                     retry_after_s: None,
                 });
             }
@@ -443,7 +443,7 @@ impl Pool {
                 .unwrap_or(2);
             return Err(Reject {
                 status: 429,
-                reason: "all keys cooling down — see /_keys",
+                reason: "all ollamux keys are cooling down (rate-limited by https://ollama.com) and recover automatically; wait for the Retry-After header, then retry. Per-key state: GET /_keys",
                 retry_after_s: Some(secs),
             });
         } else {
@@ -459,12 +459,12 @@ impl Pool {
             Ok(p) => Ok((p, cands[0])),
             Err(WaitRejected::Full) => Err(Reject {
                 status: 429,
-                reason: "overloaded: all keys busy and the wait queue is full",
+                reason: "ollamux is overloaded: every key is at its concurrency limit and the wait queue is full; raise per-key concurrency (KEY:N in the keys file) or add more keys. Retry shortly",
                 retry_after_s: Some(2),
             }),
             Err(WaitRejected::Timeout) => Err(Reject {
                 status: 429,
-                reason: "overloaded: queued too long for a free slot",
+                reason: "ollamux is overloaded: the request queued too long for a free key slot; raise per-key concurrency (KEY:N in the keys file) or reduce parallel requests. Retry via Retry-After",
                 retry_after_s: Some(1),
             }),
         }

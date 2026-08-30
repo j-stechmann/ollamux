@@ -35,6 +35,17 @@ fn spawn_server(pool: Arc<ollamux::Pool>, upstream: &str) -> String {
     format!("http://{addr}")
 }
 
+fn headers_of(r: &ureq::Response) -> Vec<(String, String)> {
+    r.headers_names()
+        .into_iter()
+        .flat_map(|n| {
+            r.all(&n)
+                .into_iter()
+                .map(move |v| (n.clone(), v.to_string()))
+        })
+        .collect()
+}
+
 fn get(url: &str, path: &str) -> (u16, String, Vec<(String, String)>) {
     let resp = match ureq::get(&format!("{url}{path}")).call() {
         Ok(r) => r,
@@ -42,22 +53,26 @@ fn get(url: &str, path: &str) -> (u16, String, Vec<(String, String)>) {
         Err(e) => panic!("request failed: {e}"),
     };
     let status = resp.status();
-    let headers: Vec<(String, String)> = resp
-        .headers_names()
-        .into_iter()
-        .flat_map(|n| {
-            resp.all(&n)
-                .into_iter()
-                .map(move |v| (n.clone(), v.to_string()))
-        })
-        .collect();
+    let headers = headers_of(&resp);
     (status, resp.into_string().unwrap(), headers)
 }
 
 fn post(url: &str, path: &str, body: &str) -> (u16, String) {
+    let (status, body, _) = post_with_headers(url, path, body);
+    (status, body)
+}
+
+fn post_with_headers(url: &str, path: &str, body: &str) -> (u16, String, Vec<(String, String)>) {
     match ureq::post(&format!("{url}{path}")).send_string(body) {
-        Ok(r) => (r.status(), r.into_string().unwrap()),
-        Err(ureq::Error::Status(code, r)) => (code, r.into_string().unwrap()),
+        Ok(r) => {
+            let headers = headers_of(&r);
+            let status = r.status();
+            (status, r.into_string().unwrap(), headers)
+        }
+        Err(ureq::Error::Status(code, r)) => {
+            let headers = headers_of(&r);
+            (code, r.into_string().unwrap(), headers)
+        }
         Err(e) => panic!("request failed: {e}"),
     }
 }
@@ -188,10 +203,88 @@ fn keys_health_and_404_endpoints() {
     let (status, body, _) = get(&addr, "/_health");
     assert_eq!(status, 200);
     assert!(body.contains("\"ok\":true"), "health body: {body}");
+    let health: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(health["service"], "ollamux");
+    assert_eq!(health["version"], ollamux::VERSION);
 
     let (status, body, _) = get(&addr, "/nonsense");
     assert_eq!(status, 404);
     assert!(body.contains("not a local Ollama"), "404 body: {body}");
+    // Agent-friendly guidance: says what it IS, and how to fix confusion.
+    assert!(body.contains("Ollama Cloud"), "404 body: {body}");
+    assert!(body.contains("11434"), "404 body: {body}");
+    assert!(body.contains("/api/*"), "404 body: {body}");
+}
+
+// Every response must self-identify: errors should be attributable to
+// ollamux (vs a real Ollama server or a CDN) by header alone.
+#[test]
+fn all_responses_carry_identity_header() {
+    // /api/generate streams a 200; every other path 404s (relayed verbatim).
+    let up = Upstream::spawn(|path| {
+        if path.starts_with("/api/generate") {
+            (200u16, "OK".into(), "line1\nline2\n".into())
+        } else {
+            (
+                404u16,
+                "Not Found".into(),
+                r#"{"error":"upstream 404"}"#.into(),
+            )
+        }
+    });
+    let addr = spawn_server(pool_with(&[("omk-ident001", 1)]), &up.url);
+
+    for path in ["/_health", "/nonsense"] {
+        let (_, _, headers) = get(&addr, path);
+        assert!(
+            headers
+                .iter()
+                .any(|(n, v)| n.eq_ignore_ascii_case("x-ollamux") && v.contains("ollamux/")),
+            "GET {path} must carry the X-Ollamux identity header: {headers:?}"
+        );
+    }
+
+    // Success path (no-auth endpoint) and relayed upstream error too.
+    let (_, _, headers) = get(&addr, "/api/tags");
+    assert!(
+        headers
+            .iter()
+            .any(|(n, v)| n.eq_ignore_ascii_case("x-ollamux") && v.contains("ollamux/")),
+        "relayed success must carry X-Ollamux: {headers:?}"
+    );
+    let (_, _, headers) = get(&addr, "/_doesnotexist");
+    assert!(
+        headers
+            .iter()
+            .any(|(n, v)| n.eq_ignore_ascii_case("x-ollamux") && v.contains("ollamux/")),
+        "404 must carry X-Ollamux: {headers:?}"
+    );
+
+    // Streaming responses are hand-framed in stream_chunked; the identity
+    // header must not drift from identity_header().
+    let (status, body, headers) =
+        post_with_headers(&addr, "/api/generate", r#"{"model":"x","stream":true}"#);
+    assert_eq!(status, 200);
+    assert_eq!(body, "line1\nline2\n");
+    assert!(
+        headers
+            .iter()
+            .any(|(n, v)| n.eq_ignore_ascii_case("x-ollamux") && v.contains("ollamux/")),
+        "streaming response must carry X-Ollamux: {headers:?}"
+    );
+
+    let (status, body, headers) = post_with_headers(&addr, "/api/show", r#"{"model":"x"}"#);
+    assert_eq!(status, 404, "upstream 404 is not a key signal; relayed");
+    assert!(
+        headers
+            .iter()
+            .any(|(n, v)| n.eq_ignore_ascii_case("x-ollamux") && v.contains("ollamux/")),
+        "relayed upstream error must carry X-Ollamux: {headers:?}"
+    );
+    assert!(
+        body.contains("upstream 404"),
+        "body relayed verbatim: {body}"
+    );
 }
 
 // H3: /api/tags etc. must be credential-less and must not mark key health.
@@ -291,6 +384,11 @@ fn surface_error_shapes_on_total_failure() {
     assert_eq!(status, 502, "body: {body}");
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert!(v["error"].is_string(), "ollama-style error: {body}");
+    // Guidance: where to look next.
+    assert!(
+        v["error"].as_str().unwrap().contains("/_keys"),
+        "502 must point at /_keys: {body}"
+    );
 
     let (status, body) = post(&addr, "/v1/chat/completions", r#"{"model":"x"}"#);
     assert_eq!(status, 502, "body: {body}");
@@ -298,6 +396,10 @@ fn surface_error_shapes_on_total_failure() {
     assert!(
         v["error"]["message"].is_string(),
         "openai-style error: {body}"
+    );
+    assert!(
+        v["error"]["message"].as_str().unwrap().contains("/_keys"),
+        "502 must point at /_keys: {body}"
     );
 }
 
@@ -348,10 +450,13 @@ fn rate_limited_key_rotates_and_cools() {
 fn all_dead_surfaces_403_hermetically() {
     let up = Upstream::spawn(|_| (401, "Unauthorized".into(), "Unauthorized".into()));
     let addr = spawn_server(pool_with(&[("omk-dead00001", 1)]), &up.url);
-    let (status, _) = post(&addr, "/api/chat", r#"{"model":"x"}"#);
+    let (status, body) = post(&addr, "/api/chat", r#"{"model":"x"}"#);
     assert_eq!(status, 403); // all keys dead after the 401
     let info = spawn_info(&addr);
     assert_eq!(info[0]["state"], "dead");
+    // Agent guidance: says the keys are invalid and how to recover.
+    assert!(body.contains("restart"), "403 must mention restart: {body}");
+    assert!(body.contains("/_keys"), "403 must point at /_keys: {body}");
 }
 
 #[test]
