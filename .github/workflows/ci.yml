@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [master]
+    branches: [master, develop]
   pull_request:
 
 permissions:
@@ -17,7 +17,7 @@ env:
 
 jobs:
   check:
-    name: fmt + clippy + test
+    name: check
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -31,7 +31,7 @@ jobs:
       - run: cargo test --locked --no-default-features
 
   packaging-lint:
-    name: packaging files lint
+    name: packaging-lint
     runs-on: ubuntu-latest
     container: archlinux:base-devel
     steps:
@@ -53,3 +53,20 @@ jobs:
               || { echo "::error::$p/.SRCINFO is stale (run makepkg --printsrcinfo)"; exit 1; }
             cd - >/dev/null
           done
+
+  automerge:
+    name: automerge dependabot PR
+    needs: [check, packaging-lint]
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.user.login == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: arm auto-merge
+        run: gh pr merge --auto --merge "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ github.token }}
