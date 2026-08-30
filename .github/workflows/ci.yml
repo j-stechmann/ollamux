@@ -42,10 +42,12 @@ jobs:
       - uses: actions/checkout@v5
       - name: PKGBUILD validity + .SRCINFO freshness
         run: |
-          # container jobs run as root; makepkg refuses EUID 0
+          # container jobs run as root; makepkg refuses EUID 0 and needs
+          # write access to the package dir it runs in
           useradd -m builder
           for p in packaging/aur/ollamux packaging/aur/ollamux-bin; do
             cd "$GITHUB_WORKSPACE/$p"
+            chown -R builder:builder .
             runuser -u builder -- makepkg --printsrcinfo > /tmp/expected.SRCINFO
             diff -u .SRCINFO /tmp/expected.SRCINFO \
               || { echo "::error::$p/.SRCINFO is stale (run makepkg --printsrcinfo)"; exit 1; }
