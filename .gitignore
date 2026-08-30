@@ -3,3 +3,8 @@ Cargo.lock.bak
 *.log
 dist/
 vendor/
+
+# updpkgsums/makepkg download sources into the package dirs; never commit them
+packaging/aur/*/*.tar.gz
+packaging/aur/*/ollamux.1
+packaging/aur/*/ollamux.service
