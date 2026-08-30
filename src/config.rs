@@ -1,8 +1,8 @@
 //! Key discovery and parsing.
 //!
 //! Keys come from, in order of precedence:
-//!   1. `OMLX_KEYS` env var (newlines or commas separate keys)
-//!   2. `$XDG_CONFIG_HOME/omlx/keys`, defaulting to `~/.config/omlx/keys`
+//!   1. `OLLAMUX_KEYS` env var (newlines or commas separate keys)
+//!   2. `$XDG_CONFIG_HOME/ollamux/keys`, defaulting to `~/.config/ollamux/keys`
 //!
 //! One key per line. `KEY:MODE` sets per-key concurrency (Ollama Cloud's
 //! concurrent-model limit: free=1, pro=3, max=10). Blank lines and `#`
@@ -25,7 +25,7 @@ pub struct Keys {
 
 #[derive(Debug)]
 pub enum ParseError {
-    /// Neither OMLX_KEYS nor a keys file was found.
+    /// Neither OLLAMUX_KEYS nor a keys file was found.
     NotFound(PathBuf),
     /// A line parsed but produced no usable key.
     BadLine(String),
@@ -45,7 +45,7 @@ impl std::fmt::Display for ParseError {
         match self {
             ParseError::NotFound(p) => write!(
                 f,
-                "no keys found: set OMLX_KEYS or create {} (one API key per line)",
+                "no keys found: set OLLAMUX_KEYS or create {} (one API key per line)",
                 p.display()
             ),
             ParseError::BadLine(line) => {
@@ -79,10 +79,10 @@ impl Keys {
             keys.source = path.to_path_buf();
             return Ok(keys);
         }
-        if let Ok(raw) = std::env::var("OMLX_KEYS") {
+        if let Ok(raw) = std::env::var("OLLAMUX_KEYS") {
             let keys = Self::parse(&raw, None)?;
             if keys.entries.is_empty() {
-                return Err(ParseError::Empty("OMLX_KEYS is set but empty".into()));
+                return Err(ParseError::Empty("OLLAMUX_KEYS is set but empty".into()));
             }
             return Ok(keys);
         }
@@ -166,7 +166,7 @@ impl Keys {
                 let mode = meta.permissions().mode();
                 if mode & 0o077 != 0 {
                     eprintln!(
-                        "omlx: warning: {} is readable by others (mode {:o}); fix: chmod 600 {}",
+                        "ollamux: warning: {} is readable by others (mode {:o}); fix: chmod 600 {}",
                         path.display(),
                         mode & 0o777,
                         path.display()
@@ -199,13 +199,13 @@ pub fn suffix(key: &str) -> String {
 fn config_path() -> Result<PathBuf, ParseError> {
     if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
         if !xdg.is_empty() {
-            return Ok(PathBuf::from(xdg).join("omlx/keys"));
+            return Ok(PathBuf::from(xdg).join("ollamux/keys"));
         }
     }
     let home = std::env::var("HOME").map_err(|_| {
-        ParseError::Empty("HOME not set and OMLX_KEYS unset; cannot locate keys".into())
+        ParseError::Empty("HOME not set and OLLAMUX_KEYS unset; cannot locate keys".into())
     })?;
-    Ok(PathBuf::from(home).join(".config/omlx/keys"))
+    Ok(PathBuf::from(home).join(".config/ollamux/keys"))
 }
 
 #[cfg(test)]
@@ -271,6 +271,6 @@ mod tests {
         // the file loader enforces nonempty.
         let k = Keys::parse("# only comments\n", None).unwrap();
         assert!(k.is_empty());
-        assert!(Keys::load(Some(Path::new("/nonexistent-omlx-keys")), "").is_err());
+        assert!(Keys::load(Some(Path::new("/nonexistent-ollamux-keys")), "").is_err());
     }
 }

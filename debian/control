@@ -1,20 +1,20 @@
-Source: omlx
+Source: ollamux
 Section: net
 Priority: optional
 Maintainer: Jonathan Stechmann <69059260+j-stechmann@users.noreply.github.com>
 Build-Depends: debhelper-compat (= 13), cargo, rustc:native (>= 1.85), pkg-config
 Standards-Version: 4.7.2
-Homepage: https://github.com/j-stechmann/omlx
-Vcs-Browser: https://github.com/j-stechmann/omlx
-Vcs-Git: https://github.com/j-stechmann/omlx.git
+Homepage: https://github.com/j-stechmann/ollamux
+Vcs-Browser: https://github.com/j-stechmann/ollamux
+Vcs-Git: https://github.com/j-stechmann/ollamux.git
 Rules-Requires-Root: no
 
-Package: omlx
+Package: ollamux
 Architecture: any
 Depends: ${misc:Depends}, ${shlibs:Depends}
 Recommends: systemd | systemd-tmpfiles
 Description: key-rotating reverse proxy for the Ollama Cloud API
- omlx gives several Ollama Cloud API keys and serves them combined
+ ollamux gives several Ollama Cloud API keys and serves them combined
  behind one local endpoint. Requests are spread across keys
  (round-robin, least-loaded first), and when a key is rate-limited,
  rejected, or invalid, the request silently retries on the next key

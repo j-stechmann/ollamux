@@ -1,4 +1,4 @@
 Tests: smoke
-Depends: omlx
+Depends: ollamux
 
-Test-Command: omlx --version
+Test-Command: ollamux --version

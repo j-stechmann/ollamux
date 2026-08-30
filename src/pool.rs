@@ -191,7 +191,7 @@ impl Pool {
 
     fn log(&self, msg: String) {
         if self.verbose {
-            eprintln!("omlx: {msg}");
+            eprintln!("ollamux: {msg}");
         }
     }
 

@@ -1,8 +1,8 @@
-pkgbase = omlx
+pkgbase = ollamux
 	pkgdesc = Key-rotating reverse proxy for the Ollama Cloud API
-	pkgver = 0.1.0
+	pkgver = 0.2.0
 	pkgrel = 1
-	url = https://github.com/j-stechmann/omlx
+	url = https://github.com/j-stechmann/ollamux
 	arch = x86_64
 	arch = aarch64
 	license = GPL-2.0-or-later
@@ -10,14 +10,14 @@ pkgbase = omlx
 	makedepends = cargo
 	depends = glibc
 	depends = gcc-libs
-	provides = omlx=0.1.0
-	conflicts = omlx-bin
+	provides = ollamux=0.2.0
+	conflicts = ollamux-bin
 	options = !lto
-	source = omlx-0.1.0.tar.gz::https://github.com/j-stechmann/omlx/archive/v0.1.0.tar.gz
-	source = omlx.service::https://github.com/j-stechmann/omlx/raw/v0.1.0/packaging/omlx.service
-	source = omlx.1::https://github.com/j-stechmann/omlx/raw/v0.1.0/packaging/omlx.1
+	source = ollamux-0.2.0.tar.gz::https://github.com/j-stechmann/ollamux/archive/v0.2.0.tar.gz
+	source = ollamux.service::https://github.com/j-stechmann/ollamux/raw/v0.2.0/packaging/ollamux.service
+	source = ollamux.1::https://github.com/j-stechmann/ollamux/raw/v0.2.0/packaging/ollamux.1
 	sha256sums = 1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef
 	sha256sums = 1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef
 	sha256sums = 1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef
 
-pkgname = omlx
+pkgname = ollamux

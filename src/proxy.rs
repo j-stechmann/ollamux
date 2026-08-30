@@ -101,7 +101,7 @@ impl Server {
         let (status, retries, key) = self.route(req, &path, query.as_deref());
 
         eprintln!(
-            "omlx: #{id} {method} {path} -> {status}{}{} dur={}ms",
+            "ollamux: #{id} {method} {path} -> {status}{}{} dur={}ms",
             if retries > 0 {
                 format!(" retries={retries}")
             } else {
@@ -144,7 +144,7 @@ impl Server {
         json_response(
             req,
             404,
-            r#"{"error":"omlx is a key-rotating proxy for Ollama Cloud; only /api/*, /v1/*, /_keys, /_health are served. This is not a local Ollama server."}"#,
+            r#"{"error":"ollamux is a key-rotating proxy for Ollama Cloud; only /api/*, /v1/*, /_keys, /_health are served. This is not a local Ollama server."}"#,
             None,
         );
         (404, 0, None)
@@ -166,7 +166,7 @@ impl Server {
             Ok(b) => b,
             Err(too_large) => {
                 let (status, msg) = if too_large {
-                    (413u16, "request body exceeds omlx limit (16 MiB)")
+                    (413u16, "request body exceeds ollamux limit (16 MiB)")
                 } else {
                     (400u16, "failed to read request body")
                 };
@@ -423,9 +423,9 @@ impl Server {
             }
         }
         if let Some(k) = key {
-            resp = resp.with_header(hv("X-Omlx-Key", &pool.suffix_of(k)));
+            resp = resp.with_header(hv("X-Ollamux-Key", &pool.suffix_of(k)));
         }
-        resp = resp.with_header(hv("X-Omlx-Retries", &retries.to_string()));
+        resp = resp.with_header(hv("X-Ollamux-Retries", &retries.to_string()));
         let _ = req.respond(resp);
         Attempt::Sent(if read_err { 502 } else { status })
     }
@@ -447,9 +447,9 @@ impl Server {
             .filter_map(|(n, v)| tiny_http::Header::from_bytes(n.as_bytes(), v.as_bytes()).ok())
             .collect();
         if let Some(k) = key {
-            hs.push(hv("X-Omlx-Key", &self.pool.suffix_of(k)));
+            hs.push(hv("X-Ollamux-Key", &self.pool.suffix_of(k)));
         }
-        hs.push(hv("X-Omlx-Retries", &retries.to_string()));
+        hs.push(hv("X-Ollamux-Retries", &retries.to_string()));
         let resp = tiny_http::Response::new(
             tiny_http::StatusCode(status),
             hs,
@@ -480,9 +480,9 @@ impl Server {
         let mut w = req.into_writer();
         let mut head = format!("HTTP/1.1 {status} {}\r\n", reason_phrase(status));
         if let Some(k) = key {
-            head.push_str(&format!("X-Omlx-Key: {}\r\n", self.pool.suffix_of(k)));
+            head.push_str(&format!("X-Ollamux-Key: {}\r\n", self.pool.suffix_of(k)));
         }
-        head.push_str(&format!("X-Omlx-Retries: {retries}\r\n"));
+        head.push_str(&format!("X-Ollamux-Retries: {retries}\r\n"));
         for (n, v) in headers {
             if !n.eq_ignore_ascii_case("content-length") {
                 head.push_str(&format!("{n}: {v}\r\n"));
@@ -525,7 +525,7 @@ impl Server {
                         let _ = w.write_all(b"0\r\n\r\n");
                         let _ = w.flush();
                     }
-                    eprintln!("omlx: upstream died mid-stream: {e}");
+                    eprintln!("ollamux: upstream died mid-stream: {e}");
                     return Attempt::Sent(502);
                 }
             }
@@ -613,9 +613,9 @@ fn error_json(is_v1: bool, msg: &str, status: u16) -> String {
         serde_json::json!({
             "error": {
                 "message": msg,
-                "type": "omlx_error",
+                "type": "ollamux_error",
                 "param": null,
-                "code": format!("omlx_{status}"),
+                "code": format!("ollamux_{status}"),
             }
         })
         .to_string()

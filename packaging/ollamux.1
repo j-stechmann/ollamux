@@ -1,23 +1,23 @@
-.\" omlx(1) manual page
+.\" ollamux(1) manual page
 .\" License: GPL-2.0-or-later
-.TH OMLX 1 "2026-08-30" "omlx 0.1.0" "User Commands"
+.TH OLLAMUX 1 "2026-08-30" "ollamux 0.1.0" "User Commands"
 .SH NAME
-omlx \- key-rotating reverse proxy for the Ollama Cloud API
+ollamux \- key-rotating reverse proxy for the Ollama Cloud API
 .SH SYNOPSIS
-.B omlx
+.B ollamux
 .RB [ \-\-addr
 .IR HOST:PORT ]
 .RB [ \-\-keys
 .IR PATH ]
 .RB [ \-v ]
 .br
-.B omlx
+.B ollamux
 .B \-\-help
 .br
-.B omlx
+.B ollamux
 .B \-\-version
 .SH DESCRIPTION
-.B omlx
+.B ollamux
 gives several Ollama Cloud API keys and serves them combined behind one
 local endpoint. Requests are spread across keys (round-robin,
 least-loaded first), and when a key is rate-limited, rejected, or
@@ -40,11 +40,11 @@ run side by side.
 .TP
 .BR \-k ", " \-\-keys " " \fIPATH\fR
 Keys file. Default, in order of precedence: the
-.B OMLX_KEYS
+.B OLLAMUX_KEYS
 environment variable (newline- or comma-separated keys), then
-.B $XDG_CONFIG_HOME/omlx/keys\fR,
+.B $XDG_CONFIG_HOME/ollamux/keys\fR,
 then
-.IR ~/.config/omlx/keys .
+.IR ~/.config/ollamux/keys .
 .TP
 .BR \-v ", " \-\-verbose
 Verbose stderr logging: upstream error snippets and cooldown
@@ -77,8 +77,8 @@ your-max-key...:10
 Requests beyond a key's concurrency limit queue briefly rather than
 hammering upstream; waiters beyond that get an honest 429. Duplicate
 key entries and invalid concurrency counts are startup errors, not
-warnings. The file should be readable only by the user running omlx:
-.B chmod 600 ~/.config/omlx/keys\fR.
+warnings. The file should be readable only by the user running ollamux:
+.B chmod 600 ~/.config/ollamux/keys\fR.
 .SH ENDPOINTS
 .TS
 tab(|);
@@ -102,9 +102,9 @@ response byte, so streaming responses (NDJSON and SSE) are never
 corrupted mid-flight.
 .PP
 Response headers identify the serving key
-.B X-Omlx-Key
+.B X-Ollamux-Key
 (suffix only) and the retry count
-.BR X-Omlx-Retries .
+.BR X-Ollamux-Retries .
 .SH SIGNALS
 .B SIGINT
 (ctrl-c) or
@@ -115,22 +115,22 @@ before exit; a second signal force-quits immediately (exit code 130).
 The proxy has no authentication: anything that can reach the listen
 address can use your API quota. The default binds the loopback
 interface only; do not expose it further. Keep the keys file
-owner-readable (0600); omlx warns at startup if it is group- or
+owner-readable (0600); ollamux warns at startup if it is group- or
 world-readable.
 .SH FILES
 .TP
-.I ~/.config/omlx/keys
+.I ~/.config/ollamux/keys
 Default keys file (honours
 .BR XDG_CONFIG_HOME ).
 .TP
-.I /etc/omlx/keys
+.I /etc/ollamux/keys
 Conventional location for system-wide deployments (see
 .BR systemd.unit (5)
 and the shipped
-.IR omlx.service ).
+.IR ollamux.service ).
 .SH ENVIRONMENT
 .TP
-.B OMLX_KEYS
+.B OLLAMUX_KEYS
 API keys, newline- or comma-separated; overrides the keys file unless
 .B \-\-keys
 is given.
@@ -139,7 +139,7 @@ is given.
 Base directory for the default keys location.
 .TP
 .B OLLAMA_HOST
-Not read by omlx; exported by clients to point them at the proxy
+Not read by ollamux; exported by clients to point them at the proxy
 (example:
 .BR http://localhost:11435 ).
 .SH EXIT STATUS
@@ -157,10 +157,10 @@ Startup failure: unparseable or missing keys, unbindable address.
 Interrupted: second SIGINT during drain.
 .SH SEE ALSO
 The project README at
-.IR https://github.com/j-stechmann/omlx .
+.IR https://github.com/j-stechmann/ollamux .
 .SH BUGS
 Report issues at
-.IR https://github.com/j-stechmann/omlx/issues .
+.IR https://github.com/j-stechmann/ollamux/issues .
 .SH LICENSE
 GPL-2.0-or-later.
 .SH AUTHOR

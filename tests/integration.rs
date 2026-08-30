@@ -4,14 +4,14 @@
 //! this process. The historical test hit real ollama.com; that variant now
 //! requires `--features net` (it depends on live upstream behavior).
 
-use omlx::proxy::Server;
+use ollamux::proxy::Server;
 use std::io::{Read, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-fn pool_with(keys: &[(&str, u32)]) -> Arc<omlx::Pool> {
-    Arc::new(omlx::Pool::new(
+fn pool_with(keys: &[(&str, u32)]) -> Arc<ollamux::Pool> {
+    Arc::new(ollamux::Pool::new(
         keys.iter().map(|(k, c)| (k.to_string(), *c)).collect(),
         32,
         false,
@@ -19,7 +19,7 @@ fn pool_with(keys: &[(&str, u32)]) -> Arc<omlx::Pool> {
 }
 
 /// Spawn the real Server proxying to `upstream`; returns base URL.
-fn spawn_server(pool: Arc<omlx::Pool>, upstream: &str) -> String {
+fn spawn_server(pool: Arc<ollamux::Pool>, upstream: &str) -> String {
     let server = Server::with_upstream(pool, upstream);
     let tiny = tiny_http::Server::http("127.0.0.1:0").unwrap();
     let addr = match tiny.server_addr() {
@@ -208,7 +208,7 @@ fn no_auth_paths_skip_credentials_and_slots() {
     assert!(
         !headers
             .iter()
-            .any(|(n, _)| n.eq_ignore_ascii_case("x-omlx-key")),
+            .any(|(n, _)| n.eq_ignore_ascii_case("x-ollamux-key")),
         "no-auth responses must not claim a key"
     );
 

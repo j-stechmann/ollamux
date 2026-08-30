@@ -1,13 +1,13 @@
 [package]
-name = "omlx"
-version = "0.1.0"
+name = "ollamux"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Key-rotating reverse proxy for the Ollama Cloud API"
 license = "GPL-2.0-or-later"
 authors = ["Jonathan Stechmann <69059260+j-stechmann@users.noreply.github.com>"]
-repository = "https://github.com/j-stechmann/omlx"
-homepage = "https://github.com/j-stechmann/omlx"
+repository = "https://github.com/j-stechmann/ollamux"
+homepage = "https://github.com/j-stechmann/ollamux"
 readme = "README.md"
 keywords = ["ollama", "proxy", "reverse-proxy", "llm", "api"]
 categories = ["command-line-utilities", "network-programming"]

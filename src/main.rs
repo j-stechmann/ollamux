@@ -1,4 +1,4 @@
-//! omlx — key-rotating reverse proxy for the Ollama Cloud API.
+//! ollamux — key-rotating reverse proxy for the Ollama Cloud API.
 //!
 //! tiny_http listener, ureq upstream client, per-key concurrency slots,
 //! invisible pre-first-byte failover. No signal-handling dependencies:
@@ -24,7 +24,7 @@ struct Config {
 fn main() {
     // FIRST THING, before any thread can exist (theirs or ours): block
     // SIGINT. POSIX threads inherit the caller's mask, so every thread
-    // spawned later (tiny_http's accept thread, omlx workers, the sigwait
+    // spawned later (tiny_http's accept thread, ollamux workers, the sigwait
     // thread) starts with SIGINT blocked and the signal stays
     // process-pending for `sigwait`. Doing this after spawning left those
     // threads eligible for default delivery: instant death, no drain.
@@ -35,47 +35,47 @@ fn main() {
         Ok(Some(cfg)) => cfg,
         Ok(None) => return, // --help / --version already printed
         Err(e) => {
-            eprintln!("omlx: {e}\nrun `omlx --help` for usage");
+            eprintln!("ollamux: {e}\nrun `ollamux --help` for usage");
             std::process::exit(2);
         }
     };
 
-    let keys = match omlx::Keys::load(cfg.keys_path.as_deref(), "") {
+    let keys = match ollamux::Keys::load(cfg.keys_path.as_deref(), "") {
         Ok(k) => k,
         Err(e) => {
-            eprintln!("omlx: {e}");
+            eprintln!("ollamux: {e}");
             std::process::exit(1);
         }
     };
     if keys.is_empty() {
-        eprintln!("omlx: no keys configured; refusing to start");
+        eprintln!("ollamux: no keys configured; refusing to start");
         std::process::exit(1);
     }
 
-    let pool = Arc::new(omlx::Pool::new(
+    let pool = Arc::new(ollamux::Pool::new(
         keys.entries.clone(),
         WAITER_CAP,
         cfg.verbose,
     ));
-    let proxy = Arc::new(omlx::proxy::Server::new(pool.clone()));
+    let proxy = Arc::new(ollamux::proxy::Server::new(pool.clone()));
 
     let addr = cfg.addr.clone();
     let tiny = match tiny_http::Server::http(addr.as_str()) {
         Ok(s) => Arc::new(s),
         Err(e) => {
-            eprintln!("omlx: cannot bind {addr}: {e}");
+            eprintln!("ollamux: cannot bind {addr}: {e}");
             std::process::exit(1);
         }
     };
 
     eprintln!(
-        "omlx v{}: {} key(s) loaded [{}], {} slot(s), listening on http://{addr}",
-        omlx::VERSION,
+        "ollamux v{}: {} key(s) loaded [{}], {} slot(s), listening on http://{addr}",
+        ollamux::VERSION,
         keys.len(),
         keys.suffixes().join(", "),
         pool.total_slots(),
     );
-    eprintln!("omlx: point clients at http://{addr} (OLLAMA_HOST or base_url …/v1)");
+    eprintln!("ollamux: point clients at http://{addr} (OLLAMA_HOST or base_url …/v1)");
 
     let stop = Arc::new(AtomicBool::new(false));
     spawn_workers(tiny.clone(), proxy.clone(), stop.clone());
@@ -84,7 +84,7 @@ fn main() {
     install_sigint(move || {
         stop_ctrl.store(true, Ordering::SeqCst);
         eprintln!(
-            "omlx: shutting down (draining up to {}s; ctrl-c again to force quit)",
+            "ollamux: shutting down (draining up to {}s; ctrl-c again to force quit)",
             DRAIN.as_secs()
         )
     });
@@ -94,7 +94,7 @@ fn main() {
         match tiny.recv_timeout(Duration::from_millis(250)) {
             Ok(Some(request)) => dispatch(request, &proxy),
             Ok(None) => {}
-            Err(e) => eprintln!("omlx: recv error: {e}"),
+            Err(e) => eprintln!("ollamux: recv error: {e}"),
         }
     }
 
@@ -106,10 +106,10 @@ fn main() {
             Err(_) => break,
         }
     }
-    eprintln!("omlx: bye");
+    eprintln!("ollamux: bye");
 }
 
-fn dispatch(request: tiny_http::Request, proxy: &Arc<omlx::proxy::Server>) {
+fn dispatch(request: tiny_http::Request, proxy: &Arc<ollamux::proxy::Server>) {
     proxy.handle(request);
 }
 
@@ -117,7 +117,7 @@ fn dispatch(request: tiny_http::Request, proxy: &Arc<omlx::proxy::Server>) {
 /// (it's internally synchronized), so N workers = N concurrent requests.
 fn spawn_workers(
     tiny: Arc<tiny_http::Server>,
-    proxy: Arc<omlx::proxy::Server>,
+    proxy: Arc<ollamux::proxy::Server>,
     stop: Arc<AtomicBool>,
 ) {
     let workers = proxy.pool.total_slots().clamp(4, 64) as usize;
@@ -164,7 +164,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Config>, Stri
                 return Ok(None);
             }
             "-V" | "--version" => {
-                println!("omlx {}", omlx::VERSION);
+                println!("ollamux {}", ollamux::VERSION);
                 return Ok(None);
             }
             "-a" | "--addr" => cfg.addr = value()?,
@@ -180,15 +180,15 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Config>, Stri
 
 fn print_help() {
     println!(
-        "omlx {} — key-rotating proxy for the Ollama Cloud API
+        "ollamux {} — key-rotating proxy for the Ollama Cloud API
 
 USAGE:
-    omlx [--addr HOST:PORT] [--keys PATH] [-v]
+    ollamux [--addr HOST:PORT] [--keys PATH] [-v]
 
 OPTIONS:
     -a, --addr <HOST:PORT>   Listen address [default: {DEFAULT_ADDR}]
-    -k, --keys <PATH>        Keys file (default: $OMLX_KEYS, else
-                             $XDG_CONFIG_HOME/omlx/keys, else ~/.config/omlx/keys)
+    -k, --keys <PATH>        Keys file (default: $OLLAMUX_KEYS, else
+                             $XDG_CONFIG_HOME/ollamux/keys, else ~/.config/ollamux/keys)
     -v, --verbose            Verbose stderr (upstream snippets, cooldowns)
     -h, --help               This help
     -V, --version            Print version
@@ -206,7 +206,7 @@ ENDPOINTS:
     /api/*, /v1/*   proxied to https://ollama.com with key rotation
     /_keys          per-key health JSON
     /_health        liveness JSON",
-        omlx::VERSION
+        ollamux::VERSION
     );
 }
 
@@ -237,7 +237,7 @@ fn block_sigint_before_threading() {
         sigaddset(&mut set, SIGINT);
         let rc = pthread_sigmask(SIG_BLOCK, &set, std::ptr::null_mut());
         if rc != 0 {
-            eprintln!("omlx: warning: cannot block SIGINT ({rc}); ctrl-c will hard-exit");
+            eprintln!("ollamux: warning: cannot block SIGINT ({rc}); ctrl-c will hard-exit");
         }
     }
 }

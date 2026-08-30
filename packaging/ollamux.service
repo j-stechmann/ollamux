@@ -1,30 +1,30 @@
-# omlx.service — shipped by distro packages (AUR, RPM, deb).
+# ollamux.service — shipped by distro packages (AUR, RPM, deb).
 #
 # The proxy is unauthenticated by design: anything that can reach the
 # listen address can use your API quota. This unit therefore keeps the
 # loopback binding and runs under a dynamic (transient) system user.
 #
-# Setup: put one API key per line into /etc/omlx/keys (root-only):
-#   install -m 600 /dev/null /etc/omlx/keys   # then edit
-#   systemctl enable --now omlx
+# Setup: put one API key per line into /etc/ollamux/keys (root-only):
+#   install -m 600 /dev/null /etc/ollamux/keys   # then edit
+#   systemctl enable --now ollamux
 #
 # Key material is handed to the process as a systemd credential
 # (LoadCredential), so the root-owned file never needs to be readable
 # by the transient UID. Inside the service: $CREDENTIALS_DIRECTORY.
 #
-# Extra flags (e.g. -v) go in /etc/default/omlx as OMLX_OPTS="-v".
+# Extra flags (e.g. -v) go in /etc/default/ollamux as OLLAMUX_OPTS="-v".
 
 [Unit]
 Description=Key-rotating reverse proxy for the Ollama Cloud API
-Documentation=https://github.com/j-stechmann/omlx
+Documentation=https://github.com/j-stechmann/ollamux
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/omlx --addr 127.0.0.1:11435 --keys ${CREDENTIALS_DIRECTORY}/omlx-keys $OMLX_OPTS
-EnvironmentFile=-/etc/default/omlx
-LoadCredential=omlx-keys:/etc/omlx/keys
+ExecStart=/usr/bin/ollamux --addr 127.0.0.1:11435 --keys ${CREDENTIALS_DIRECTORY}/ollamux-keys $OLLAMUX_OPTS
+EnvironmentFile=-/etc/default/ollamux
+LoadCredential=ollamux-keys:/etc/ollamux/keys
 
 # Hardening: this service only needs to bind a loopback TCP port and
 # make outbound HTTPS connections.
@@ -55,7 +55,7 @@ SystemCallErrorNumber=EPERM
 SystemCallArchitectures=native
 UMask=0077
 
-# Statelessness: omlx keeps all key state in memory and is designed to
+# Statelessness: ollamux keeps all key state in memory and is designed to
 # be restarted freely; disk access is not needed (credentials arrive by
 # fd), so the whole filesystem tree is invisible via ProtectSystem=strict.
 Restart=on-failure

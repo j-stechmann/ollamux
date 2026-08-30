@@ -1,6 +1,6 @@
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
-Upstream-Name: omlx
-Source: https://github.com/j-stechmann/omlx
+Upstream-Name: ollamux
+Source: https://github.com/j-stechmann/ollamux
 Upstream-Contact: Jonathan Stechmann <69059260+j-stechmann@users.noreply.github.com>
 
 Files: *

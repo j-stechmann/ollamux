@@ -19,7 +19,7 @@ endif
 
 override_dh_auto_install:
 	dh_auto_install
-	install -Dm0644 packaging/omlx.service \
-		debian/omlx/lib/systemd/system/omlx.service
-	install -Dm0644 packaging/omlx.1 \
-		debian/omlx/usr/share/man/man1/omlx.1
+	install -Dm0644 packaging/ollamux.service \
+		debian/ollamux/lib/systemd/system/ollamux.service
+	install -Dm0644 packaging/ollamux.1 \
+		debian/ollamux/usr/share/man/man1/ollamux.1

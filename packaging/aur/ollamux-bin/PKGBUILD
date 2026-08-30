@@ -1,0 +1,25 @@
+# Maintainer: Jonathan Stechmann <69059260+j-stechmann@users.noreply.github.com>
+pkgname=ollamux-bin
+pkgver=0.2.0
+pkgrel=1
+pkgdesc='Key-rotating reverse proxy for the Ollama Cloud API (prebuilt binary)'
+url='https://github.com/j-stechmann/ollamux'
+arch=(x86_64)
+license=(GPL-2.0-or-later)
+depends=(glibc)
+provides=(ollamux="$pkgver")
+conflicts=(ollamux)
+source=("$pkgname-$pkgver.tar.gz::$url/releases/download/v$pkgver/ollamux-$pkgver-x86_64.tar.gz"
+        "ollamux.service::https://raw.githubusercontent.com/j-stechmann/ollamux/v$pkgver/packaging/ollamux.service"
+        "ollamux.1::https://raw.githubusercontent.com/j-stechmann/ollamux/v$pkgver/packaging/ollamux.1")
+sha256sums=('1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef'
+            '1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef'
+            '1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef')
+options=(!strip)
+
+package() {
+  cd "$srcdir"
+  install -Dm755 "ollamux-$pkgver-x86_64/ollamux" "$pkgdir/usr/bin/ollamux"
+  install -Dm644 ollamux.1 "$pkgdir/usr/share/man/man1/ollamux.1"
+  install -Dm644 ollamux.service "$pkgdir/usr/lib/systemd/system/ollamux.service"
+}

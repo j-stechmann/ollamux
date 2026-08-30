@@ -1,4 +1,7 @@
-# omlx
+# ollamux
+
+*ollamux* — an **Olla**ma **mu**ltiple**x**er: a mux, naturally.
+(Previously published as `omlx`.)
 
 A key-rotating reverse proxy for the [Ollama Cloud API](https://ollama.com).
 Give it several API keys and it serves them combined behind one local
@@ -8,7 +11,7 @@ retries on the next key before anything reaches your client.
 
 ```
 ollama CLI ──┐
-OpenAI SDK ──┼──> omlx :11435 ──> https://ollama.com
+OpenAI SDK ──┼──> ollamux :11435 ──> https://ollama.com
   curl ──────┘        (key 1..N, per-key concurrency slots, auto-failover)
 ```
 
@@ -19,9 +22,9 @@ OpenAI SDK ──┼──> omlx :11435 ──> https://ollama.com
 cargo install --path .
 
 # 2. Add your keys (https://ollama.com/settings/keys)
-mkdir -p ~/.config/omlx
-printf '%s\n' 'your-key-one...' 'your-key-two...' > ~/.config/omlx/keys
-chmod 600 ~/.config/omlx/keys
+mkdir -p ~/.config/ollamux
+printf '%s\n' 'your-key-one...' 'your-key-two...' > ~/.config/ollamux/keys
+chmod 600 ~/.config/ollamux/keys
 
 # 3. Point any Ollama client at it
 export OLLAMA_HOST=http://localhost:11435
@@ -32,12 +35,12 @@ ollama run gpt-oss:120b
 
 | Source              | Install                                            |
 | ------------------- | -------------------------------------------------- |
-| AUR (source build)  | `paru -S omlx`                                     |
-| AUR (prebuilt)      | `paru -S omlx-bin`                                 |
-| Fedora/COPR         | `dnf copr enable j-stechmann/omlx && dnf install omlx` |
-| Debian (from release assets) | `apt install ./omlx_0.1.0-1_amd64.deb`    |
-| Container           | `docker run -p 11435:11435 -e OMLX_KEYS=… ghcr.io/j-stechmann/omlx` |
-| From source         | `cargo install --locked omlx` (crates.io) or `cargo install --path .` |
+| AUR (source build)  | `paru -S ollamux`                                     |
+| AUR (prebuilt)      | `paru -S ollamux-bin`                                 |
+| Fedora/COPR         | `dnf copr enable j-stechmann/ollamux && dnf install ollamux` |
+| Debian (from release assets) | `apt install ./ollamux_0.1.0-1_amd64.deb`    |
+| Container           | `docker run -p 11435:11435 -e OLLAMUX_KEYS=… ghcr.io/j-stechmann/ollamux` |
+| From source         | `cargo install --locked ollamux` (crates.io) or `cargo install --path .` |
 
 Prebuilt static binaries (x86_64/aarch64 musl) are attached to each
 GitHub release. Packager notes: [`packaging/README.md`](packaging/README.md).
@@ -51,8 +54,8 @@ client = OpenAI(base_url="http://localhost:11435/v1", api_key="unused")
 
 ## Keys file
 
-One key per line in `~/.config/omlx/keys` (respects `XDG_CONFIG_HOME`),
-or set `OMLX_KEYS` (newline/comma-separated) to skip the file entirely.
+One key per line in `~/.config/ollamux/keys` (respects `XDG_CONFIG_HOME`),
+or set `OLLAMUX_KEYS` (newline/comma-separated) to skip the file entirely.
 Blank lines and `#` comments are allowed.
 
 Optionally set a per-key concurrency limit with a `:N` suffix — the number of
@@ -103,8 +106,8 @@ a mysterious upstream one — see `/_keys` for per-key state.
 
 - Logs: one stderr line per request (`retries=N`, `key=<suffix>`);
   `-v` adds upstream error snippets.
-- Response headers include `X-Omlx-Key` (which key served it) and
-  `X-Omlx-Retries`.
+- Response headers include `X-Ollamux-Key` (which key served it) and
+  `X-Ollamux-Retries`.
 - `SIGINT` (ctrl-c) drains in-flight requests for up to 5 s, then exits;
   press again to force-quit.
 - Request bodies are buffered up to 16 MiB (needed for replay across

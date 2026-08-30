@@ -1,4 +1,12 @@
-omlx (0.1.0-1) unstable; urgency=medium
+ollamux (0.2.0-1) unstable; urgency=medium
+
+  * Rebrand: omlx is now ollamux (Ollama multiplexer).
+  * Environment variables, HTTP headers, error codes and config paths
+    renamed accordingly (OLLAMUX_KEYS, X-Ollamux-*, ~/.config/ollamux).
+
+ -- Jonathan Stechmann <69059260+j-stechmann@users.noreply.github.com>  Sun, 30 Aug 2026 16:00:00 +0000
+
+ollamux (0.1.0-1) unstable; urgency=medium
 
   * Initial release.
 

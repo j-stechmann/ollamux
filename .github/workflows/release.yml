@@ -47,21 +47,21 @@ jobs:
           export RUSTFLAGS="-C target-feature=+crt-static"
           cargo build --locked --release --target ${{ matrix.target }}
       - name: smoke
-        run: ./target/${{ matrix.target }}/release/omlx --version
+        run: ./target/${{ matrix.target }}/release/ollamux --version
       - name: package
         run: |
           VER="${GITHUB_REF_NAME#v}"
-          mkdir "omlx-$VER-${{ matrix.arch }}"
-          cp "target/${{ matrix.target }}/release/omlx" "omlx-$VER-${{ matrix.arch }}/"
-          cp README.md LICENSE "omlx-$VER-${{ matrix.arch }}/"
-          tar -czf "omlx-$VER-${{ matrix.arch }}.tar.gz" "omlx-$VER-${{ matrix.arch }}"
-          sha256sum "omlx-$VER-${{ matrix.arch }}.tar.gz" > "omlx-$VER-${{ matrix.arch }}.tar.gz.sha256"
+          mkdir "ollamux-$VER-${{ matrix.arch }}"
+          cp "target/${{ matrix.target }}/release/ollamux" "ollamux-$VER-${{ matrix.arch }}/"
+          cp README.md LICENSE "ollamux-$VER-${{ matrix.arch }}/"
+          tar -czf "ollamux-$VER-${{ matrix.arch }}.tar.gz" "ollamux-$VER-${{ matrix.arch }}"
+          sha256sum "ollamux-$VER-${{ matrix.arch }}.tar.gz" > "ollamux-$VER-${{ matrix.arch }}.tar.gz.sha256"
       - uses: actions/upload-artifact@v4
         with:
           name: binary-${{ matrix.arch }}
           path: |
-            omlx-*-*.tar.gz
-            omlx-*-*.tar.gz.sha256
+            ollamux-*-*.tar.gz
+            ollamux-*-*.tar.gz.sha256
           if-no-files-found: error
 
   # ---- 2. source + vendor tarballs ----------------------------------
@@ -77,9 +77,9 @@ jobs:
         with:
           name: source
           path: |
-            dist/omlx-*.tar.gz
-            dist/omlx-*-vendor.tar.xz
-            dist/omlx-*-cargo-config.toml
+            dist/ollamux-*.tar.gz
+            dist/ollamux-*-vendor.tar.xz
+            dist/ollamux-*-cargo-config.toml
             dist/SHA256SUMS
           if-no-files-found: error
 
@@ -101,38 +101,38 @@ jobs:
       - name: unpack + rustc sanity
         run: |
           rustc --version
-          tar -xzf omlx-*.tar.gz
+          tar -xzf ollamux-*.tar.gz
           VER="${GITHUB_REF_NAME#v}"
           # vendor/ lands inside the source tree; the in-tree
           # .cargo/config.toml (in the tarball) makes this offline.
-          tar -xJf "omlx-$VER-vendor.tar.xz" -C "omlx-$VER"
+          tar -xJf "ollamux-$VER-vendor.tar.xz" -C "ollamux-$VER"
       - name: offline build
         run: |
-          cd "omlx-${GITHUB_REF_NAME#v}"
+          cd "ollamux-${GITHUB_REF_NAME#v}"
           cargo build --locked --offline --release
       - name: assemble deb
         run: |
           VER="${GITHUB_REF_NAME#v}"
-          D="omlx-$VER-deb/DEBIAN"
-          mkdir -p "$D" "omlx-$VER-deb/usr/bin" "omlx-$VER-deb/usr/share/man/man1" \
-                   "omlx-$VER-deb/usr/share/licenses/omlx" \
-                   "omlx-$VER-deb/usr/lib/systemd/system"
-          install -m755 "omlx-$VER/target/release/omlx" "omlx-$VER-deb/usr/bin/"
+          D="ollamux-$VER-deb/DEBIAN"
+          mkdir -p "$D" "ollamux-$VER-deb/usr/bin" "ollamux-$VER-deb/usr/share/man/man1" \
+                   "ollamux-$VER-deb/usr/share/licenses/ollamux" \
+                   "ollamux-$VER-deb/usr/lib/systemd/system"
+          install -m755 "ollamux-$VER/target/release/ollamux" "ollamux-$VER-deb/usr/bin/"
           # unit/man live inside the source tarball (job has no checkout)
-          gzip -9c "omlx-$VER/packaging/omlx.1" > "omlx-$VER-deb/usr/share/man/man1/omlx.1.gz"
-          install -m644 "omlx-$VER/packaging/omlx.service" "omlx-$VER-deb/usr/lib/systemd/system/"
-          install -m644 "omlx-$VER/LICENSE" "omlx-$VER-deb/usr/share/licenses/omlx/"
+          gzip -9c "ollamux-$VER/packaging/ollamux.1" > "ollamux-$VER-deb/usr/share/man/man1/ollamux.1.gz"
+          install -m644 "ollamux-$VER/packaging/ollamux.service" "ollamux-$VER-deb/usr/lib/systemd/system/"
+          install -m644 "ollamux-$VER/LICENSE" "ollamux-$VER-deb/usr/share/licenses/ollamux/"
           # control file (minimum viable; lintian-cleanliness is distro's job)
           {
-            echo "Package: omlx"
+            echo "Package: ollamux"
             echo "Version: $VER-1"
             echo "Architecture: amd64"
             echo "Maintainer: Jonathan Stechmann <69059260+j-stechmann@users.noreply.github.com>"
             echo "Depends: libc6 (>= 2.34)"
             echo "Description: key-rotating reverse proxy for the Ollama Cloud API"
           } > "$D/control"
-          dpkg-deb --build --root-owner-group "omlx-$VER-deb" "omlx_${VER}-1_amd64.deb"
-          sha256sum "omlx_${VER}-1_amd64.deb" > "omlx_${VER}-1_amd64.deb.sha256"
+          dpkg-deb --build --root-owner-group "ollamux-$VER-deb" "ollamux_${VER}-1_amd64.deb"
+          sha256sum "ollamux_${VER}-1_amd64.deb" > "ollamux_${VER}-1_amd64.deb.sha256"
       - uses: actions/upload-artifact@v4
         with:
           name: deb
@@ -161,20 +161,20 @@ jobs:
           VER="${GITHUB_REF_NAME#v}"
           rpmbuild_dir="$HOME/rpmbuild"
           mkdir -p "$rpmbuild_dir"/{SOURCES,SPECS,RPMS,SRPMS,BUILD}
-          cp "omlx-$VER.tar.gz" \
-             "omlx-$VER-vendor.tar.xz" "$rpmbuild_dir/SOURCES/"
+          cp "ollamux-$VER.tar.gz" \
+             "ollamux-$VER-vendor.tar.xz" "$rpmbuild_dir/SOURCES/"
           # spec/unit/man come from inside the source tarball (this job
           # has no checkout); the tarball is the artifact under test.
-          tar -xzf "omlx-$VER.tar.gz" \
-            "omlx-$VER/packaging/rpm/omlx.spec" \
-            "omlx-$VER/packaging/omlx.service" \
-            "omlx-$VER/packaging/omlx.1"
-          cp "omlx-$VER/packaging/omlx.service" "$rpmbuild_dir/SOURCES/omlx.service"
-          cp "omlx-$VER/packaging/omlx.1" "$rpmbuild_dir/SOURCES/omlx.1"
-          cp "omlx-$VER/packaging/rpm/omlx.spec" "$rpmbuild_dir/SPECS/omlx.spec"
+          tar -xzf "ollamux-$VER.tar.gz" \
+            "ollamux-$VER/packaging/rpm/ollamux.spec" \
+            "ollamux-$VER/packaging/ollamux.service" \
+            "ollamux-$VER/packaging/ollamux.1"
+          cp "ollamux-$VER/packaging/ollamux.service" "$rpmbuild_dir/SOURCES/ollamux.service"
+          cp "ollamux-$VER/packaging/ollamux.1" "$rpmbuild_dir/SOURCES/ollamux.1"
+          cp "ollamux-$VER/packaging/rpm/ollamux.spec" "$rpmbuild_dir/SPECS/ollamux.spec"
       - name: build rpm + srpm
         run: |
-          rpmbuild -ba ~/rpmbuild/SPECS/omlx.spec
+          rpmbuild -ba ~/rpmbuild/SPECS/ollamux.spec
           sha256sum ~/rpmbuild/RPMS/x86_64/*.rpm > rpm.sha256
           sha256sum ~/rpmbuild/SRPMS/*.src.rpm > srpm.sha256
       - uses: actions/upload-artifact@v4
@@ -213,13 +213,13 @@ jobs:
         with:
           generate_release_notes: true
           files: |
-            omlx-*-*.tar.gz
-            omlx-*-*.tar.gz.sha256
-            omlx_*.deb
-            omlx_*.deb.sha256
+            ollamux-*-*.tar.gz
+            ollamux-*-*.tar.gz.sha256
+            ollamux_*.deb
+            ollamux_*.deb.sha256
             *.rpm
             *.src.rpm
-            omlx-*-vendor.tar.xz
+            ollamux-*-vendor.tar.xz
             SHA256SUMS
 
   # ---- 6. container image to GHCR ------------------------------------
@@ -245,7 +245,7 @@ jobs:
             ghcr.io/${{ github.repository }}:${{ github.ref_name }}
             ghcr.io/${{ github.repository }}:latest
 
-  # ---- 7. AUR push (omlx source + omlx-bin), real makepkg ------------
+  # ---- 7. AUR push (ollamux source + ollamux-bin), real makepkg ------------
   # Skips cleanly when AUR_SSH_KEY is not configured (e.g. AUR signups
   # closed); add the secret later and re-run this job via workflow_dispatch.
   aur:
@@ -256,8 +256,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - pkg: omlx
-          - pkg: omlx-bin
+          - pkg: ollamux
+          - pkg: ollamux-bin
     permissions:
       contents: read
     env:
@@ -310,7 +310,7 @@ jobs:
         env:
           PKG: ${{ matrix.pkg }}
         run: |
-          git config --global user.name "omlx-release-bot"
+          git config --global user.name "ollamux-release-bot"
           git config --global user.email "69059260+j-stechmann@users.noreply.github.com"
           cd "packaging/aur/$PKG"
           aur_repo="ssh://aur@aur.archlinux.org/$PKG.git"
@@ -366,7 +366,7 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: copr build
         if: ${{ steps.secret.outputs.available == 'true' }}
-        run: copr-cli build j-stechmann/omlx *.src.rpm
+        run: copr-cli build j-stechmann/ollamux *.src.rpm
 
   # ---- 9. crates.io --------------------------------------------------
   # Skips cleanly when CARGO_REGISTRY_TOKEN is not configured.

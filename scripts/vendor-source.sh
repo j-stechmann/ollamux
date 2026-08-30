@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Produce the release source tarball + vendored-crates archive:
-#   omlx-<ver>.tar.gz        — git-archive (HEAD) + .cargo/config.toml
-#   omlx-<ver>-vendor.tar.xz — cargo vendor output, flat "vendor/" root
+#   ollamux-<ver>.tar.gz        — git-archive (HEAD) + .cargo/config.toml
+#   ollamux-<ver>-vendor.tar.xz — cargo vendor output, flat "vendor/" root
 #   SHA256SUMS               — checksums for both
 #
 # Consumers:
@@ -15,7 +15,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 VER="${1:-$(cargo pkgid | sed 's/.*#//')}"
-NAME="omlx-$VER"
+NAME="ollamux-$VER"
 OUT="dist"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT

@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [master]
   pull_request:
 
 permissions:
@@ -41,7 +41,7 @@ jobs:
       - uses: actions/checkout@v5
       - name: PKGBUILD validity + .SRCINFO freshness
         run: |
-          for p in packaging/aur/omlx packaging/aur/omlx-bin; do
+          for p in packaging/aur/ollamux packaging/aur/ollamux-bin; do
             cd "$p"
             makepkg --printsrcinfo > /tmp/expected.SRCINFO
             diff -u .SRCINFO /tmp/expected.SRCINFO \

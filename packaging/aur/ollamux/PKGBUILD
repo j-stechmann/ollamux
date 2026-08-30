@@ -1,19 +1,19 @@
 # Maintainer: Jonathan Stechmann <69059260+j-stechmann@users.noreply.github.com>
-pkgname=omlx
-pkgver=0.1.0
+pkgname=ollamux
+pkgver=0.2.0
 pkgrel=1
 pkgdesc='Key-rotating reverse proxy for the Ollama Cloud API'
-url='https://github.com/j-stechmann/omlx'
+url='https://github.com/j-stechmann/ollamux'
 arch=(x86_64 aarch64)
 license=(GPL-2.0-or-later)
 depends=(glibc gcc-libs)
 makedepends=(cargo)
 checkdepends=(cargo)
-provides=(omlx="$pkgver")
-conflicts=(omlx-bin)
+provides=(ollamux="$pkgver")
+conflicts=(ollamux-bin)
 source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz"
-        "omlx.service::$url/raw/v$pkgver/packaging/omlx.service"
-        "omlx.1::$url/raw/v$pkgver/packaging/omlx.1")
+        "ollamux.service::$url/raw/v$pkgver/packaging/ollamux.service"
+        "ollamux.1::$url/raw/v$pkgver/packaging/ollamux.1")
 sha256sums=('1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef'
             '1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef'
             '1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef')
@@ -41,6 +41,6 @@ package() {
   install -Dm755 "target/release/$pkgname" -t "$pkgdir/usr/bin/"
   install -Dm644 LICENSE -t "$pkgdir/usr/share/licenses/$pkgname/"
   install -Dm644 README.md -t "$pkgdir/usr/share/doc/$pkgname/"
-  install -Dm644 "$srcdir/omlx.1" "$pkgdir/usr/share/man/man1/omlx.1"
-  install -Dm644 "$srcdir/omlx.service" "$pkgdir/usr/lib/systemd/system/omlx.service"
+  install -Dm644 "$srcdir/ollamux.1" "$pkgdir/usr/share/man/man1/ollamux.1"
+  install -Dm644 "$srcdir/ollamux.service" "$pkgdir/usr/lib/systemd/system/ollamux.service"
 }
