@@ -277,6 +277,15 @@ jobs:
         run: pacman -Syu --noconfirm git openssh pacman-contrib
       - uses: actions/checkout@v5
         if: ${{ steps.secret.outputs.available == 'true' }}
+      - name: prepare non-root makepkg user
+        if: ${{ steps.secret.outputs.available == 'true' }}
+        env:
+          PKG: ${{ matrix.pkg }}
+        run: |
+          # container jobs run as root; makepkg refuses EUID 0 and needs
+          # write access to the package dir it runs in
+          useradd -m builder
+          chown -R builder:builder "packaging/aur/$PKG"
       - name: configure ssh
         if: ${{ steps.secret.outputs.available == 'true' }}
         run: |
@@ -294,17 +303,19 @@ jobs:
         run: |
           VER="${GITHUB_REF_NAME#v}"
           cd "packaging/aur/$PKG"
-          sed -i "s/^pkgver=.*/pkgver=$VER/" PKGBUILD
-          sed -i "s/^pkgrel=.*/pkgrel=1/" PKGBUILD
+          # all file mutations here happen as the builder user so ownership
+          # stays consistent for the makepkg steps below
+          runuser -u builder -- sed -i "s/^pkgver=.*/pkgver=$VER/" PKGBUILD
+          runuser -u builder -- sed -i "s/^pkgrel=.*/pkgrel=1/" PKGBUILD
           # refresh checksums: downloads the actual release assets
-          updpkgsums
+          runuser -u builder -- updpkgsums
       - name: regenerate .SRCINFO
         if: ${{ steps.secret.outputs.available == 'true' }}
         env:
           PKG: ${{ matrix.pkg }}
         run: |
           cd "packaging/aur/$PKG"
-          makepkg --printsrcinfo > .SRCINFO
+          runuser -u builder -- makepkg --printsrcinfo > .SRCINFO
       - name: push to AUR
         if: ${{ steps.secret.outputs.available == 'true' }}
         env:
