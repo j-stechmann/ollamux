@@ -32,6 +32,9 @@ https://ollama.com.}
 
 %prep
 %autosetup -p1 -n omlx-%{version}
+# vendor/ from the vendor tarball lands inside the source tree; cargo_prep
+# then wires crates.io -> ./vendor (offline).
+tar -xJf %{SOURCE1}
 %cargo_prep -v vendor
 
 %build
