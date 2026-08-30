@@ -203,10 +203,8 @@ jobs:
       # hoist *.rpm and *.src.rpm from wherever they are to the workspace root
       - name: flatten rpm paths
         run: |
-          shopt -s globstar
-          cp -v --parents **/*.rpm . 2>/dev/null || true
-          cp -v --parents **/*.src.rpm . 2>/dev/null || true
-          ls -la *.rpm *.src.rpm 2>/dev/null
+          find . -name '*.rpm' -type f -exec mv -v {} . +
+          ls -la *.rpm
       - name: create release
         id: create
         uses: softprops/action-gh-release@v2
