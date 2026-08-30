@@ -68,25 +68,30 @@ fn main() {
         }
     };
 
-    eprintln!(
-        "ollamux v{}: {} key(s) loaded [{}], {} slot(s), listening on http://{addr}",
-        ollamux::VERSION,
-        keys.len(),
-        keys.suffixes().join(", "),
-        pool.total_slots(),
-    );
-    eprintln!("ollamux: point clients at http://{addr} (OLLAMA_HOST or base_url …/v1)");
+    if cfg.verbose {
+        eprintln!(
+            "ollamux v{}: {} key(s) loaded [{}], {} slot(s), listening on http://{addr}",
+            ollamux::VERSION,
+            keys.len(),
+            keys.suffixes().join(", "),
+            pool.total_slots(),
+        );
+        eprintln!("ollamux: point clients at http://{addr} (OLLAMA_HOST or base_url …/v1)");
+    }
 
     let stop = Arc::new(AtomicBool::new(false));
     spawn_workers(tiny.clone(), proxy.clone(), stop.clone());
 
+    let verbose = cfg.verbose;
     let stop_ctrl = stop.clone();
     install_sigint(move || {
         stop_ctrl.store(true, Ordering::SeqCst);
-        eprintln!(
-            "ollamux: shutting down (draining up to {}s; ctrl-c again to force quit)",
-            DRAIN.as_secs()
-        )
+        if verbose {
+            eprintln!(
+                "ollamux: shutting down (draining up to {}s; ctrl-c again to force quit)",
+                DRAIN.as_secs()
+            )
+        }
     });
 
     // --- main loop: accept until stopped, then drain ---
@@ -94,7 +99,11 @@ fn main() {
         match tiny.recv_timeout(Duration::from_millis(250)) {
             Ok(Some(request)) => dispatch(request, &proxy),
             Ok(None) => {}
-            Err(e) => eprintln!("ollamux: recv error: {e}"),
+            Err(e) => {
+                if verbose {
+                    eprintln!("ollamux: recv error: {e}")
+                }
+            }
         }
     }
 
@@ -106,7 +115,9 @@ fn main() {
             Err(_) => break,
         }
     }
-    eprintln!("ollamux: bye");
+    if verbose {
+        eprintln!("ollamux: bye");
+    }
 }
 
 fn dispatch(request: tiny_http::Request, proxy: &Arc<ollamux::proxy::Server>) {
@@ -189,7 +200,8 @@ OPTIONS:
     -a, --addr <HOST:PORT>   Listen address [default: {DEFAULT_ADDR}]
     -k, --keys <PATH>        Keys file (default: $OLLAMUX_KEYS, else
                              $XDG_CONFIG_HOME/ollamux/keys, else ~/.config/ollamux/keys)
-    -v, --verbose            Verbose stderr (upstream snippets, cooldowns)
+    -v, --verbose            Verbose stderr (startup banner, per-request log,
+                             key cooldowns/deaths, upstream snippets)
     -h, --help               This help
     -V, --version            Print version
 

@@ -185,6 +185,11 @@ impl Pool {
         self.states.iter().map(|s| s.concurrency).sum()
     }
 
+    /// Whether verbose stderr logging is enabled.
+    pub fn verbose(&self) -> bool {
+        self.verbose
+    }
+
     pub fn suffix_of(&self, key: usize) -> String {
         crate::config::suffix(&self.keys[key])
     }

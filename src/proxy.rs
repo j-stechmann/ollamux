@@ -100,16 +100,18 @@ impl Server {
 
         let (status, retries, key) = self.route(req, &path, query.as_deref());
 
-        eprintln!(
-            "ollamux: #{id} {method} {path} -> {status}{}{} dur={}ms",
-            if retries > 0 {
-                format!(" retries={retries}")
-            } else {
-                String::new()
-            },
-            key.map(|s| format!(" key={s}")).unwrap_or_default(),
-            started.elapsed().as_millis(),
-        );
+        if self.pool.verbose() {
+            eprintln!(
+                "ollamux: #{id} {method} {path} -> {status}{}{} dur={}ms",
+                if retries > 0 {
+                    format!(" retries={retries}")
+                } else {
+                    String::new()
+                },
+                key.map(|s| format!(" key={s}")).unwrap_or_default(),
+                started.elapsed().as_millis(),
+            );
+        }
     }
 
     /// Returns (client-visible status, retries used, key suffix if proxied).
@@ -525,7 +527,9 @@ impl Server {
                         let _ = w.write_all(b"0\r\n\r\n");
                         let _ = w.flush();
                     }
-                    eprintln!("ollamux: upstream died mid-stream: {e}");
+                    if self.pool.verbose() {
+                        eprintln!("ollamux: upstream died mid-stream: {e}");
+                    }
                     return Attempt::Sent(502);
                 }
             }

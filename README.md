@@ -104,8 +104,9 @@ a mysterious upstream one — see `/_keys` for per-key state.
 
 ## Runtime notes
 
-- Logs: one stderr line per request (`retries=N`, `key=<suffix>`);
-  `-v` adds upstream error snippets.
+- Logs: silent by default. `-v` adds a per-request stderr line
+  (`retries=N`, `key=<suffix>`), key cooldown/death events, startup banner,
+  shutdown notices, and upstream error snippets; fatal errors always print.
 - Response headers include `X-Ollamux-Key` (which key served it) and
   `X-Ollamux-Retries`.
 - `SIGINT` (ctrl-c) drains in-flight requests for up to 5 s, then exits;
