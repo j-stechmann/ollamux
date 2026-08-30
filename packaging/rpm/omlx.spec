@@ -46,6 +46,9 @@ export RUSTFLAGS="%{build_rustflags}"
 %cargo_install
 install -Dm0644 %{SOURCE2} %{buildroot}%{_unitdir}/omlx.service
 install -Dm0644 %{SOURCE3} %{buildroot}%{_mandir}/man1/omlx.1
+# cargo_install registers the crate in /usr/share/cargo/registry; an
+# application package owns only the binary, unit and man page.
+rm -rf %{buildroot}/usr/share/cargo/registry
 
 %check
 %cargo_test
