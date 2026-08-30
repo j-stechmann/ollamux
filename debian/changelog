@@ -1,3 +1,11 @@
+ollamux (0.3.0-1) unstable; urgency=medium
+
+  * Logging is now silent by default; -v enables banner, request log
+    and notices.
+  * Errors are agent-friendly; responses carry an X-Ollamux header.
+
+ -- Jonathan Stechmann <69059260+j-stechmann@users.noreply.github.com>  Sun, 30 Aug 2026 20:00:00 +0000
+
 ollamux (0.2.0-1) unstable; urgency=medium
 
   * Rebrand: omlx is now ollamux (Ollama multiplexer).
