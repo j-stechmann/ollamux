@@ -197,16 +197,16 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           merge-multiple: true
-      # the rpm artifact preserves container-internal paths
-      # (/github/home/rpmbuild/...); hoist the packages up
+      # the rpm job runs in a container and uploads /github/home/rpmbuild/...;
+      # download-artifact extracts relative to the runner $HOME, so the rpms
+      # can land in either RPMS/ (observed) or github/home/rpmbuild/RPMS/ —
+      # hoist *.rpm and *.src.rpm from wherever they are to the workspace root
       - name: flatten rpm paths
         run: |
-          if [ -d github/home/rpmbuild ]; then
-            mv -v github/home/rpmbuild/RPMS/x86_64/*.rpm .
-            mv -v github/home/rpmbuild/SRPMS/*.src.rpm .
-            rm -rf github
-          fi
-          ls -la
+          shopt -s globstar
+          cp -v --parents **/*.rpm . 2>/dev/null || true
+          cp -v --parents **/*.src.rpm . 2>/dev/null || true
+          ls -la *.rpm *.src.rpm 2>/dev/null
       - name: create release
         id: create
         uses: softprops/action-gh-release@v2
