@@ -35,6 +35,17 @@ fn spawn_server(pool: Arc<ollamux::Pool>, upstream: &str) -> String {
     format!("http://{addr}")
 }
 
+fn headers_of(r: &ureq::Response) -> Vec<(String, String)> {
+    r.headers_names()
+        .into_iter()
+        .flat_map(|n| {
+            r.all(&n)
+                .into_iter()
+                .map(move |v| (n.clone(), v.to_string()))
+        })
+        .collect()
+}
+
 fn get(url: &str, path: &str) -> (u16, String, Vec<(String, String)>) {
     let resp = match ureq::get(&format!("{url}{path}")).call() {
         Ok(r) => r,
@@ -42,24 +53,13 @@ fn get(url: &str, path: &str) -> (u16, String, Vec<(String, String)>) {
         Err(e) => panic!("request failed: {e}"),
     };
     let status = resp.status();
-    let headers: Vec<(String, String)> = resp
-        .headers_names()
-        .into_iter()
-        .flat_map(|n| {
-            resp.all(&n)
-                .into_iter()
-                .map(move |v| (n.clone(), v.to_string()))
-        })
-        .collect();
+    let headers = headers_of(&resp);
     (status, resp.into_string().unwrap(), headers)
 }
 
 fn post(url: &str, path: &str, body: &str) -> (u16, String) {
-    match ureq::post(&format!("{url}{path}")).send_string(body) {
-        Ok(r) => (r.status(), r.into_string().unwrap()),
-        Err(ureq::Error::Status(code, r)) => (code, r.into_string().unwrap()),
-        Err(e) => panic!("request failed: {e}"),
-    }
+    let (status, body, _) = post_with_headers(url, path, body);
+    (status, body)
 }
 
 fn post_with_headers(url: &str, path: &str, body: &str) -> (u16, String, Vec<(String, String)>) {
@@ -75,17 +75,6 @@ fn post_with_headers(url: &str, path: &str, body: &str) -> (u16, String, Vec<(St
         }
         Err(e) => panic!("request failed: {e}"),
     }
-}
-
-fn headers_of(r: &ureq::Response) -> Vec<(String, String)> {
-    r.headers_names()
-        .into_iter()
-        .flat_map(|n| {
-            r.all(&n)
-                .into_iter()
-                .map(move |v| (n.clone(), v.to_string()))
-        })
-        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -231,12 +220,17 @@ fn keys_health_and_404_endpoints() {
 // ollamux (vs a real Ollama server or a CDN) by header alone.
 #[test]
 fn all_responses_carry_identity_header() {
-    let up = Upstream::spawn(|_| {
-        (
-            404u16,
-            "Not Found".into(),
-            r#"{"error":"upstream 404"}"#.into(),
-        )
+    // /api/generate streams a 200; every other path 404s (relayed verbatim).
+    let up = Upstream::spawn(|path| {
+        if path.starts_with("/api/generate") {
+            (200u16, "OK".into(), "line1\nline2\n".into())
+        } else {
+            (
+                404u16,
+                "Not Found".into(),
+                r#"{"error":"upstream 404"}"#.into(),
+            )
+        }
     });
     let addr = spawn_server(pool_with(&[("omk-ident001", 1)]), &up.url);
 
@@ -266,7 +260,20 @@ fn all_responses_carry_identity_header() {
         "404 must carry X-Ollamux: {headers:?}"
     );
 
-    let (status, body, headers) = post_with_headers(&addr, "/api/generate", r#"{"model":"x"}"#);
+    // Streaming responses are hand-framed in stream_chunked; the identity
+    // header must not drift from identity_header().
+    let (status, body, headers) =
+        post_with_headers(&addr, "/api/generate", r#"{"model":"x","stream":true}"#);
+    assert_eq!(status, 200);
+    assert_eq!(body, "line1\nline2\n");
+    assert!(
+        headers
+            .iter()
+            .any(|(n, v)| n.eq_ignore_ascii_case("x-ollamux") && v.contains("ollamux/")),
+        "streaming response must carry X-Ollamux: {headers:?}"
+    );
+
+    let (status, body, headers) = post_with_headers(&addr, "/api/show", r#"{"model":"x"}"#);
     assert_eq!(status, 404, "upstream 404 is not a key signal; relayed");
     assert!(
         headers

@@ -178,15 +178,18 @@ impl Server {
                 let (status, msg) = if too_large {
                     (
                         413u16,
-                        "request body exceeds ollamux's 16 MiB limit (bodies are buffered in memory so they can be replayed across key failover); reduce attachments/images or send the model a URL instead",
+                        format!(
+                            "request body exceeds ollamux's {} MiB limit (bodies are buffered in memory so they can be replayed across key failover); reduce attachments/images or send the model a URL instead",
+                            MAX_BODY / (1024 * 1024)
+                        ),
                     )
                 } else {
                     (
                         400u16,
-                        "ollamux failed to read the request body (client disconnected or sent a malformed/truncated request); retry the request",
+                        "ollamux failed to read the request body (client disconnected or sent a malformed/truncated request); retry the request".to_string(),
                     )
                 };
-                let json = error_json(is_v1, msg, status);
+                let json = error_json(is_v1, &msg, status);
                 json_response(req, status, &json, None);
                 return (status, 0, None);
             }
@@ -216,7 +219,8 @@ impl Server {
                     let json = error_json(
                         is_v1,
                         &format!(
-                            "ollamux could not reach the upstream (https://ollama.com): {reason}. Check network access and per-key state via GET /_keys; ollamux retries automatically, so a repeat of this request may succeed."
+                            "ollamux could not reach the upstream ({}): {reason}. Check network access and per-key state via GET /_keys; no automatic retry applies to this endpoint — repeat the request.",
+                            self.upstream
                         ),
                         502,
                     );
@@ -255,8 +259,9 @@ impl Server {
                 Attempt::Retryable(reason) => {
                     if retries + 1 >= MAX_ATTEMPTS || no_auth {
                         let msg = format!(
-                            "ollamux exhausted all {} failover attempt(s) against https://ollama.com; last error: {reason}. Per-key state: GET /_keys. The keys each cool down and recover automatically, so retrying later may succeed.",
-                            retries + 1
+                            "ollamux exhausted all {} failover attempt(s) against {}; last error: {reason}. Per-key state: GET /_keys. The keys each cool down and recover automatically, so retrying later may succeed.",
+                            retries + 1,
+                            self.upstream
                         );
                         let json = error_json(is_v1, &msg, 502);
                         json_response(req, 502, &json, None);
@@ -503,7 +508,12 @@ impl Server {
         let http10 = req.http_version() < &tiny_http::HTTPVersion(1, 1);
         let mut w = req.into_writer();
         let mut head = format!("HTTP/1.1 {status} {}\r\n", reason_phrase(status));
-        head.push_str(&format!("X-Ollamux: ollamux/{}\r\n", crate::VERSION));
+        let ident = identity_header();
+        head.push_str(&format!(
+            "{}: {}\r\n",
+            ident.field.as_str(),
+            ident.value.as_str()
+        ));
         if let Some(k) = key {
             head.push_str(&format!("X-Ollamux-Key: {}\r\n", self.pool.suffix_of(k)));
         }
