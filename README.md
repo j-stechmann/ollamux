@@ -28,6 +28,20 @@ export OLLAMA_HOST=http://localhost:11435
 ollama run gpt-oss:120b
 ```
 
+## Install (distro packages)
+
+| Source              | Install                                            |
+| ------------------- | -------------------------------------------------- |
+| AUR (source build)  | `paru -S omlx`                                     |
+| AUR (prebuilt)      | `paru -S omlx-bin`                                 |
+| Fedora/COPR         | `dnf copr enable j-stechmann/omlx && dnf install omlx` |
+| Debian (from release assets) | `apt install ./omlx_0.1.0-1_amd64.deb`    |
+| Container           | `docker run -p 11435:11435 -e OMLX_KEYS=… ghcr.io/j-stechmann/omlx` |
+| From source         | `cargo install --locked omlx` (crates.io) or `cargo install --path .` |
+
+Prebuilt static binaries (x86_64/aarch64 musl) are attached to each
+GitHub release. Packager notes: [`packaging/README.md`](packaging/README.md).
+
 OpenAI-compatible clients use the same proxy with a base URL:
 
 ```python

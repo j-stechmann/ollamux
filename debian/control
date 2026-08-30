@@ -1,0 +1,26 @@
+Source: omlx
+Section: net
+Priority: optional
+Maintainer: Jonathan Stechmann <69059260+j-stechmann@users.noreply.github.com>
+Build-Depends: debhelper-compat (= 13), cargo, rustc:native (>= 1.85), pkg-config
+Standards-Version: 4.7.2
+Homepage: https://github.com/j-stechmann/omlx
+Vcs-Browser: https://github.com/j-stechmann/omlx
+Vcs-Git: https://github.com/j-stechmann/omlx.git
+Rules-Requires-Root: no
+
+Package: omlx
+Architecture: any
+Depends: ${misc:Depends}, ${shlibs:Depends}
+Recommends: systemd | systemd-tmpfiles
+Description: key-rotating reverse proxy for the Ollama Cloud API
+ omlx gives several Ollama Cloud API keys and serves them combined
+ behind one local endpoint. Requests are spread across keys
+ (round-robin, least-loaded first), and when a key is rate-limited,
+ rejected, or invalid, the request silently retries on the next key
+ before anything reaches the client.
+ .
+ This is not a local Ollama server: it serves no models, it proxies to
+ https://ollama.com. Point Ollama clients at it via
+ OLLAMA_HOST=http://localhost:11435, or OpenAI-compatible clients via
+ base URL http://localhost:11435/v1.

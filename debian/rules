@@ -1,0 +1,25 @@
+#!/usr/bin/make -f
+
+# Vendored crates (vendor/ + .cargo/config.toml from the source
+# tarball) make the build offline and rustc flags flow via CARGO_BUILD_*
+# set by dh. Do not strip here: Cargo release profile strips already.
+
+export CARGO_BUILD_JOBS=$(shell nproc)
+
+%:
+	dh $@ --buildsystem=cargo
+
+override_dh_auto_build:
+	dh_auto_build -- release --locked --offline
+
+override_dh_auto_test:
+ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))
+	CARGO_NET_OFFLINE=true dh_auto_test -- release --locked --offline --no-default-features
+endif
+
+override_dh_auto_install:
+	dh_auto_install
+	install -Dm0644 packaging/omlx.service \
+		debian/omlx/lib/systemd/system/omlx.service
+	install -Dm0644 packaging/omlx.1 \
+		debian/omlx/usr/share/man/man1/omlx.1

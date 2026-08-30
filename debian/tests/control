@@ -1,0 +1,4 @@
+Tests: smoke
+Depends: omlx
+
+Test-Command: omlx --version

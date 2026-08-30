@@ -1,0 +1,25 @@
+# Maintainer: Jonathan Stechmann <69059260+j-stechmann@users.noreply.github.com>
+pkgname=omlx-bin
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Key-rotating reverse proxy for the Ollama Cloud API (prebuilt binary)'
+url='https://github.com/j-stechmann/omlx'
+arch=(x86_64)
+license=(GPL-2.0-or-later)
+depends=(glibc)
+provides=(omlx="$pkgver")
+conflicts=(omlx)
+source=("$pkgname-$pkgver.tar.gz::$url/releases/download/v$pkgver/omlx-$pkgver-x86_64.tar.gz"
+        "omlx.service::https://raw.githubusercontent.com/j-stechmann/omlx/v$pkgver/packaging/omlx.service"
+        "omlx.1::https://raw.githubusercontent.com/j-stechmann/omlx/v$pkgver/packaging/omlx.1")
+sha256sums=('1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef'
+            '1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef'
+            '1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef')
+options=(!strip)
+
+package() {
+  cd "$srcdir"
+  install -Dm755 "omlx-$pkgver-x86_64/omlx" "$pkgdir/usr/bin/omlx"
+  install -Dm644 omlx.1 "$pkgdir/usr/share/man/man1/omlx.1"
+  install -Dm644 omlx.service "$pkgdir/usr/lib/systemd/system/omlx.service"
+}

@@ -1,0 +1,46 @@
+# Maintainer: Jonathan Stechmann <69059260+j-stechmann@users.noreply.github.com>
+pkgname=omlx
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Key-rotating reverse proxy for the Ollama Cloud API'
+url='https://github.com/j-stechmann/omlx'
+arch=(x86_64 aarch64)
+license=(GPL-2.0-or-later)
+depends=(glibc gcc-libs)
+makedepends=(cargo)
+checkdepends=(cargo)
+provides=(omlx="$pkgver")
+conflicts=(omlx-bin)
+source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz"
+        "omlx.service::$url/raw/v$pkgver/packaging/omlx.service"
+        "omlx.1::$url/raw/v$pkgver/packaging/omlx.1")
+sha256sums=('1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef'
+            '1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef'
+            '1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef')
+options=(!lto)
+
+prepare() {
+  cd "$pkgname-$pkgver"
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo build --frozen --release --locked
+}
+
+check() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo test --frozen --locked
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+  install -Dm755 "target/release/$pkgname" -t "$pkgdir/usr/bin/"
+  install -Dm644 LICENSE -t "$pkgdir/usr/share/licenses/$pkgname/"
+  install -Dm644 README.md -t "$pkgdir/usr/share/doc/$pkgname/"
+  install -Dm644 "$srcdir/omlx.1" "$pkgdir/usr/share/man/man1/omlx.1"
+  install -Dm644 "$srcdir/omlx.service" "$pkgdir/usr/lib/systemd/system/omlx.service"
+}

@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt + clippy + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --locked
+      - run: cargo test --locked --no-default-features
+
+  packaging-lint:
+    name: packaging files lint
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - name: Install tooling
+        run: |
+          pacman -Syu --noconfirm git makepkg
+      - uses: actions/checkout@v5
+      - name: PKGBUILD validity + .SRCINFO freshness
+        run: |
+          for p in packaging/aur/omlx packaging/aur/omlx-bin; do
+            cd "$p"
+            makepkg --printsrcinfo > /tmp/expected.SRCINFO
+            diff -u .SRCINFO /tmp/expected.SRCINFO \
+              || { echo "::error::$p/.SRCINFO is stale (run makepkg --printsrcinfo)"; exit 1; }
+            cd - >/dev/null
+          done

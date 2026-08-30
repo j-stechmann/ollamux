@@ -1,0 +1,167 @@
+.\" omlx(1) manual page
+.\" License: GPL-2.0-or-later
+.TH OMLX 1 "2026-08-30" "omlx 0.1.0" "User Commands"
+.SH NAME
+omlx \- key-rotating reverse proxy for the Ollama Cloud API
+.SH SYNOPSIS
+.B omlx
+.RB [ \-\-addr
+.IR HOST:PORT ]
+.RB [ \-\-keys
+.IR PATH ]
+.RB [ \-v ]
+.br
+.B omlx
+.B \-\-help
+.br
+.B omlx
+.B \-\-version
+.SH DESCRIPTION
+.B omlx
+gives several Ollama Cloud API keys and serves them combined behind one
+local endpoint. Requests are spread across keys (round-robin,
+least-loaded first), and when a key is rate-limited, rejected, or
+invalid, the request silently retries on the next key before anything
+reaches the client.
+.PP
+This is not a local Ollama server: it serves no models, it proxies to
+.I https://ollama.com\fR.
+Point Ollama clients at it via
+.B OLLAMA_HOST=http://localhost:11435\fR,
+or OpenAI-compatible clients via base URL
+.IR http://localhost:11435/v1 .
+.SH OPTIONS
+.TP
+.BR \-a ", " \-\-addr " " \fIHOST:PORT\fR
+Listen address. Default:
+.IR 127.0.0.1:11435 .
+The default port deliberately differs from Ollama's 11434 so both can
+run side by side.
+.TP
+.BR \-k ", " \-\-keys " " \fIPATH\fR
+Keys file. Default, in order of precedence: the
+.B OMLX_KEYS
+environment variable (newline- or comma-separated keys), then
+.B $XDG_CONFIG_HOME/omlx/keys\fR,
+then
+.IR ~/.config/omlx/keys .
+.TP
+.BR \-v ", " \-\-verbose
+Verbose stderr logging: upstream error snippets and cooldown
+transitions. Without it, one summary line per request is emitted.
+.TP
+.BR \-h ", " \-\-help
+Print usage and exit.
+.TP
+.BR \-V ", " \-\-version
+Print version and exit.
+.SH KEYS FILE
+One API key per line (get keys at
+.IR https://ollama.com/settings/keys ).
+Blank lines and lines starting with
+.B #
+are ignored. Optionally append
+.B :N
+to a key to set that account's per-key concurrency limit \- the number
+of cloud models the account may run at once (free tier 1, pro 3, max
+10; the default when no suffix is given is 3):
+.PP
+.RS
+.nf
+your-free-key...:1
+your-pro-key...:3
+your-max-key...:10
+.fi
+.RE
+.PP
+Requests beyond a key's concurrency limit queue briefly rather than
+hammering upstream; waiters beyond that get an honest 429. Duplicate
+key entries and invalid concurrency counts are startup errors, not
+warnings. The file should be readable only by the user running omlx:
+.B chmod 600 ~/.config/omlx/keys\fR.
+.SH ENDPOINTS
+.TS
+tab(|);
+l l.
+/api/*|Proxied to https://ollama.com with key rotation
+/v1/*|Proxied (OpenAI-compatible surface) with rotation
+/_keys|Per-key health JSON (key suffixes only, no secrets)
+/_health|Liveness JSON: {"ok":...,"keys":...,"total_slots":...}
+.TE
+.PP
+Any other path answers 404 with a hint.
+.SH FAILOVER BEHAVIOR
+Rate-limited keys (429) cool down for 60 seconds, or the server's
+.B Retry-After
+value capped at 5 minutes; the request retries on the next key.
+Invalid keys (401/403) are marked dead until restart. Upstream 5xx and
+network errors fail over to the next key; three consecutive failures
+put a key in cooldown. Everything else (e.g. a 400 from a malformed
+request) is passed through untouched. Failover happens before the first
+response byte, so streaming responses (NDJSON and SSE) are never
+corrupted mid-flight.
+.PP
+Response headers identify the serving key
+.B X-Omlx-Key
+(suffix only) and the retry count
+.BR X-Omlx-Retries .
+.SH SIGNALS
+.B SIGINT
+(ctrl-c) or
+.B SIGTERM
+starts a graceful drain of in-flight requests for up to 5 seconds
+before exit; a second signal force-quits immediately (exit code 130).
+.SH SECURITY
+The proxy has no authentication: anything that can reach the listen
+address can use your API quota. The default binds the loopback
+interface only; do not expose it further. Keep the keys file
+owner-readable (0600); omlx warns at startup if it is group- or
+world-readable.
+.SH FILES
+.TP
+.I ~/.config/omlx/keys
+Default keys file (honours
+.BR XDG_CONFIG_HOME ).
+.TP
+.I /etc/omlx/keys
+Conventional location for system-wide deployments (see
+.BR systemd.unit (5)
+and the shipped
+.IR omlx.service ).
+.SH ENVIRONMENT
+.TP
+.B OMLX_KEYS
+API keys, newline- or comma-separated; overrides the keys file unless
+.B \-\-keys
+is given.
+.TP
+.B XDG_CONFIG_HOME
+Base directory for the default keys location.
+.TP
+.B OLLAMA_HOST
+Not read by omlx; exported by clients to point them at the proxy
+(example:
+.BR http://localhost:11435 ).
+.SH EXIT STATUS
+.TP
+.B 0
+Clean shutdown after drain.
+.TP
+.B 2
+Command-line usage error.
+.TP
+.B 1
+Startup failure: unparseable or missing keys, unbindable address.
+.TP
+.B 130
+Interrupted: second SIGINT during drain.
+.SH SEE ALSO
+The project README at
+.IR https://github.com/j-stechmann/omlx .
+.SH BUGS
+Report issues at
+.IR https://github.com/j-stechmann/omlx/issues .
+.SH LICENSE
+GPL-2.0-or-later.
+.SH AUTHOR
+Jonathan Stechmann.

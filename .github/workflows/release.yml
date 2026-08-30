@@ -1,0 +1,334 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ---- 1. static binaries (musl, native runners) --------------------
+  binaries:
+    name: binary ${{ matrix.arch }}
+    runs-on: ${{ matrix.runs-on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            target: x86_64-unknown-linux-musl
+            runs-on: ubuntu-latest
+          - arch: aarch64
+            target: aarch64-unknown-linux-musl
+            runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: build (static)
+        run: |
+          export RUSTFLAGS="-C target-feature=+crt-static"
+          cargo build --locked --release --target ${{ matrix.target }}
+      - name: smoke
+        run: ./target/${{ matrix.target }}/release/omlx --version
+      - name: package
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          mkdir "omlx-$VER-${{ matrix.arch }}"
+          cp "target/${{ matrix.target }}/release/omlx" "omlx-$VER-${{ matrix.arch }}/"
+          cp README.md LICENSE "omlx-$VER-${{ matrix.arch }}/"
+          tar -czf "omlx-$VER-${{ matrix.arch }}.tar.gz" "omlx-$VER-${{ matrix.arch }}"
+          sha256sum "omlx-$VER-${{ matrix.arch }}.tar.gz" > "omlx-$VER-${{ matrix.arch }}.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.arch }}
+          path: |
+            omlx-*-*.tar.gz
+            omlx-*-*.tar.gz.sha256
+          if-no-files-found: error
+
+  # ---- 2. source + vendor tarballs ----------------------------------
+  source:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - run: ./scripts/vendor-source.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: source
+          path: |
+            dist/omlx-*.tar.gz
+            dist/omlx-*-vendor.tar.xz
+            dist/omlx-*-cargo-config.toml
+            dist/SHA256SUMS
+          if-no-files-found: error
+
+  # ---- 3. deb (debian:trixie, offline vendored build) ---------------
+  deb:
+    needs: [source]
+    runs-on: ubuntu-latest
+    container: debian:trixie
+    permissions:
+      contents: read
+    steps:
+      - name: install toolchain
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential cargo rustc pkg-config dpkg-dev
+      - uses: actions/download-artifact@v4
+        with:
+          name: source
+      - name: unpack + rustc sanity
+        run: |
+          rustc --version
+          tar -xzf omlx-*.tar.gz
+          VER="${GITHUB_REF_NAME#v}"
+          tar -xJf "omlx-$VER-vendor.tar.xz"
+          cd "omlx-$VER"
+          mkdir -p .cargo
+          cp ../omlx-"$VER"-cargo-config.toml .cargo/config.toml
+      - name: offline build
+        run: |
+          cd omlx-*
+          cargo build --locked --offline --release
+      - name: assemble deb
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          D="omlx-$VER-deb/DEBIAN"
+          mkdir -p "$D" "omlx-$VER-deb/usr/bin" "omlx-$VER-deb/usr/share/man/man1" \
+                   "omlx-$VER-deb/usr/share/licenses/omlx" \
+                   "omlx-$VER-deb/usr/lib/systemd/system"
+          install -m755 "omlx-$VER/target/release/omlx" "omlx-$VER-deb/usr/bin/"
+          gzip -9c packaging/omlx.1 > "omlx-$VER-deb/usr/share/man/man1/omlx.1.gz"
+          install -m644 packaging/omlx.service "omlx-$VER-deb/usr/lib/systemd/system/"
+          install -m644 LICENSE "omlx-$VER-deb/usr/share/licenses/omlx/"
+          # control file (minimum viable; lintian-cleanliness is distro's job)
+          {
+            echo "Package: omlx"
+            echo "Version: $VER-1"
+            echo "Architecture: amd64"
+            echo "Maintainer: Jonathan Stechmann <69059260+j-stechmann@users.noreply.github.com>"
+            echo "Depends: libc6 (>= 2.34)"
+            echo "Description: key-rotating reverse proxy for the Ollama Cloud API"
+          } > "$D/control"
+          dpkg-deb --build --root-owner-group "omlx-$VER-deb" "omlx_${VER}-1_amd64.deb"
+          sha256sum "omlx_${VER}-1_amd64.deb" > "omlx_${VER}-1_amd64.deb.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb
+          path: |
+            *.deb
+            *.deb.sha256
+          if-no-files-found: error
+
+  # ---- 4. rpm (fedora, rpmbuild + vendor tarball) -------------------
+  rpm:
+    needs: [source]
+    runs-on: ubuntu-latest
+    container: fedora:latest
+    permissions:
+      contents: read
+    steps:
+      - name: install toolchain
+        run: |
+          dnf install -y --setopt=install_weak_deps=False \
+            rpm-build cargo rustc clang systemd-rpm-macros tar xz gzip git
+      - uses: actions/download-artifact@v4
+        with:
+          name: source
+      - name: assemble rpmbuild tree
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          rpmbuild_dir="$HOME/rpmbuild"
+          mkdir -p "$rpmbuild_dir"/{SOURCES,SPECS,RPMS,SRPMS,BUILD}
+          cp "omlx-$VER.tar.gz" \
+             "omlx-$VER-vendor.tar.xz" "$rpmbuild_dir/SOURCES/"
+          cp packaging/omlx.service "$rpmbuild_dir/SOURCES/omlx.service"
+          cp packaging/omlx.1 "$rpmbuild_dir/SOURCES/omlx.1"
+          cp packaging/rpm/omlx.spec "$rpmbuild_dir/SPECS/omlx.spec"
+      - name: build rpm + srpm
+        run: |
+          rpmbuild -ba ~/rpmbuild/SPECS/omlx.spec
+          sha256sum ~/rpmbuild/RPMS/x86_64/*.rpm > rpm.sha256
+          sha256sum ~/rpmbuild/SRPMS/*.src.rpm > srpm.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rpm
+          path: |
+            /github/home/rpmbuild/RPMS/x86_64/*.rpm
+            /github/home/rpmbuild/SRPMS/*.src.rpm
+          if-no-files-found: error
+
+  # ---- 5. GitHub Release: gather artifacts + publish -----------------
+  release:
+    needs: [binaries, source, deb, rpm]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      upload_url: ${{ steps.create.outputs.upload_url }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - name: create release
+        id: create
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            omlx-*-*.tar.gz
+            omlx-*-*.tar.gz.sha256
+            omlx_*.deb
+            omlx_*.deb.sha256
+            *.rpm
+            *.src.rpm
+            omlx-*-vendor.tar.xz
+            SHA256SUMS
+
+  # ---- 6. container image to GHCR ------------------------------------
+  container:
+    needs: [release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}:${{ github.ref_name }}
+            ghcr.io/${{ github.repository }}:latest
+
+  # ---- 7. AUR push (omlx source + omlx-bin), real makepkg ------------
+  aur:
+    needs: [release]
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - pkg: omlx
+          - pkg: omlx-bin
+    permissions:
+      contents: read
+    steps:
+      - name: install tooling
+        run: pacman -Syu --noconfirm git openssh
+      - uses: actions/checkout@v5
+      - name: configure ssh
+        env:
+          AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$AUR_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H aur.archlinux.org >> ~/.ssh/known_hosts
+          # makepkg is in the base-devel container; ensure PATH sanity
+          command -v updpkgsums makepkg
+      - name: update PKGBUILD + checksums from release assets
+        env:
+          PKG: ${{ matrix.pkg }}
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          cd "packaging/aur/$PKG"
+          sed -i "s/^pkgver=.*/pkgver=$VER/" PKGBUILD
+          sed -i "s/^pkgrel=.*/pkgrel=1/" PKGBUILD
+          # refresh checksums: downloads the actual release assets
+          updpkgsums
+      - name: regenerate .SRCINFO
+        env:
+          PKG: ${{ matrix.pkg }}
+        run: |
+          cd "packaging/aur/$PKG"
+          makepkg --printsrcinfo > .SRCINFO
+      - name: push to AUR
+        env:
+          PKG: ${{ matrix.pkg }}
+        run: |
+          git config --global user.name "omlx-release-bot"
+          git config --global user.email "69059260+j-stechmann@users.noreply.github.com"
+          cd "packaging/aur/$PKG"
+          aur_repo="ssh://aur@aur.archlinux.org/$PKG.git"
+          if git ls-remote "$aur_repo" HEAD >/dev/null 2>&1; then
+            git clone "$aur_repo" aur
+            cp PKGBUILD .SRCINFO aur/
+            cd aur
+            git add PKGBUILD .SRCINFO
+            git diff --staged --quiet || git commit -m "upstream release ${GITHUB_REF_NAME}"
+            git push origin master
+          else
+            # first submission: init a fresh package repo
+            git init -b master aur
+            cd aur
+            cp ../PKGBUILD ../.SRCINFO .
+            git add PKGBUILD .SRCINFO
+            git commit -m "upstream release ${GITHUB_REF_NAME}"
+            git remote add origin "$aur_repo"
+            git push -u origin master
+          fi
+
+  # ---- 8. COPR (SRPM upload) -----------------------------------------
+  copr:
+    needs: [rpm]
+    runs-on: ubuntu-latest
+    # least-critical channel: a COPR hiccup must not sink the release
+    continue-on-error: true
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: rpm
+      - name: copr-cli config
+        env:
+          COPR_CONFIG: ${{ secrets.COPR_CONFIG }}
+        run: |
+          mkdir -p ~/.config
+          printf '%s\n' "$COPR_CONFIG" > ~/.config/copr
+          chmod 600 ~/.config/copr
+          pipx install copr-cli
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: copr build
+        run: copr-cli build j-stechmann/omlx *.src.rpm
+
+  # ---- 9. crates.io --------------------------------------------------
+  cratesio:
+    needs: [release]
+    runs-on: ubuntu-latest
+    # recoverable by hand; don't sink the release run if it flaps
+    continue-on-error: true
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
