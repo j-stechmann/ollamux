@@ -95,7 +95,7 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends build-essential cargo rustc pkg-config dpkg-dev
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: source
       - name: unpack + rustc sanity
@@ -153,7 +153,7 @@ jobs:
         run: |
           dnf install -y --setopt=install_weak_deps=False \
             rpm-build cargo rust-packaging systemd-rpm-macros tar xz gzip git
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: source
       - name: assemble rpmbuild tree
@@ -194,7 +194,7 @@ jobs:
     outputs:
       upload_url: ${{ steps.create.outputs.upload_url }}
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           merge-multiple: true
       # the rpm job runs in a container and uploads /github/home/rpmbuild/...;
@@ -353,7 +353,7 @@ jobs:
     env:
       COPR_CONFIG: ${{ secrets.COPR_CONFIG }}
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: rpm
       - name: check for COPR config
