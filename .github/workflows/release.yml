@@ -56,7 +56,7 @@ jobs:
           cp README.md LICENSE "ollamux-$VER-${{ matrix.arch }}/"
           tar -czf "ollamux-$VER-${{ matrix.arch }}.tar.gz" "ollamux-$VER-${{ matrix.arch }}"
           sha256sum "ollamux-$VER-${{ matrix.arch }}.tar.gz" > "ollamux-$VER-${{ matrix.arch }}.tar.gz.sha256"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: binary-${{ matrix.arch }}
           path: |
@@ -73,7 +73,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - run: ./scripts/vendor-source.sh
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: source
           path: |
@@ -133,7 +133,7 @@ jobs:
           } > "$D/control"
           dpkg-deb --build --root-owner-group "ollamux-$VER-deb" "ollamux_${VER}-1_amd64.deb"
           sha256sum "ollamux_${VER}-1_amd64.deb" > "ollamux_${VER}-1_amd64.deb.sha256"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: deb
           path: |
@@ -177,7 +177,7 @@ jobs:
           rpmbuild -ba ~/rpmbuild/SPECS/ollamux.spec
           sha256sum ~/rpmbuild/RPMS/x86_64/*.rpm > rpm.sha256
           sha256sum ~/rpmbuild/SRPMS/*.src.rpm > srpm.sha256
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: rpm
           path: |
