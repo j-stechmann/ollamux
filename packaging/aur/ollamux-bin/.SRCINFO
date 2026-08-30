@@ -12,8 +12,8 @@ pkgbase = ollamux-bin
 	source = ollamux-bin-0.2.0.tar.gz::https://github.com/j-stechmann/ollamux/releases/download/v0.2.0/ollamux-0.2.0-x86_64.tar.gz
 	source = ollamux.service::https://raw.githubusercontent.com/j-stechmann/ollamux/v0.2.0/packaging/ollamux.service
 	source = ollamux.1::https://raw.githubusercontent.com/j-stechmann/ollamux/v0.2.0/packaging/ollamux.1
-	sha256sums = 1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef
-	sha256sums = 1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef
-	sha256sums = 1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef
+	sha256sums = 80900d37f7edee7cd84706cd2d6819fab8e7da7509d82c14c3c6ae2258521eda
+	sha256sums = a88b8011353909db0dfd5947689d840fad5e397a4cbdf4b805257b66a49dadc8
+	sha256sums = ff38a4c7024b58435ee69cdfd6314cd95e65db6246580003cf80a54ad17693ed
 
 pkgname = ollamux-bin
