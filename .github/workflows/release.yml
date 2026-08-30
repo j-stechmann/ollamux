@@ -203,7 +203,7 @@ jobs:
       # hoist *.rpm and *.src.rpm from wherever they are to the workspace root
       - name: flatten rpm paths
         run: |
-          find . -name '*.rpm' -type f -exec mv -v {} . +
+          find . -name '*.rpm' -type f -exec mv -vt . {} +
           ls -la *.rpm
       - name: create release
         id: create
