@@ -107,8 +107,9 @@ a mysterious upstream one — see `/_keys` for per-key state.
 - Logs: silent by default. `-v` adds a per-request stderr line
   (`retries=N`, `key=<suffix>`), key cooldown/death events, startup banner,
   shutdown notices, and upstream error snippets; fatal errors always print.
-- Response headers include `X-Ollamux-Key` (which key served it) and
-  `X-Ollamux-Retries`.
+- Response headers include `X-Ollamux` (ollamux/version — every response,
+  including relayed upstream errors, is attributable), `X-Ollamux-Key`
+  (which key served it) and `X-Ollamux-Retries`.
 - `SIGINT` (ctrl-c) drains in-flight requests for up to 5 s, then exits;
   press again to force-quit.
 - Request bodies are buffered up to 16 MiB (needed for replay across

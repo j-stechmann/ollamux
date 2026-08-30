@@ -34,6 +34,12 @@ const SNIPPET: u64 = 256;
 
 const UPSTREAM: &str = "https://ollama.com";
 
+/// Self-identification for every response: lets an agent (or human with
+/// curl) tell ollamux apart from a real Ollama server or a CDN error page.
+fn identity_header() -> tiny_http::Header {
+    hv("X-Ollamux", &format!("ollamux/{}", crate::VERSION))
+}
+
 /// No-auth upstream paths: single attempt; never rotate, never mark keys.
 /// Stored WITH a leading slash; route() passes trimmed paths, so matching
 /// normalizes both (an earlier build compared trimmed to untrimmed and the
@@ -129,6 +135,8 @@ impl Server {
         }
         if path == "_health" {
             let body = serde_json::json!({
+                "service": "ollamux",
+                "version": crate::VERSION,
                 "ok": self.pool.healthy_any(),
                 "keys": self.pool.len(),
                 "total_slots": self.pool.total_slots(),
@@ -146,7 +154,7 @@ impl Server {
         json_response(
             req,
             404,
-            r#"{"error":"ollamux is a key-rotating proxy for Ollama Cloud; only /api/*, /v1/*, /_keys, /_health are served. This is not a local Ollama server."}"#,
+            r#"{"error":"ollamux (key-rotating proxy for Ollama Cloud, https://ollama.com) serves only /api/*, /v1/*, /_keys, /_health — this is not a local Ollama server and has no local models. If you meant a local Ollama, point your client at port 11434 instead; for Ollama Cloud, use /api/… or /v1/… here (models: GET /api/tags)."}"#,
             None,
         );
         (404, 0, None)
@@ -168,9 +176,15 @@ impl Server {
             Ok(b) => b,
             Err(too_large) => {
                 let (status, msg) = if too_large {
-                    (413u16, "request body exceeds ollamux limit (16 MiB)")
+                    (
+                        413u16,
+                        "request body exceeds ollamux's 16 MiB limit (bodies are buffered in memory so they can be replayed across key failover); reduce attachments/images or send the model a URL instead",
+                    )
                 } else {
-                    (400u16, "failed to read request body")
+                    (
+                        400u16,
+                        "ollamux failed to read the request body (client disconnected or sent a malformed/truncated request); retry the request",
+                    )
                 };
                 let json = error_json(is_v1, msg, status);
                 json_response(req, status, &json, None);
@@ -199,7 +213,13 @@ impl Server {
             return match self.attempt(&cx, &mut req) {
                 Attempt::Sent(status) => (status, 0, None),
                 Attempt::Retryable(reason) => {
-                    let json = error_json(is_v1, &format!("upstream unavailable: {reason}"), 502);
+                    let json = error_json(
+                        is_v1,
+                        &format!(
+                            "ollamux could not reach the upstream (https://ollama.com): {reason}. Check network access and per-key state via GET /_keys; ollamux retries automatically, so a repeat of this request may succeed."
+                        ),
+                        502,
+                    );
                     json_response(req, 502, &json, None);
                     (502, 0, None)
                 }
@@ -235,7 +255,7 @@ impl Server {
                 Attempt::Retryable(reason) => {
                     if retries + 1 >= MAX_ATTEMPTS || no_auth {
                         let msg = format!(
-                            "upstream unavailable after {} attempt(s): {reason}",
+                            "ollamux exhausted all {} failover attempt(s) against https://ollama.com; last error: {reason}. Per-key state: GET /_keys. The keys each cool down and recover automatically, so retrying later may succeed.",
                             retries + 1
                         );
                         let json = error_json(is_v1, &msg, 502);
@@ -428,6 +448,7 @@ impl Server {
             resp = resp.with_header(hv("X-Ollamux-Key", &pool.suffix_of(k)));
         }
         resp = resp.with_header(hv("X-Ollamux-Retries", &retries.to_string()));
+        resp = resp.with_header(identity_header());
         let _ = req.respond(resp);
         Attempt::Sent(if read_err { 502 } else { status })
     }
@@ -452,6 +473,7 @@ impl Server {
             hs.push(hv("X-Ollamux-Key", &self.pool.suffix_of(k)));
         }
         hs.push(hv("X-Ollamux-Retries", &retries.to_string()));
+        hs.push(identity_header());
         let resp = tiny_http::Response::new(
             tiny_http::StatusCode(status),
             hs,
@@ -481,6 +503,7 @@ impl Server {
         let http10 = req.http_version() < &tiny_http::HTTPVersion(1, 1);
         let mut w = req.into_writer();
         let mut head = format!("HTTP/1.1 {status} {}\r\n", reason_phrase(status));
+        head.push_str(&format!("X-Ollamux: ollamux/{}\r\n", crate::VERSION));
         if let Some(k) = key {
             head.push_str(&format!("X-Ollamux-Key: {}\r\n", self.pool.suffix_of(k)));
         }
@@ -631,7 +654,8 @@ fn error_json(is_v1: bool, msg: &str, status: u16) -> String {
 fn json_response(req: tiny_http::Request, status: u16, body: &str, retry_after: Option<u64>) {
     let mut resp = tiny_http::Response::from_string(body.to_string())
         .with_status_code(status)
-        .with_header(hv("Content-Type", "application/json"));
+        .with_header(hv("Content-Type", "application/json"))
+        .with_header(identity_header());
     if let Some(secs) = retry_after {
         resp = resp.with_header(hv("Retry-After", &secs.to_string()));
     }
@@ -642,7 +666,8 @@ fn send_reject(req: tiny_http::Request, rej: &Reject, is_v1: bool) {
     let json = error_json(is_v1, rej.reason, rej.status);
     let mut resp = tiny_http::Response::from_string(json)
         .with_status_code(rej.status)
-        .with_header(hv("Content-Type", "application/json"));
+        .with_header(hv("Content-Type", "application/json"))
+        .with_header(identity_header());
     if let Some(secs) = rej.retry_after_s {
         resp = resp.with_header(hv("Retry-After", &secs.to_string()));
     }
