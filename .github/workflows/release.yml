@@ -103,13 +103,12 @@ jobs:
           rustc --version
           tar -xzf omlx-*.tar.gz
           VER="${GITHUB_REF_NAME#v}"
-          tar -xJf "omlx-$VER-vendor.tar.xz"
-          cd "omlx-$VER"
-          mkdir -p .cargo
-          cp ../omlx-"$VER"-cargo-config.toml .cargo/config.toml
+          # vendor/ lands inside the source tree; the in-tree
+          # .cargo/config.toml (in the tarball) makes this offline.
+          tar -xJf "omlx-$VER-vendor.tar.xz" -C "omlx-$VER"
       - name: offline build
         run: |
-          cd omlx-*
+          cd "omlx-${GITHUB_REF_NAME#v}"
           cargo build --locked --offline --release
       - name: assemble deb
         run: |
@@ -119,9 +118,10 @@ jobs:
                    "omlx-$VER-deb/usr/share/licenses/omlx" \
                    "omlx-$VER-deb/usr/lib/systemd/system"
           install -m755 "omlx-$VER/target/release/omlx" "omlx-$VER-deb/usr/bin/"
-          gzip -9c packaging/omlx.1 > "omlx-$VER-deb/usr/share/man/man1/omlx.1.gz"
-          install -m644 packaging/omlx.service "omlx-$VER-deb/usr/lib/systemd/system/"
-          install -m644 LICENSE "omlx-$VER-deb/usr/share/licenses/omlx/"
+          # unit/man live inside the source tarball (job has no checkout)
+          gzip -9c "omlx-$VER/packaging/omlx.1" > "omlx-$VER-deb/usr/share/man/man1/omlx.1.gz"
+          install -m644 "omlx-$VER/packaging/omlx.service" "omlx-$VER-deb/usr/lib/systemd/system/"
+          install -m644 "omlx-$VER/LICENSE" "omlx-$VER-deb/usr/share/licenses/omlx/"
           # control file (minimum viable; lintian-cleanliness is distro's job)
           {
             echo "Package: omlx"
@@ -152,7 +152,7 @@ jobs:
       - name: install toolchain
         run: |
           dnf install -y --setopt=install_weak_deps=False \
-            rpm-build cargo rustc clang systemd-rpm-macros tar xz gzip git
+            rpm-build cargo rust-packaging systemd-rpm-macros tar xz gzip git
       - uses: actions/download-artifact@v4
         with:
           name: source
@@ -163,9 +163,15 @@ jobs:
           mkdir -p "$rpmbuild_dir"/{SOURCES,SPECS,RPMS,SRPMS,BUILD}
           cp "omlx-$VER.tar.gz" \
              "omlx-$VER-vendor.tar.xz" "$rpmbuild_dir/SOURCES/"
-          cp packaging/omlx.service "$rpmbuild_dir/SOURCES/omlx.service"
-          cp packaging/omlx.1 "$rpmbuild_dir/SOURCES/omlx.1"
-          cp packaging/rpm/omlx.spec "$rpmbuild_dir/SPECS/omlx.spec"
+          # spec/unit/man come from inside the source tarball (this job
+          # has no checkout); the tarball is the artifact under test.
+          tar -xzf "omlx-$VER.tar.gz" \
+            "omlx-$VER/packaging/rpm/omlx.spec" \
+            "omlx-$VER/packaging/omlx.service" \
+            "omlx-$VER/packaging/omlx.1"
+          cp "omlx-$VER/packaging/omlx.service" "$rpmbuild_dir/SOURCES/omlx.service"
+          cp "omlx-$VER/packaging/omlx.1" "$rpmbuild_dir/SOURCES/omlx.1"
+          cp "omlx-$VER/packaging/rpm/omlx.spec" "$rpmbuild_dir/SPECS/omlx.spec"
       - name: build rpm + srpm
         run: |
           rpmbuild -ba ~/rpmbuild/SPECS/omlx.spec
