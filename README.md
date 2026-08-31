@@ -78,11 +78,60 @@ than hammering upstream. Requests that wait too long get an honest `429`.
 | `/api/*`       | Proxied to `https://ollama.com` with rotation    |
 | `/v1/*`        | Proxied (OpenAI-compatible surface) with rotation|
 | `/_keys`       | Per-key health JSON (suffixes only, no secrets)  |
+| `/_usage`      | Per-key Ollama Cloud usage JSON (`?refresh=1` forces a refresh) |
 | `/_health`     | `{"ok":…, "keys":…, "total_slots":…}`            |
 
 Everything else answers `404` with a hint — this is **not** a local Ollama
 server; it serves no models and `ollama list` against it shows the cloud
 model list, not local models.
+
+## Usage introspection
+
+Ollama Cloud meters usage per account (fraction of your plan's cap, not
+tokens) on an **undocumented** endpoint, `GET https://ollama.com/api/usage`
+— the same one the ollama.com settings page uses. The session window rolls
+over roughly every 5 hours, the weekly one every 7 days; there are no reset
+timestamps upstream. Since that endpoint could change or disappear without
+warning, `/_usage` treats any payload drift as a per-key error string,
+never a crash. (Proxied `/api/usage` requests are NOT special: they go
+through normal key rotation and reflect whichever key served them — use
+`/_usage` for the per-account picture.)
+
+```sh
+curl -s localhost:11435/_usage | jq .
+curl -s 'localhost:11435/_usage?refresh=1' | jq .   # force a refresh
+```
+
+`/_usage` fans out to the usage endpoint with every configured key in
+parallel and answers with one row per key (suffixes only, never secrets):
+fresh session/weekly fractions plus percents, top models, the 4-week
+rolling cost, or a per-key error otherwise. Responses are cached for 60 s
+(`updated`/`age_s`/`stale` fields tell you the age); `/_keys` embeds the
+latest known usage per key from the same cache — it never triggers an
+upstream call itself, and usage checks never touch key health (a 401 there
+is reported, not treated as a dead key).
+
+```json
+{"updated":1756620000,"age_s":3,"stale":false,"keys":[
+  {"index":0,"suffix":"1234","ok":true,"session":0.037,"weekly":0.007,
+   "session_pct":3.7,"weekly_pct":0.7,
+   "models":[{"name":"gpt-oss:120b","request_count":42}],"cost":"$1.23"}]}
+```
+
+## Quota-aware key selection
+
+```sh
+ollamux --usage-aware        # demote keys at/over 80% session usage
+ollamux --usage-aware=90     # custom threshold (1–99)
+# or: OLLAMUX_USAGE_AWARE=80 (the flag wins when both are set)
+```
+
+When enabled, ollamux polls the usage endpoint every 60 s and orders
+candidate keys so that keys whose session usage is at/over the threshold
+are served **last** — demoted, never excluded: an over-quota key still
+takes requests when no fresh key has a free slot. Failed usage fetches
+keep the previous snapshot; with the feature off, routing behaves exactly
+as before.
 
 ## What failover means here
 
@@ -119,7 +168,9 @@ a mysterious upstream one — see `/_keys` for per-key state.
 
 ## Limitations (on purpose)
 
-- No usage dashboards, token accounting, or provisioning — it's a proxy.
+- Usage introspection is read-only reporting; there is no token accounting
+  or historical dashboard — `/_usage` mirrors what ollama.com exposes per
+  account.
 - No request rewriting: models must exist on ollama.com.
 - A dead key stays dead until restart (`/_keys` shows why). Restarting is
   cheap: it's stateless.

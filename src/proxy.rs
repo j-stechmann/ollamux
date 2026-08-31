@@ -7,6 +7,7 @@
 //! sent. Until then it can be reused across failover attempts.
 
 use crate::pool::{Pool, Reject};
+use crate::usage::UsageTracker;
 use std::io::{Read, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -56,6 +57,9 @@ static REQ_ID: AtomicUsize = AtomicUsize::new(1);
 
 pub struct Server {
     pub pool: Arc<Pool>,
+    /// Usage introspection (/_usage). Always present; fetches only when
+    /// /_usage / ?refresh / --usage-aware actually run.
+    pub usage: Arc<UsageTracker>,
     agent: ureq::Agent,
     /// Base URL of the upstream ("https://ollama.com"); injectable so tests
     /// can run hermetically against a local server.
@@ -65,6 +69,31 @@ pub struct Server {
 impl Server {
     pub fn new(pool: Arc<Pool>) -> Server {
         Self::with_upstream(pool, UPSTREAM)
+    }
+
+    /// Spawn the quota-aware background poller (opt-in via --usage-aware):
+    /// refresh the usage snapshot at the TTL cadence until `stop` is set.
+    /// Fetch failures are non-fatal — the previous snapshot is kept and
+    /// the failure surfaces per-key in /_usage.
+    pub fn spawn_usage_poller(self: &Arc<Self>, stop: Arc<std::sync::atomic::AtomicBool>) {
+        let server = Arc::clone(self);
+        std::thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                // tick() is a no-op while the snapshot is fresh, so an
+                // on-demand /_usage refresh is never duplicated here.
+                server.usage.tick();
+                // Wake frequently enough to observe `stop` promptly.
+                let wake = stop.clone();
+                let deadline = Instant::now() + crate::usage::USAGE_TTL;
+                while Instant::now() < deadline {
+                    if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+                let _ = wake;
+            }
+        });
     }
 
     /// Test seam: point the proxy at a different (e.g. local) upstream.
@@ -86,8 +115,10 @@ impl Server {
             .max_idle_connections_per_host(slots)
             .https_only(https_only)
             .build();
+        let usage = Arc::new(UsageTracker::new(pool.clone(), upstream));
         Server {
             pool,
+            usage,
             agent,
             upstream: upstream.trim_end_matches('/').to_string(),
         }
@@ -129,8 +160,45 @@ impl Server {
     ) -> (u16, usize, Option<String>) {
         let path = path.trim_start_matches('/');
         if path == "_keys" {
-            let body = serde_json::to_value(self.pool.info()).unwrap_or_default();
-            json_response(req, 200, &body.to_string(), None);
+            // Pure in-memory read: /_keys must never trigger an upstream
+            // usage fetch (incident readers rely on it being instant).
+            // Usage columns appear only when a snapshot already exists.
+            let body = match self.usage.peek() {
+                Some(snap) => {
+                    let rows = self.pool.info_with_usage(&snap);
+                    let values: Vec<serde_json::Value> = rows
+                        .into_iter()
+                        .map(|(info, brief)| {
+                            let mut v = serde_json::to_value(&info).unwrap_or_default();
+                            if let Some(b) = brief {
+                                v["usage"] = serde_json::to_value(b).unwrap_or_default();
+                            }
+                            v
+                        })
+                        .collect();
+                    serde_json::to_string(&values).unwrap_or_else(|_| "[]".to_string())
+                }
+                None => serde_json::to_value(self.pool.info())
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|_| "[]".to_string()),
+            };
+            json_response(req, 200, &body, None);
+            return (200, 0, None);
+        }
+        if path == "_usage" {
+            let force = query.is_some_and(|q| {
+                q.split('&').any(|kv| {
+                    let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
+                    k == "refresh" && v != "0" && v != "false"
+                })
+            });
+            let snap = if force {
+                self.usage.refresh()
+            } else {
+                self.usage.get()
+            };
+            let body = usage_json(&snap, self.pool.total_keys());
+            json_response(req, 200, &body, None);
             return (200, 0, None);
         }
         if path == "_health" {
@@ -154,7 +222,7 @@ impl Server {
         json_response(
             req,
             404,
-            r#"{"error":"ollamux (key-rotating proxy for Ollama Cloud, https://ollama.com) serves only /api/*, /v1/*, /_keys, /_health — this is not a local Ollama server and has no local models. If you meant a local Ollama, point your client at port 11434 instead; for Ollama Cloud, use /api/… or /v1/… here (models: GET /api/tags)."}"#,
+            r#"{"error":"ollamux (key-rotating proxy for Ollama Cloud, https://ollama.com) serves only /api/*, /v1/*, /_keys, /_usage, /_health — this is not a local Ollama server and has no local models. If you meant a local Ollama, point your client at port 11434 instead; for Ollama Cloud, use /api/… or /v1/… here (models: GET /api/tags; per-key usage: GET /_usage)."}"#,
             None,
         );
         (404, 0, None)
@@ -743,6 +811,38 @@ fn curated_response_headers(resp: &ureq::Response) -> Vec<(String, String)> {
         }
     }
     out
+}
+
+/// Render a usage snapshot as the /_usage response body: envelope with
+/// freshness, one row per pool key (ok:data or ok:false + error). Key
+/// count comes from the pool so a snapshot older than a keys-file change
+/// (impossible — keys are fixed at startup, but be defensive) rows as
+/// failures rather than truncating silently.
+fn usage_json(snap: &crate::usage::UsageSnapshot, expected: usize) -> String {
+    let updated = snap.updated_unix();
+    let age_s = snap.fetched_at.elapsed().as_secs();
+    let keys: Vec<serde_json::Value> = snap
+        .keys
+        .iter()
+        .map(|k| serde_json::to_value(k).unwrap_or_default())
+        .chain(
+            // Missing rows (pool grew? defensive only) render as failures.
+            (snap.keys.len()..expected).map(|i| {
+                serde_json::json!({"index": i, "suffix": "?", "ok": false, "error": "no usage data"})
+            }),
+        )
+        .collect();
+    // Re-fetch when the snapshot is older than the TTL but still served
+    // (stale-while-revalidate): tell the client so it can decide.
+    let stale = age_s >= crate::usage::USAGE_TTL.as_secs();
+    serde_json::json!({
+        "updated": updated,
+        "age_s": age_s,
+        "stale": stale,
+        "session_window": "about 5 hours (rolling; no reset timestamps upstream)",
+        "keys": keys,
+    })
+    .to_string()
 }
 
 fn reason_phrase(status: u16) -> &'static str {
