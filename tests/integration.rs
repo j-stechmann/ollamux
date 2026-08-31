@@ -525,11 +525,6 @@ fn usage_body(session: f64, weekly: f64, model: &str, count: u64, cost: &str) ->
     )
 }
 
-/// Auth header as sent by the proxy for a pool key (see attempt()).
-fn bearer_for(suffix: &str) -> String {
-    format!("Bearer omk-{suffix}")
-}
-
 #[test]
 fn usage_endpoint_aggregates_per_key_without_secrets() {
     let payload_a = usage_body(0.037, 0.007, "gpt-oss:120b", 42, "$1.23");
@@ -677,10 +672,13 @@ fn usage_auth_failure_is_reported_never_marks_dead() {
     let info = spawn_info(&addr);
     assert_eq!(info[0]["state"], "up", "401 on usage must not mark_dead");
     // The Bearer header reached upstream as expected (sanity on the seam).
+    let _ = up.wait_for_count(1, Duration::from_secs(5));
+    let reqs = up.recorded();
+    assert_eq!(reqs.len(), 1, "one usage fetch recorded");
     assert_eq!(
-        bearer_for("unauth401"),
-        "Bearer omk-unauth401xx".replace("xx", ""),
-        "bearer_for builds Bearer omk-<suffix>"
+        reqs[0].auth.as_deref(),
+        Some("Bearer omk-unauth401xx"),
+        "usage fetch must send Bearer <full key>"
     );
 }
 

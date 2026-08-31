@@ -25,7 +25,7 @@
 //! a pure in-memory read that merely renders the latest snapshot.
 
 use crate::pool::Pool;
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Serve-at-most-this-age snapshot before a refresh is considered. The
@@ -274,10 +274,6 @@ pub struct UsageTracker {
     snapshot: SnapshotCell,
     /// Single-flight guard for refreshes.
     fetch_mu: Mutex<()>,
-    /// Sleepers wait here while a fetch is in flight (no spinning).
-    fetch_cv: Condvar,
-    /// Whether at least one fetch has run (drives wait_for_snapshot logic).
-    has_snapshot: std::sync::atomic::AtomicBool,
 }
 
 /// Per-key fetch failure. upstream HTTP error bodies are withheld: they
@@ -321,8 +317,6 @@ impl UsageTracker {
             }),
             snapshot: Mutex::new(None),
             fetch_mu: Mutex::new(()),
-            fetch_cv: Condvar::new(),
-            has_snapshot: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -464,10 +458,7 @@ impl UsageTracker {
             keys,
         });
         *lock(&self.snapshot) = Some(Arc::clone(&snap));
-        self.has_snapshot
-            .store(true, std::sync::atomic::Ordering::Relaxed);
         self.pool.publish_usage(&snap);
-        self.fetch_cv.notify_all();
         snap
     }
 

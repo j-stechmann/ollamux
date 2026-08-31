@@ -97,7 +97,7 @@ l l.
 /api/*|Proxied to https://ollama.com with key rotation
 /v1/*|Proxied (OpenAI-compatible surface) with rotation
 /_keys|Per-key health JSON (key suffixes only, no secrets; embeds latest known usage when a usage snapshot exists)
-/_usage|Per-key usage JSON from the (undocumented) GET /api/usage upstream endpoint, fan-out across all keys, 60s cache; ?refresh=1 forces a refresh
+/_usage|Per-key usage JSON from the (undocumented) GET /api/usage upstream endpoint, fan-out across all keys, 60s cache; ?refresh=1 forces a refresh (rate-limited to one fetch per 5s)
 /_health|Liveness JSON: {"ok":...,"keys":...,"total_slots":...}
 .TE
 .PP

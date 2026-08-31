@@ -83,7 +83,6 @@ impl Server {
                 // on-demand /_usage refresh is never duplicated here.
                 server.usage.tick();
                 // Wake frequently enough to observe `stop` promptly.
-                let wake = stop.clone();
                 let deadline = Instant::now() + crate::usage::USAGE_TTL;
                 while Instant::now() < deadline {
                     if stop.load(std::sync::atomic::Ordering::Relaxed) {
@@ -91,7 +90,6 @@ impl Server {
                     }
                     std::thread::sleep(Duration::from_millis(250));
                 }
-                let _ = wake;
             }
         });
     }

@@ -111,8 +111,10 @@ pub struct Pool {
     /// 80%). 0 = disabled. Written once at startup (Relaxed is enough).
     usage_threshold_x10: AtomicUsize,
     /// Bit i set = key i's latest known session usage is at/over the
-    /// threshold. A 0 value must never exclude keys from `candidates()`
-    /// (data absent = no demotion), so it doubles as "no usage known".
+    /// threshold. Only 64 bits exist, so keys at/over index 64 are never
+    /// demoted rather than aliased onto another key's bit. A 0 value
+    /// must never exclude keys from `candidates()` (data absent = no
+    /// demotion), so it doubles as "no usage known".
     over_quota_mask: AtomicU64,
 }
 
@@ -171,7 +173,8 @@ pub struct KeyInfo {
 }
 
 /// Usage figures embedded in `/_keys`. Raw fractions are primary (the
-/// upstream's own unit); percents are one-decimal mirrors for humans.
+/// upstream's own unit); percents are one-decimal mirrors for humans,
+/// clamped to [0, 100] the same way /_usage renders them.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct UsageBrief {
     pub session: f64,
@@ -181,6 +184,12 @@ pub struct UsageBrief {
     /// True when the key's session usage is at/over the configured
     /// quota-aware threshold (always false when routing is not enabled).
     pub over_quota: bool,
+}
+
+/// One-decimal percent mirror of a fraction, clamped to [0, 100] —
+/// identical to usage::pct so /_keys and /_usage can never disagree.
+fn pct(f: f64) -> f64 {
+    (f.clamp(0.0, 1.0) * 1000.0).round() / 10.0
 }
 
 impl Pool {
@@ -262,12 +271,18 @@ impl Pool {
         let mut mask = 0u64;
         if threshold != THRESHOLD_DISABLED {
             for k in &snap.keys {
+                // Keys beyond bit 63 cannot be represented in the mask;
+                // skip them (never demoted) instead of folding several
+                // keys onto one bit or shifting out of range.
+                if k.index >= u64::BITS as usize {
+                    continue;
+                }
                 if let Some(session) = k.session {
                     // Threshold is in tenths of a percent; usage is a
                     // 0.0–1.0 fraction (compare in tenths of a percent:
                     // session * 1000 >= threshold).
                     if (session * 1000.0).clamp(0.0, 1000.0) as usize >= threshold {
-                        mask |= 1u64 << k.index.min(63);
+                        mask |= 1u64 << k.index;
                     }
                 }
             }
@@ -291,8 +306,8 @@ impl Pool {
                 Some(UsageBrief {
                     session,
                     weekly,
-                    session_pct: (session * 1000.0).round() / 10.0,
-                    weekly_pct: (weekly * 1000.0).round() / 10.0,
+                    session_pct: pct(session),
+                    weekly_pct: pct(weekly),
                     over_quota: threshold != THRESHOLD_DISABLED
                         && (session * 1000.0).clamp(0.0, 1000.0) as usize >= threshold,
                 })
@@ -458,7 +473,13 @@ impl Pool {
         cands.sort_by_key(|&i| {
             let ks = &self.states[i];
             let load_x1024 = (ks.in_use() as u64 * 1024) / ks.concurrency as u64;
-            let over = (demote_mask >> i) & 1;
+            // Mask bit only exists for indices < 64 (see publish_usage):
+            // higher keys are never demoted, never panics on debug shifts.
+            let over = if i < u64::BITS as usize {
+                (demote_mask >> i) & 1
+            } else {
+                0
+            };
             let ord = (i as u64 + rr) % n;
             (over, load_x1024, ord)
         });
@@ -900,5 +921,35 @@ mod tests {
         assert_eq!(b.session, 0.812);
         assert_eq!(b.session_pct, 81.2);
         assert!(b.over_quota, "81.2% >= 80% threshold");
+    }
+
+    #[test]
+    fn over_quota_mask_ignores_keys_beyond_64_bits() {
+        // Pool with 65 keys; the last one is over quota. Before the
+        // bounds check this folded bit 64 onto bit 0 (release) or
+        // panicked on the shift (debug).
+        let keys: Vec<(String, u32)> = (0..65).map(|i| (format!("omk-wide{i:04}"), 2)).collect();
+        let p = Pool::new(keys, 4, false);
+        p.set_usage_threshold(80);
+        let entries: Vec<(usize, Option<f64>)> = (0..65)
+            .map(|i| {
+                // Only key 64 is over threshold; bit 63 is the highest
+                // representable one and stays under threshold here.
+                if i == 64 {
+                    (i, Some(0.99))
+                } else {
+                    (i, Some(0.10))
+                }
+            })
+            .collect();
+        p.publish_usage(&usage_snap(&entries));
+        // No aliasing: only bits < 64 may be set, and key 0 must be
+        // untouched even though key 64 is over quota.
+        let mask = p.over_quota_mask.load(Ordering::Relaxed);
+        assert_eq!(mask, 0, "no over-quota key below 64 → empty mask");
+        // candidates() must not panic (debug >> overflow) for any index.
+        let cands = p.candidates();
+        assert_eq!(cands.len(), 65);
+        assert_eq!(cands[0], 0, "key 0 must not inherit key 64's demotion");
     }
 }

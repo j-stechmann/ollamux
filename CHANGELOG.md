@@ -12,8 +12,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `/_usage` endpoint: per-key Ollama Cloud usage (session/weekly
   fractions of the plan cap, percents, top models, 4-week rolling cost)
   via the undocumented `GET /api/usage` upstream endpoint — parallel
-  fan-out across all keys, 60 s cache, `?refresh=1` to force a refresh,
-  suffixes only (no secrets). Payload drift on the undocumented endpoint
+  fan-out across all keys, 60 s cache, `?refresh=1` to force a refresh
+  (rate-limited to one forced fetch per 5 s), suffixes only (no secrets). Payload drift on the undocumented endpoint
   degrades to a per-key error string, never a crash; usage checks never
   touch key health.
 - `/_keys` now embeds the latest known usage per key (`usage` field)
