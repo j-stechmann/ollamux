@@ -1,3 +1,12 @@
+ollamux (0.5.0-1) unstable; urgency=medium
+
+  * New: prompt-cache affinity (on by default; --no-affinity /
+    OLLAMUX_NO_AFFINITY to disable), X-Ollamux-Affinity header.
+  * Fixed: OLLAMUX_NO_AFFINITY env var alone was ignored; affinity
+    header now reports miss on unusable pins.
+
+ -- Jonathan Stechmann <69059260+j-stechmann@users.noreply.github.com>  Tue, 01 Sep 2026 17:30:00 +0000
+
 ollamux (0.4.0-1) unstable; urgency=medium
 
   * New: usage introspection (/_usage) and quota-aware key routing

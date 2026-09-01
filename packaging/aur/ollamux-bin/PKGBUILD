@@ -1,6 +1,6 @@
 # Maintainer: Jonathan Stechmann <69059260+j-stechmann@users.noreply.github.com>
 pkgname=ollamux-bin
-pkgver=0.4.0
+pkgver=0.5.0
 pkgrel=1
 pkgdesc='Key-rotating reverse proxy for the Ollama Cloud API (prebuilt binary)'
 url='https://github.com/j-stechmann/ollamux'
