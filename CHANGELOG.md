@@ -13,12 +13,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fractions of the plan cap, percents, top models, 4-week rolling cost)
   via the undocumented `GET /api/usage` upstream endpoint — parallel
   fan-out across all keys, 60 s cache, `?refresh=1` to force a refresh
-  (rate-limited to one forced fetch per 5 s), suffixes only (no secrets). Payload drift on the undocumented endpoint
-  degrades to a per-key error string, never a crash; usage checks never
-  touch key health.
+  (rate-limited to one fetch *attempt* per 5 s, so failed rounds back
+  off too), suffixes only (no secrets). Payload drift on the
+  undocumented endpoint degrades to a per-key error string, never a
+  crash; usage checks never touch key health.
 - `/_keys` now embeds the latest known usage per key (`usage` field)
   from the shared snapshot — still a pure in-memory read that never
-  triggers upstream calls.
+  triggers upstream calls. Windows absent from the snapshot are omitted
+  rather than substituted from the other window.
 - Quota-aware key selection behind `--usage-aware[=PCT]` (default 80;
   also `OLLAMUX_USAGE_AWARE`, flag wins): keys at/over the threshold
   session usage are demoted in candidate selection — served last, never

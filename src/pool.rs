@@ -174,13 +174,19 @@ pub struct KeyInfo {
 
 /// Usage figures embedded in `/_keys`. Raw fractions are primary (the
 /// upstream's own unit); percents are one-decimal mirrors for humans,
-/// clamped to [0, 100] the same way /_usage renders them.
+/// clamped to [0, 100] the same way /_usage renders them. A window the
+/// snapshot does not carry stays absent (field omitted) — it is never
+/// fabricated from the other window.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct UsageBrief {
-    pub session: f64,
-    pub weekly: f64,
-    pub session_pct: f64,
-    pub weekly_pct: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub weekly: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_pct: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub weekly_pct: Option<f64>,
     /// True when the key's session usage is at/over the configured
     /// quota-aware threshold (always false when routing is not enabled).
     pub over_quota: bool,
@@ -291,25 +297,25 @@ impl Pool {
     }
 
     /// Latest usage rendering per key for `/_keys`: a pure in-memory read
-    /// of the optional snapshot — never triggers a fetch.
+    /// of the optional snapshot — never triggers a fetch. Windows absent
+    /// from the snapshot stay absent (never substituted from the other
+    /// window, matching /_usage's honest rendering of partial data).
     pub fn usage_briefs(&self, snap: &crate::usage::UsageSnapshot) -> Vec<Option<UsageBrief>> {
         let threshold = self.usage_threshold_x10.load(Ordering::Relaxed);
         snap.keys
             .iter()
             .map(|k| {
-                let (session, weekly) = match (k.session, k.weekly) {
-                    (Some(s), Some(w)) => (s, w),
-                    (Some(s), None) => (s, s),
-                    (None, Some(w)) => (w, w),
-                    (None, None) => return None,
-                };
+                if k.session.is_none() && k.weekly.is_none() {
+                    return None;
+                }
                 Some(UsageBrief {
-                    session,
-                    weekly,
-                    session_pct: pct(session),
-                    weekly_pct: pct(weekly),
+                    session: k.session,
+                    weekly: k.weekly,
+                    session_pct: k.session.map(pct),
+                    weekly_pct: k.weekly.map(pct),
                     over_quota: threshold != THRESHOLD_DISABLED
-                        && (session * 1000.0).clamp(0.0, 1000.0) as usize >= threshold,
+                        && k.session
+                            .is_some_and(|s| (s * 1000.0).clamp(0.0, 1000.0) as usize >= threshold),
                 })
             })
             .collect()
@@ -446,13 +452,23 @@ impl Pool {
     }
 
     /// `info()` with usage columns joined in from a snapshot (used by
-    /// `/_keys` when a usage snapshot exists).
+    /// `/_keys` when a usage snapshot exists). Joined by index rather
+    /// than zipped: a short snapshot (defensive only — keys are fixed at
+    /// startup) leaves the extra keys' usage absent instead of silently
+    /// truncating the /_keys output.
     pub fn info_with_usage(
         &self,
         snap: &crate::usage::UsageSnapshot,
     ) -> Vec<(KeyInfo, Option<UsageBrief>)> {
         let briefs = self.usage_briefs(snap);
-        self.info().into_iter().zip(briefs).collect()
+        self.info()
+            .into_iter()
+            .enumerate()
+            .map(|(i, info)| {
+                let usage = briefs.get(i).cloned().flatten();
+                (info, usage)
+            })
+            .collect()
     }
 
     // ----- selection & admission -----
@@ -918,9 +934,43 @@ mod tests {
         let briefs = p.usage_briefs(&snap);
         assert!(briefs[0].is_none());
         let b = briefs[1].as_ref().unwrap();
-        assert_eq!(b.session, 0.812);
-        assert_eq!(b.session_pct, 81.2);
+        assert_eq!(b.session, Some(0.812));
+        assert_eq!(b.session_pct, Some(81.2));
         assert!(b.over_quota, "81.2% >= 80% threshold");
+    }
+
+    #[test]
+    fn usage_briefs_never_fabricate_missing_windows() {
+        let p = two_key_pool();
+        // Session-only row: weekly must stay absent, not copy session.
+        // (usage_snap's helper mirrors weekly=session, so build the row
+        // by hand to model upstream drift honestly.)
+        let mut row = usage_snap(&[(0, None)]).keys.remove(0);
+        row.session = Some(0.4);
+        row.weekly = None;
+        row.ok = true;
+        let snap = crate::usage::UsageSnapshot {
+            fetched_at: std::time::Instant::now(),
+            keys: vec![row],
+        };
+        let briefs = p.usage_briefs(&snap);
+        let b = briefs[0].as_ref().unwrap();
+        assert_eq!(b.session, Some(0.4));
+        assert_eq!(b.weekly, None);
+        assert_eq!(b.weekly_pct, None);
+        // Weekly-only row: symmetric.
+        let mut row = usage_snap(&[(0, None)]).keys.remove(0);
+        row.weekly = Some(0.2);
+        row.ok = true;
+        let snap = crate::usage::UsageSnapshot {
+            fetched_at: std::time::Instant::now(),
+            keys: vec![row],
+        };
+        let briefs = p.usage_briefs(&snap);
+        let b = briefs[0].as_ref().unwrap();
+        assert_eq!(b.session, None);
+        assert_eq!(b.weekly, Some(0.2));
+        assert!(!b.over_quota, "session absent → never over quota");
     }
 
     #[test]

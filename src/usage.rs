@@ -31,7 +31,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// Serve-at-most-this-age snapshot before a refresh is considered. The
 /// session window resets ~5h, so polling harder buys nothing.
 pub const USAGE_TTL: Duration = Duration::from_secs(60);
-/// Minimum interval between forced refreshes (`?refresh=1` spam guard).
+/// Minimum interval between upstream fetch attempts: gates forced
+/// refreshes (`?refresh=1` spam guard) and backs off revalidation after
+/// failed rounds, which keep the previous snapshot and thus freeze its
+/// age (see `do_fetch_inner`). Overridable via `with_min_refresh` for
+/// tests.
 const MIN_REFRESH: Duration = Duration::from_secs(5);
 /// Upstream timeouts for usage fetches (bounded; never a whole-request
 /// timeout beyond these).
@@ -274,6 +278,12 @@ pub struct UsageTracker {
     snapshot: SnapshotCell,
     /// Single-flight guard for refreshes.
     fetch_mu: Mutex<()>,
+    /// When the last fetch *attempt* (not publication) ended. Unlike
+    /// snapshot age this advances on failed rounds, so it rate-limits
+    /// retries even while a good snapshot is kept unchanged.
+    last_attempt: Mutex<Option<Instant>>,
+    /// Minimum interval between fetch attempts (tests may shorten it).
+    min_refresh: Duration,
 }
 
 /// Per-key fetch failure. upstream HTTP error bodies are withheld: they
@@ -322,11 +332,20 @@ impl UsageTracker {
             }),
             snapshot: Mutex::new(None),
             fetch_mu: Mutex::new(()),
+            last_attempt: Mutex::new(None),
+            min_refresh: MIN_REFRESH,
         }
     }
 
     pub fn with_ttl(mut self, ttl: Duration) -> UsageTracker {
         self.ttl = ttl;
+        self
+    }
+
+    /// Override the minimum interval between fetch attempts (tests).
+    #[doc(hidden)]
+    pub fn with_min_refresh(mut self, d: Duration) -> UsageTracker {
+        self.min_refresh = d;
         self
     }
 
@@ -366,6 +385,12 @@ impl UsageTracker {
                 if let Some(s) = self.fresh_snapshot() {
                     return s;
                 }
+                // Failure backoff: a recent failed attempt must not turn
+                // every /_usage request into a new full fan-out (the kept
+                // previous snapshot never ages forward to gate this).
+                if self.attempt_cooldown_left().is_some() {
+                    return self.wait_or_peek(&guard);
+                }
                 self.do_fetch_inner(&guard)
             }
         }
@@ -377,12 +402,28 @@ impl UsageTracker {
     pub fn refresh(&self) -> Arc<UsageSnapshot> {
         let guard = lock(&self.fetch_mu);
         // Min-interval guard: a ?refresh=1 loop must not hammer upstream.
-        if let Some(s) = self.peek() {
-            if s.fetched_at.elapsed() < MIN_REFRESH {
-                return s;
-            }
+        // Based on the last fetch attempt — not snapshot age — so sustained
+        // upstream failures (which keep the old snapshot, freezing its age)
+        // are backed off all the same.
+        if self.attempt_cooldown_left().is_some() {
+            return self.wait_or_peek(&guard);
         }
         self.do_fetch_inner(&guard)
+    }
+
+    /// Remaining min-interval cooldown since the last fetch attempt, if any.
+    fn attempt_cooldown_left(&self) -> Option<Duration> {
+        let last = (*lock(&self.last_attempt))?;
+        let elapsed = last.elapsed();
+        (elapsed < self.min_refresh).then(|| self.min_refresh - elapsed)
+    }
+
+    /// Inside the min-interval window: serve the freshest snapshot that
+    /// exists (callers hold the fetch guard, so no fetch can be in flight;
+    /// a first-ever fetch always runs because no snapshot implies no
+    /// recorded attempt).
+    fn wait_or_peek(&self, _guard: &MutexGuard<'_, ()>) -> Arc<UsageSnapshot> {
+        self.peek().unwrap_or_else(|| self.do_fetch_inner(_guard))
     }
 
     /// Background poller step (--usage-aware): refresh when the TTL has
@@ -400,6 +441,11 @@ impl UsageTracker {
         // Re-check: an on-demand refresh may have completed while we
         // contended for the lock.
         if self.fresh_snapshot().is_some() {
+            return false;
+        }
+        // Same failure backoff as get()/refresh(): a failed round must not
+        // make every poller tick a new fan-out against a struggling upstream.
+        if self.attempt_cooldown_left().is_some() {
             return false;
         }
         self.do_fetch_inner(&guard);
@@ -423,8 +469,12 @@ impl UsageTracker {
     /// The one fetch routine (callers must hold the fetch guard). On
     /// failure the existing snapshot is kept untouched; on success a new
     /// snapshot replaces it and the pool is notified (quota-aware routing).
+    /// `last_attempt` is stamped on every round — success or failure — so
+    /// the min-interval guard keeps rate-limiting retries while a failed
+    /// round leaves the snapshot (and its age) frozen.
     fn do_fetch_inner(&self, _guard: &MutexGuard<'_, ()>) -> Arc<UsageSnapshot> {
         let results = self.fetch_all();
+        *lock(&self.last_attempt) = Some(Instant::now());
         let mut keys = Vec::with_capacity(self.pool.len());
         for (i, res) in results.into_iter().enumerate() {
             let suffix = self.pool.suffix_of(i);
@@ -462,8 +512,9 @@ impl UsageTracker {
         // transient failure (network blip, one 429) would otherwise wipe the
         // usage mask and re-admit over-quota keys for a full TTL. Keep the
         // previous snapshot (its usage is already published to the pool);
-        // its age drives the next retry via TTL/MIN_REFRESH. First-ever
-        // failures must still land so /_usage can surface them.
+        // retries are rate-limited by last_attempt via MIN_REFRESH, since
+        // this path freezes the snapshot's own age. First-ever failures
+        // must still land so /_usage can surface them.
         if keys.iter().all(|k| !k.ok) {
             if let Some(prev) = self.peek() {
                 return prev;
@@ -656,6 +707,7 @@ mod tests {
         let pool = Arc::new(Pool::new(vec![("omk-usage-ttl1".into(), 1)], 4, false));
         let t = UsageTracker::new(pool, "https://ollama.com")
             .with_ttl(Duration::from_millis(50))
+            .with_min_refresh(Duration::ZERO) // isolate TTL behavior
             .with_fetch(|_, _, _| {
                 CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Ok(serde_json::from_str(r#"{"limits":{"session":{"usage":0.25}}}"#).unwrap())
@@ -705,23 +757,56 @@ mod tests {
     fn failed_refresh_keeps_previous_snapshot() {
         static FAIL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         let pool = Arc::new(Pool::new(vec![("omk-usage-keep".into(), 1)], 4, false));
-        let t = UsageTracker::new(pool, "https://ollama.com").with_fetch(|_, _, _| {
-            if FAIL.load(std::sync::atomic::Ordering::Relaxed) {
-                Err(FetchError::Network("boom".into()))
-            } else {
-                Ok(serde_json::from_str(r#"{"limits":{"session":{"usage":0.5}}}"#).unwrap())
-            }
-        });
+        let t = UsageTracker::new(pool, "https://ollama.com")
+            .with_ttl(Duration::from_millis(20))
+            .with_min_refresh(Duration::from_millis(30))
+            .with_fetch(|_, _, _| {
+                if FAIL.load(std::sync::atomic::Ordering::Relaxed) {
+                    Err(FetchError::Network("boom".into()))
+                } else {
+                    Ok(serde_json::from_str(r#"{"limits":{"session":{"usage":0.5}}}"#).unwrap())
+                }
+            });
         let first = t.get();
         assert!(first.keys[0].ok);
         FAIL.store(true, std::sync::atomic::Ordering::Relaxed);
-        // get() with a short TTL is not MIN_REFRESH-guarded (refresh() is),
-        // so drive the failed round through get(): wait past the TTL, then
-        // let the stale path fetch. The previous good snapshot must survive.
-        std::thread::sleep(Duration::from_millis(40));
+        // Wait past both TTL and min-interval so the stale path may fetch.
+        std::thread::sleep(Duration::from_millis(60));
         let again = t.get();
         assert!(again.keys[0].ok, "failed refresh must keep good data");
         assert_eq!(again.keys[0].session, Some(0.5));
+        assert_eq!(again.fetched_at, first.fetched_at);
+    }
+
+    #[test]
+    fn failed_rounds_are_backed_off_like_successful_ones() {
+        // The bug this pins: failed rounds keep the previous snapshot, so
+        // snapshot age freezes and a snapshot-age-based guard would let a
+        // ?refresh=1 (or stale get()) loop fan out on every call. The
+        // attempt-based guard must rate-limit those rounds too.
+        static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let pool = Arc::new(Pool::new(vec![("omk-usage-bo01".into(), 1)], 4, false));
+        let t = UsageTracker::new(pool, "https://ollama.com")
+            .with_min_refresh(Duration::from_millis(100))
+            .with_fetch(|_, _, _| {
+                CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Err(FetchError::Status(429))
+            });
+        let first = t.get(); // first-ever failure lands (no snapshot yet)
+        assert!(!first.keys[0].ok);
+        assert_eq!(CALLS.load(std::sync::atomic::Ordering::Relaxed), 1);
+        // Stale-snapshot + total failure: repeated refresh() must back off.
+        let _ = t.refresh();
+        let _ = t.refresh();
+        let _ = t.get();
+        assert_eq!(
+            CALLS.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "failed rounds must be min-interval guarded like successes"
+        );
+        std::thread::sleep(Duration::from_millis(120));
+        let _ = t.refresh(); // window elapsed → one more attempt
+        assert_eq!(CALLS.load(std::sync::atomic::Ordering::Relaxed), 2);
     }
 
     #[test]
@@ -763,14 +848,17 @@ mod tests {
         let pool = Arc::new(Pool::new(vec![("omk-usage-min1".into(), 1)], 4, false));
         let t = UsageTracker::new(pool, "https://ollama.com")
             .with_ttl(Duration::ZERO)
+            .with_min_refresh(Duration::from_millis(120))
             .with_fetch(|_, _, _| {
                 CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Ok(serde_json::from_str(r#"{"limits":{"session":{"usage":0.1}}}"#).unwrap())
             });
         let _ = t.refresh();
-        let _ = t.refresh(); // inside MIN_REFRESH window: no second fetch
+        let _ = t.refresh(); // inside min-interval: no second fetch
+        let _ = t.get(); // also guarded now (stale path can't bypass it)
         assert_eq!(CALLS.load(std::sync::atomic::Ordering::Relaxed), 1);
-        let _ = t.get(); // TTL=0 → stale → get() fetches (not guarded)
+        std::thread::sleep(Duration::from_millis(140));
+        let _ = t.get(); // window elapsed → refetch
         assert_eq!(CALLS.load(std::sync::atomic::Ordering::Relaxed), 2);
     }
 }

@@ -78,7 +78,7 @@ than hammering upstream. Requests that wait too long get an honest `429`.
 | `/api/*`       | Proxied to `https://ollama.com` with rotation    |
 | `/v1/*`        | Proxied (OpenAI-compatible surface) with rotation|
 | `/_keys`       | Per-key health JSON (suffixes only, no secrets)  |
-| `/_usage`      | Per-key Ollama Cloud usage JSON (`?refresh=1` forces a refresh, at most once per 5 s) |
+| `/_usage`      | Per-key Ollama Cloud usage JSON (`?refresh=1` forces a refresh, at most one fetch attempt per 5 s) |
 | `/_health`     | `{"ok":…, "keys":…, "total_slots":…}`            |
 
 Everything else answers `404` with a hint — this is **not** a local Ollama
@@ -102,9 +102,12 @@ curl -s localhost:11435/_usage | jq .
 curl -s 'localhost:11435/_usage?refresh=1' | jq .   # force a refresh
 ```
 
-Forced refreshes are rate-limited to at most one upstream fetch per 5 s
-(a `?refresh=1` inside that window serves the cached snapshot — `stale`
-keeps reflecting the 60 s TTL, not this guard).
+Forced refreshes are rate-limited to at most one upstream fetch attempt
+per 5 s (a `?refresh=1` inside that window serves the cached snapshot —
+`stale` keeps reflecting the 60 s TTL, not this guard). The guard counts
+*attempts*, not successes: while the upstream is failing (failed rounds
+keep the last good snapshot), polling loops back off instead of fanning
+out on every request.
 
 `/_usage` fans out to the usage endpoint with every configured key in
 parallel and answers with one row per key (suffixes only, never secrets):

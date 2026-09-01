@@ -286,7 +286,7 @@ ENDPOINTS:
     /api/*, /v1/*   proxied to https://ollama.com with key rotation
     /_keys          per-key health JSON (embeds usage when known)
     /_usage         per-key Ollama Cloud usage JSON (?refresh=1 forces,
-                    at most one forced refresh per 5 s)
+                    at most one fetch attempt per 5 s)
     /_health        liveness JSON",
         ollamux::VERSION
     );
