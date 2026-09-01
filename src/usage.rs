@@ -287,12 +287,17 @@ pub enum FetchError {
 }
 
 fn parse_payload(body: &str) -> Result<UsagePayload, String> {
-    let p: UsagePayload = serde_json::from_str(body)
-        .map_err(|e| format!("endpoint changed (unexpected payload): {e}"))?;
-    if !p.plausible() {
-        return Err("endpoint changed (no usage data in payload)".to_string());
-    }
-    Ok(p)
+    // The serde error text embeds offending values from the body verbatim
+    // (e.g. a hostile upstream echoing the Authorization secret into a
+    // wrong-typed field). Only the location is relayed, never content.
+    serde_json::from_str::<UsagePayload>(body)
+        .map(|p| {
+            if !p.plausible() {
+                return Err("endpoint changed (no usage data in payload)".to_string());
+            }
+            Ok(p)
+        })
+        .unwrap_or_else(|_| Err("endpoint changed (unexpected payload)".to_string()))
 }
 
 impl UsageTracker {
@@ -453,6 +458,17 @@ impl UsageTracker {
                 Err(FetchError::Network(e)) => KeyUsage::failed(i, suffix, format!("network: {e}")),
             });
         }
+        // If every key failed, don't overwrite good data with nothing: a
+        // transient failure (network blip, one 429) would otherwise wipe the
+        // usage mask and re-admit over-quota keys for a full TTL. Keep the
+        // previous snapshot (its usage is already published to the pool);
+        // its age drives the next retry via TTL/MIN_REFRESH. First-ever
+        // failures must still land so /_usage can surface them.
+        if keys.iter().all(|k| !k.ok) {
+            if let Some(prev) = self.peek() {
+                return prev;
+            }
+        }
         let snap = Arc::new(UsageSnapshot {
             fetched_at: Instant::now(),
             keys,
@@ -608,6 +624,20 @@ mod tests {
     }
 
     #[test]
+    fn parse_errors_never_echo_body_content() {
+        // A hostile upstream answering 200 with the Authorization secret
+        // echoed into a wrong-typed field must not leak it into the error
+        // string (serde's own message embeds offending values verbatim).
+        let body = r#"{"limits":{"session":{"usage":"Bearer omk-secret1234"}}}"#;
+        let err = parse_payload(body).unwrap_err();
+        assert!(
+            !err.contains("omk-secret1234"),
+            "parse error must not relay body content: {err}"
+        );
+        assert!(err.contains("endpoint changed"));
+    }
+
+    #[test]
     fn fetch_maps_status_and_network_errors() {
         let pool = Arc::new(Pool::new(vec![("omk-usage-er1".into(), 1)], 4, false));
         let t = UsageTracker::new(pool, "https://ollama.com")
@@ -675,20 +705,21 @@ mod tests {
     fn failed_refresh_keeps_previous_snapshot() {
         static FAIL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         let pool = Arc::new(Pool::new(vec![("omk-usage-keep".into(), 1)], 4, false));
-        let t = UsageTracker::new(pool, "https://ollama.com")
-            .with_ttl(Duration::from_millis(30))
-            .with_fetch(|_, _, _| {
-                if FAIL.load(std::sync::atomic::Ordering::Relaxed) {
-                    Err(FetchError::Network("boom".into()))
-                } else {
-                    Ok(serde_json::from_str(r#"{"limits":{"session":{"usage":0.5}}}"#).unwrap())
-                }
-            });
+        let t = UsageTracker::new(pool, "https://ollama.com").with_fetch(|_, _, _| {
+            if FAIL.load(std::sync::atomic::Ordering::Relaxed) {
+                Err(FetchError::Network("boom".into()))
+            } else {
+                Ok(serde_json::from_str(r#"{"limits":{"session":{"usage":0.5}}}"#).unwrap())
+            }
+        });
         let first = t.get();
         assert!(first.keys[0].ok);
         FAIL.store(true, std::sync::atomic::Ordering::Relaxed);
+        // get() with a short TTL is not MIN_REFRESH-guarded (refresh() is),
+        // so drive the failed round through get(): wait past the TTL, then
+        // let the stale path fetch. The previous good snapshot must survive.
         std::thread::sleep(Duration::from_millis(40));
-        let again = t.refresh();
+        let again = t.get();
         assert!(again.keys[0].ok, "failed refresh must keep good data");
         assert_eq!(again.keys[0].session, Some(0.5));
     }
