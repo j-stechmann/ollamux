@@ -1,6 +1,6 @@
 .\" ollamux(1) manual page
 .\" License: GPL-2.0-or-later
-.TH OLLAMUX 1 "2026-08-30" "ollamux 0.1.0" "User Commands"
+.TH OLLAMUX 1 "2026-08-31" "ollamux 0.3.0" "User Commands"
 .SH NAME
 ollamux \- key-rotating reverse proxy for the Ollama Cloud API
 .SH SYNOPSIS
@@ -9,6 +9,7 @@ ollamux \- key-rotating reverse proxy for the Ollama Cloud API
 .IR HOST:PORT ]
 .RB [ \-\-keys
 .IR PATH ]
+.RB [ \-\-usage-aware[= PCT ]]
 .RB [ \-v ]
 .br
 .B ollamux
@@ -50,6 +51,16 @@ then
 Verbose stderr logging: upstream error snippets and cooldown
 transitions. Without it, one summary line per request is emitted.
 .TP
+.B \-\-usage-aware[= \fIPCT \fR]
+Quota-aware key selection: keys whose latest known session usage is
+at/over
+.I PCT
+percent are served last (never excluded). Default threshold: 80.
+Also settable via
+.BR OLLAMUX_USAGE_AWARE ;
+the flag wins when both are given. An invalid threshold is a usage
+error (exit 2). The usage data is polled every 60 seconds.
+.TP
 .BR \-h ", " \-\-help
 Print usage and exit.
 .TP
@@ -85,11 +96,31 @@ tab(|);
 l l.
 /api/*|Proxied to https://ollama.com with key rotation
 /v1/*|Proxied (OpenAI-compatible surface) with rotation
-/_keys|Per-key health JSON (key suffixes only, no secrets)
+/_keys|Per-key health JSON (key suffixes only, no secrets; embeds latest known usage when a usage snapshot exists)
+/_usage|Per-key usage JSON from the (undocumented) GET /api/usage upstream endpoint, fan-out across all keys, 60s cache; ?refresh=1 forces a refresh (rate-limited to one fetch attempt per 5s)
 /_health|Liveness JSON: {"ok":...,"keys":...,"total_slots":...}
 .TE
 .PP
 Any other path answers 404 with a hint.
+.SH USAGE INTROSPECTION
+The usage endpoint of Ollama Cloud is undocumented and may change or
+disappear without warning. ollamux decodes it tolerantly: payload drift
+is reported as a per-key error in
+.BR /_usage ,
+never a crash. Usage is a fraction of the plan's cap (0.0\(en1.0), not a
+token count; the session window rolls over roughly every 5 hours and
+there are no reset timestamps upstream. Usage checks never touch key
+health: a 401 there is reported in /_usage but does not mark the key
+dead. /_keys is a pure in-memory read and never triggers upstream usage
+calls.
+.SH QUOTA-AWARE KEY SELECTION
+With
+.B \-\-usage-aware[= \fIPCT \fR]
+(see OPTIONS), ollamux polls the usage endpoint every 60 seconds and
+demotes keys whose session usage is at/over the threshold behind fresher
+keys during candidate selection \(em demoted, never excluded: an
+over-quota key still serves when no fresh key has a free slot. Failed
+refreshes keep the previous snapshot.
 .SH FAILOVER BEHAVIOR
 Rate-limited keys (429) cool down for 60 seconds, or the server's
 .B Retry-After
@@ -134,6 +165,12 @@ and the shipped
 API keys, newline- or comma-separated; overrides the keys file unless
 .B \-\-keys
 is given.
+.TP
+.B OLLAMUX_USAGE_AWARE
+Enables quota-aware routing with the given percent threshold (1\(en99);
+equivalent to
+.BR \-\-usage-aware= \fIPCT \fR.
+The command-line flag wins when both are set.
 .TP
 .B XDG_CONFIG_HOME
 Base directory for the default keys location.

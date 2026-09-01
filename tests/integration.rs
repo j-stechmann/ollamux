@@ -85,6 +85,8 @@ fn post_with_headers(url: &str, path: &str, body: &str) -> (u16, String, Vec<(St
 pub struct Upstream {
     pub url: String,
     requests: std::sync::Arc<std::sync::Mutex<Vec<RecordedRequest>>>,
+    /// (condvar, completion counter) for wait_for_count.
+    done: Arc<(std::sync::Condvar, std::sync::Mutex<usize>)>,
 }
 
 #[derive(Clone)]
@@ -100,25 +102,45 @@ impl Upstream {
     pub fn spawn(
         resp_for: impl Fn(&str) -> (u16, String, String) + Send + Sync + 'static,
     ) -> Upstream {
+        Self::spawn_auth(move |path, _| resp_for(path))
+    }
+
+    /// Like spawn, but the responder also sees the Authorization header
+    /// (None when absent) — needed to script per-key usage responses.
+    /// resp_for: given (path-with-query, auth), return (status, body).
+    pub fn spawn_auth(
+        resp_for: impl Fn(&str, Option<&str>) -> (u16, String, String) + Send + Sync + 'static,
+    ) -> Upstream {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let done = Arc::new((std::sync::Condvar::new(), std::sync::Mutex::new(0usize)));
         let reqs = requests.clone();
         let resp_for = std::sync::Arc::new(resp_for);
+        let accept_done = done.clone();
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { continue };
                 let reqs = reqs.clone();
                 let resp_for = resp_for.clone();
+                let done = accept_done.clone();
                 std::thread::spawn(move || {
                     let (method, path, auth, body) = read_http_request(&mut stream);
+                    let auth_for_resp = Arc::new(std::sync::Mutex::new(auth.clone()));
                     reqs.lock().unwrap().push(RecordedRequest {
                         method,
                         path_with_query: path.clone(),
                         auth,
                         body,
                     });
-                    let (status, reason, body) = resp_for(&path);
+                    {
+                        let (cv, count) = &*done;
+                        let mut n = count.lock().unwrap();
+                        *n += 1;
+                        cv.notify_all();
+                    }
+                    let auth_snap = auth_for_resp.lock().unwrap().clone();
+                    let (status, reason, body) = resp_for(&path, auth_snap.as_deref());
                     let payload = format!(
                         "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
                         body.len()
@@ -127,11 +149,35 @@ impl Upstream {
                 });
             }
         });
-        Upstream { url, requests }
+        Upstream {
+            url,
+            requests,
+            done,
+        }
     }
 
     pub fn recorded(&self) -> Vec<RecordedRequest> {
         self.requests.lock().unwrap().clone()
+    }
+
+    /// Block until at least `n` requests have been recorded (bounded).
+    pub fn wait_for_count(&self, n: usize, timeout: Duration) -> usize {
+        let (cv, count) = &*self.done;
+        let deadline = std::time::Instant::now() + timeout;
+        let mut guard = count.lock().unwrap();
+        loop {
+            if *guard >= n {
+                return *guard;
+            }
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return *guard;
+            }
+            let (g, _t) = cv
+                .wait_timeout(guard, left.min(Duration::from_millis(50)))
+                .unwrap();
+            guard = g;
+        }
     }
 }
 
@@ -466,6 +512,290 @@ fn streaming_passes_through_chunked() {
     let (status, body) = post(&addr, "/api/generate", r#"{"model":"x","stream":true}"#);
     assert_eq!(status, 200);
     assert_eq!(body, "line1\nline2\n");
+}
+
+// ---------------------------------------------------------------------------
+// /_usage and usage-aware routing (hermetic): the local upstream scripts
+// GET /api/usage per Authorization header.
+// ---------------------------------------------------------------------------
+
+fn usage_body(session: f64, weekly: f64, model: &str, count: u64, cost: &str) -> String {
+    format!(
+        r#"{{"limits":{{"session":{{"usage":{session},"models":[{{"name":"{model}","request_count":{count}}}]}},"weekly":{{"usage":{weekly}}}}},"activity":{{"cost":"{cost}"}}}}"#
+    )
+}
+
+#[test]
+fn usage_endpoint_aggregates_per_key_without_secrets() {
+    let payload_a = usage_body(0.037, 0.007, "gpt-oss:120b", 42, "$1.23");
+    let payload_b = usage_body(0.81, 0.42, "qwen3-coder:480b", 7, "$0.10");
+    let up = Upstream::spawn_auth(move |path, auth| {
+        assert!(path.starts_with("/api/usage"), "unexpected path {path}");
+        match auth {
+            Some(a) if a.contains("abcd1234") => (200, "OK".into(), payload_a.clone()),
+            Some(a) if a.contains("efgh5678") => (200, "OK".into(), payload_b.clone()),
+            other => panic!("unexpected auth {other:?}"),
+        }
+    });
+    let addr = spawn_server(
+        pool_with(&[("omk-abcd1234", 1), ("omk-efgh5678", 1)]),
+        &up.url,
+    );
+
+    let (status, body, headers) = post_with_headers(&addr, "/_usage", "");
+    assert_eq!(status, 200, "body: {body}");
+    assert!(
+        headers
+            .iter()
+            .any(|(n, v)| n.eq_ignore_ascii_case("x-ollamux") && v.contains("ollamux/")),
+        "identity header present: {headers:?}"
+    );
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["keys"].as_array().unwrap().len(), 2, "{body}");
+    let updated = v["updated"].as_u64().expect("updated unix ts");
+    assert!(updated > 0);
+    assert!(v["age_s"].is_u64(), "{body}");
+    assert_eq!(v["stale"], false, "{body}");
+
+    // Per-key rows: ok/error vocabulary, suffixes only.
+    let rows = v["keys"].as_array().unwrap();
+    let row_a = rows.iter().find(|r| r["suffix"] == "1234").unwrap();
+    assert_eq!(row_a["ok"], true, "{body}");
+    assert_eq!(row_a["session"], 0.037);
+    assert_eq!(row_a["session_pct"], 3.7);
+    assert_eq!(row_a["weekly_pct"], 0.7);
+    assert_eq!(row_a["models"][0]["request_count"], 42);
+    assert_eq!(row_a["cost"], json_str("$1.23"));
+    let row_b = rows.iter().find(|r| r["suffix"] == "5678").unwrap();
+    assert_eq!(row_b["session_pct"], 81.0);
+
+    // No secret ever.
+    assert!(!body.contains("omk-abcd1234"), "secret leaked: {body}");
+    assert!(!body.contains("omk-efgh5678"), "secret leaked: {body}");
+}
+
+fn json_str(s: &str) -> serde_json::Value {
+    serde_json::Value::String(s.to_string())
+}
+
+#[test]
+fn usage_ttl_caches_and_refresh_flag_bypasses() {
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+    let up = Upstream::spawn_auth(move |_, _| {
+        CALLS.fetch_add(1, Ordering::Relaxed);
+        (200, "OK".into(), usage_body(0.1, 0.2, "m", 1, "$0.01"))
+    });
+    let addr = spawn_server(pool_with(&[("omk-ttlcache001", 1)]), &up.url);
+
+    let _ = post(&addr, "/_usage", "");
+    assert_eq!(up.wait_for_count(1, std::time::Duration::from_secs(5)), 1);
+    // Second call inside the TTL: served from cache, no new upstream hit.
+    let _ = post(&addr, "/_usage", "");
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert_eq!(
+        CALLS.load(Ordering::Relaxed),
+        1,
+        "TTL must suppress refetch"
+    );
+
+    // ?refresh=1 forces a second round. MIN_REFRESH (5s) deliberately
+    // gates the forced path too — assert the fetch count stays at 1 and
+    // that a second ?refresh within the window does not hammer upstream.
+    let (status, body, _) = post_with_headers(&addr, "/_usage?refresh=1", "");
+    assert_eq!(status, 200, "{body}");
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert_eq!(
+        CALLS.load(Ordering::Relaxed),
+        1,
+        "?refresh=1 inside MIN_REFRESH must not refetch"
+    );
+}
+
+#[test]
+fn keys_endpoint_never_fetches_but_embeds_snapshot() {
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+    let up = Upstream::spawn_auth(move |_, _| {
+        CALLS.fetch_add(1, Ordering::Relaxed);
+        (200, "OK".into(), usage_body(0.5, 0.25, "m", 3, "$3.21"))
+    });
+    let addr = spawn_server(pool_with(&[("omk-keysembed1", 1)]), &up.url);
+
+    // Pure in-memory read: no snapshot yet → no usage key, no upstream call.
+    let (status, body, _) = get(&addr, "/_keys");
+    assert_eq!(status, 200);
+    let info: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(info[0].get("usage").is_none(), "no snapshot yet: {body}");
+    assert_eq!(CALLS.load(Ordering::Relaxed), 0, "/_keys must never fetch");
+
+    // A /_usage call populates the snapshot…
+    let _ = post(&addr, "/_usage", "");
+    assert_eq!(up.wait_for_count(1, std::time::Duration::from_secs(2)), 1);
+
+    // …and the next /_keys read embeds it (still zero extra upstream calls).
+    let (_, body2, _) = get(&addr, "/_keys");
+    let info2: serde_json::Value = serde_json::from_str(&body2).unwrap();
+    assert_eq!(info2[0]["usage"]["session"], 0.5, "{body2}");
+    assert_eq!(info2[0]["usage"]["session_pct"], 50.0);
+    assert_eq!(info2[0]["usage"]["weekly_pct"], 25.0, "{body2}");
+    assert_eq!(CALLS.load(Ordering::Relaxed), 1);
+    assert_eq!(info2[0]["state"], "up", "usage must not touch key health");
+}
+
+#[test]
+fn usage_payload_drift_is_reported_per_key_still_200() {
+    let up = Upstream::spawn_auth(|_, _| (200, "OK".into(), r#"{"hello":"world"}"#.into()));
+    let addr = spawn_server(pool_with(&[("omk-drift00001", 1)]), &up.url);
+    let (status, body, _) = post_with_headers(&addr, "/_usage", "");
+    assert_eq!(status, 200, "introspection stays 200 on drift: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let row = &v["keys"][0];
+    assert_eq!(row["ok"], false);
+    assert!(
+        row["error"].as_str().unwrap().contains("endpoint changed"),
+        "{body}"
+    );
+}
+
+#[test]
+fn usage_auth_failure_is_reported_never_marks_dead() {
+    let up = Upstream::spawn_auth(move |_, auth| match auth {
+        Some(a) if a.contains("unauth401") => (401, "Unauthorized".into(), String::new()),
+        _ => (200, "OK".into(), usage_body(0.1, 0.1, "m", 1, "$0")),
+    });
+    let addr = spawn_server(pool_with(&[("omk-unauth401xx", 1)]), &up.url);
+    let (status, body, _) = post_with_headers(&addr, "/_usage", "");
+    assert_eq!(status, 200);
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["keys"][0]["ok"], false);
+    assert_eq!(v["keys"][0]["error"], json_str("unauthorized"));
+    // Usage introspection is read-only: the key stays up in /_keys.
+    let info = spawn_info(&addr);
+    assert_eq!(info[0]["state"], "up", "401 on usage must not mark_dead");
+    // The Bearer header reached upstream as expected (sanity on the seam).
+    let _ = up.wait_for_count(1, Duration::from_secs(5));
+    let reqs = up.recorded();
+    assert_eq!(reqs.len(), 1, "one usage fetch recorded");
+    assert_eq!(
+        reqs[0].auth.as_deref(),
+        Some("Bearer omk-unauth401xx"),
+        "usage fetch must send Bearer <full key>"
+    );
+}
+
+#[test]
+fn usage_upstream_error_body_is_never_relayed() {
+    // A malicious/broken upstream echoing the Bearer secret must not leak
+    // through /_usage: only generated suffix-safe error strings appear.
+    let up = Upstream::spawn_auth(move |_, auth| {
+        let echoed = auth.unwrap_or_default();
+        (500, "Server Error".into(), format!("error with {echoed}"))
+    });
+    let addr = spawn_server(pool_with(&[("omk-secret1234", 1)]), &up.url);
+    let (status, body, _) = post_with_headers(&addr, "/_usage", "");
+    assert_eq!(status, 200);
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["keys"][0]["ok"], false);
+    assert_eq!(v["keys"][0]["error"], json_str("upstream HTTP 500"));
+    assert!(
+        !body.contains("omk-secret1234"),
+        "upstream error text must not be relayed: {body}"
+    );
+}
+
+#[test]
+fn usage_all_keys_failing_still_answers_200() {
+    // Nothing listens on the upstream port: every fetch takes the network
+    // error path. /_usage is observability: never 5xx, report per key.
+    let addr = spawn_server(pool_with(&[("omk-noreach001", 1)]), "http://127.0.0.1:1");
+    let (status, body) = post(&addr, "/_usage", "");
+    assert_eq!(status, 200, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["keys"][0]["ok"], false);
+    let err = v["keys"][0]["error"].as_str().unwrap();
+    assert!(err.starts_with("network:"), "{body}");
+}
+
+#[test]
+fn usage_endpoint_method_and_query_handling() {
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+    let up = Upstream::spawn_auth(move |_, _| {
+        CALLS.fetch_add(1, Ordering::Relaxed);
+        (200, "OK".into(), usage_body(0.1, 0.2, "m", 1, "$0.01"))
+    });
+    let addr = spawn_server(pool_with(&[("omk-methodtest1", 1)]), &up.url);
+
+    // GET works (the documented form)…
+    let (status, _, _) = get(&addr, "/_usage");
+    assert_eq!(status, 200);
+    assert_eq!(up.wait_for_count(1, std::time::Duration::from_secs(2)), 1);
+
+    // …POST hits the same read-only introspection route (harmless).
+    let (status, _, _) = post_with_headers(&addr, "/_usage", "");
+    assert_eq!(status, 200);
+    // Unknown query params other than refresh are ignored.
+    let (status, _, _) = get(&addr, "/_usage?foo=bar");
+    assert_eq!(status, 200);
+    let _ = CALLS.load(Ordering::Relaxed);
+}
+
+#[test]
+fn usage_aware_routing_demotes_over_quota_key() {
+    // Two keys: key "…aaaa" serves 95% (over the 80% threshold), key
+    // "…zzzz" 10%. Quota-aware candidates must put zzzz first.
+    let payload_a = usage_body(0.95, 0.1, "m", 1, "$0");
+    let payload_z = usage_body(0.05, 0.1, "m", 1, "$0");
+    let up = Upstream::spawn_auth(move |_, auth| match auth {
+        Some(a) if a.contains("quota0001") => (200, "OK".into(), payload_a.clone()),
+        Some(a) if a.contains("quota0002") => (200, "OK".into(), payload_z.clone()),
+        other => panic!("unexpected auth {other:?}"),
+    });
+    let pool = Arc::new(ollamux::Pool::new(
+        vec![
+            ("omk-quota0001".to_string(), 2),
+            ("omk-quota0002".to_string(), 2),
+        ],
+        4,
+        false,
+    ));
+    pool.set_usage_threshold(80);
+    let addr = spawn_server(pool.clone(), &up.url);
+
+    // Fill the snapshot (both keys fetched in one fan-out).
+    let (status, body) = post(&addr, "/_usage", "");
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(up.wait_for_count(2, std::time::Duration::from_secs(2)), 2);
+
+    // Both keys fresh+idle: the over-quota key must sort last. Round-robin
+    // would otherwise alternate, so run several admissions.
+    let mut firsts = std::collections::HashMap::new();
+    for _ in 0..8 {
+        let (_p, k) = pool
+            .admit(Duration::from_millis(200))
+            .unwrap_or_else(|e| panic!("admit failed: {e:?}"));
+        *firsts.entry(k).or_insert(0u32) += 1;
+        drop(_p);
+    }
+    assert_eq!(
+        firsts.get(&0),
+        None,
+        "over-quota key must never be chosen while a fresh key is free"
+    );
+
+    // Threshold disabled mid-flight? (Not possible at runtime; but a pool
+    // without a threshold ignores the same data.)
+    let pool_plain = pool_with(&[("omk-quota0001", 1), ("omk-quota0002", 1)]);
+    pool_plain.publish_usage(&{
+        // Fabricate a snapshot directly: over-quota on key 0 only.
+        ollamux::UsageSnapshot::for_test(
+            vec![
+                ollamux::KeyUsage::for_test(0, Some(0.99)),
+                ollamux::KeyUsage::for_test(1, Some(0.01)),
+            ],
+            std::time::Instant::now(),
+        )
+    });
+    let cands = pool_plain.candidates();
+    assert_eq!(cands.len(), 2, "no data/flag → nobody excluded");
 }
 
 #[cfg(feature = "net")]

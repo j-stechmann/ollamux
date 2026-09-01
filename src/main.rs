@@ -19,6 +19,8 @@ struct Config {
     addr: String,
     keys_path: Option<std::path::PathBuf>,
     verbose: bool,
+    /// Quota-aware routing threshold in percent (None = disabled).
+    usage_aware: Option<u32>,
 }
 
 fn main() {
@@ -57,6 +59,11 @@ fn main() {
         WAITER_CAP,
         cfg.verbose,
     ));
+    // Quota-aware routing is opt-in: set the threshold before anything
+    // serves, per the pool's write-once usage configuration.
+    if let Some(pct) = cfg.usage_aware {
+        pool.set_usage_threshold(pct);
+    }
     let proxy = Arc::new(ollamux::proxy::Server::new(pool.clone()));
 
     let addr = cfg.addr.clone();
@@ -81,6 +88,18 @@ fn main() {
 
     let stop = Arc::new(AtomicBool::new(false));
     spawn_workers(tiny.clone(), proxy.clone(), stop.clone());
+
+    // Quota-aware poller: only exists when the feature is enabled.
+    if cfg.usage_aware.is_some() {
+        proxy.spawn_usage_poller(stop.clone());
+        if cfg.verbose {
+            eprintln!(
+                "ollamux: quota-aware routing enabled (threshold {}%; usage refresh every {}s)",
+                cfg.usage_aware.unwrap_or_default(),
+                ollamux::USAGE_TTL.as_secs()
+            );
+        }
+    }
 
     let verbose = cfg.verbose;
     let stop_ctrl = stop.clone();
@@ -153,8 +172,9 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Config>, Stri
         addr: DEFAULT_ADDR.to_string(),
         keys_path: None,
         verbose: false,
+        usage_aware: None,
     };
-    let mut it = args;
+    let mut it = args.peekable();
     // Splits `--opt=value` into (`--opt`, Some(`value`)); plain `--opt`
     // yields (arg, None) and its value comes from the next argv entry.
     fn split_kv(arg: &str) -> (&str, Option<&str>) {
@@ -162,6 +182,21 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Config>, Stri
             Some((k, v)) if k.starts_with("--") => (k, Some(v)),
             _ => (arg, None),
         }
+    }
+    // A threshold string ("80" etc.) into its percent value; anything not
+    // a sane percent is a usage error, never a silent default.
+    fn parse_pct(s: &str) -> Result<u32, String> {
+        let pct: u32 = s
+            .trim()
+            .trim_end_matches('%')
+            .parse()
+            .map_err(|_| format!("invalid --usage-aware threshold {s:?} (want 1–99)"))?;
+        if pct == 0 || pct > 99 {
+            return Err(format!(
+                "invalid --usage-aware threshold {pct} (want 1–99: 0 would disable the feature)"
+            ));
+        }
+        Ok(pct)
     }
     while let Some(arg) = it.next() {
         let (flag, inline) = split_kv(&arg);
@@ -183,23 +218,56 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Config>, Stri
                 cfg.keys_path = Some(std::path::PathBuf::from(value()?));
             }
             "-v" | "--verbose" => cfg.verbose = true,
-            _other => return Err(format!("unknown argument: {arg:?}")),
+            "--usage-aware" => {
+                // `--usage-aware=PCT`, `--usage-aware PCT`, or bare
+                // `--usage-aware` (default threshold). A following token
+                // is only eaten when it looks numeric — flags stay flags.
+                cfg.usage_aware = Some(match inline {
+                    Some(v) => parse_pct(v)?,
+                    None => match it.peek() {
+                        Some(next) if next.parse::<u32>().is_ok() => {
+                            let v = it.next().expect("peeked value exists");
+                            parse_pct(&v)?
+                        }
+                        _ => DEFAULT_USAGE_AWARE,
+                    },
+                });
+            }
+            _other => {
+                return Err(format!("unknown argument: {arg:?}"));
+            }
+        }
+    }
+    if cfg.usage_aware.is_none() {
+        // Flag wins over env (keys precedence is the same shape).
+        if let Ok(raw) = std::env::var("OLLAMUX_USAGE_AWARE") {
+            if !raw.is_empty() {
+                cfg.usage_aware = Some(parse_pct(&raw)?);
+            }
         }
     }
     Ok(Some(cfg))
 }
+
+/// Default demotion threshold for --usage-aware (matches ollama-bar's
+/// warning level).
+const DEFAULT_USAGE_AWARE: u32 = 80;
 
 fn print_help() {
     println!(
         "ollamux {} — key-rotating proxy for the Ollama Cloud API
 
 USAGE:
-    ollamux [--addr HOST:PORT] [--keys PATH] [-v]
+    ollamux [--addr HOST:PORT] [--keys PATH] [--usage-aware[=PCT]] [-v]
 
 OPTIONS:
     -a, --addr <HOST:PORT>   Listen address [default: {DEFAULT_ADDR}]
     -k, --keys <PATH>        Keys file (default: $OLLAMUX_KEYS, else
                              $XDG_CONFIG_HOME/ollamux/keys, else ~/.config/ollamux/keys)
+    --usage-aware[=PCT]      Quota-aware key selection: keys whose session
+                             usage is at/over PCT percent are served last
+                             (never excluded). Default PCT: {DEFAULT_USAGE_AWARE}.
+                             Also via OLLAMUX_USAGE_AWARE (flag wins).
     -v, --verbose            Verbose stderr (startup banner, per-request log,
                              key cooldowns/deaths, upstream snippets)
     -h, --help               This help
@@ -216,7 +284,9 @@ KEYS:
 
 ENDPOINTS:
     /api/*, /v1/*   proxied to https://ollama.com with key rotation
-    /_keys          per-key health JSON
+    /_keys          per-key health JSON (embeds usage when known)
+    /_usage         per-key Ollama Cloud usage JSON (?refresh=1 forces,
+                    at most one fetch attempt per 5 s)
     /_health        liveness JSON",
         ollamux::VERSION
     );
