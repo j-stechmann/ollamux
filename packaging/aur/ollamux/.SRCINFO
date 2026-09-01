@@ -1,6 +1,6 @@
 pkgbase = ollamux
 	pkgdesc = Key-rotating reverse proxy for the Ollama Cloud API
-	pkgver = 0.3.0
+	pkgver = 0.4.0
 	pkgrel = 1
 	url = https://github.com/j-stechmann/ollamux
 	arch = x86_64
@@ -10,12 +10,12 @@ pkgbase = ollamux
 	makedepends = cargo
 	depends = glibc
 	depends = gcc-libs
-	provides = ollamux=0.3.0
+	provides = ollamux=0.4.0
 	conflicts = ollamux-bin
 	options = !lto
-	source = ollamux-0.3.0.tar.gz::https://github.com/j-stechmann/ollamux/archive/v0.3.0.tar.gz
-	source = ollamux.service::https://github.com/j-stechmann/ollamux/raw/v0.3.0/packaging/ollamux.service
-	source = ollamux.1::https://github.com/j-stechmann/ollamux/raw/v0.3.0/packaging/ollamux.1
+	source = ollamux-0.4.0.tar.gz::https://github.com/j-stechmann/ollamux/archive/v0.4.0.tar.gz
+	source = ollamux.service::https://github.com/j-stechmann/ollamux/raw/v0.4.0/packaging/ollamux.service
+	source = ollamux.1::https://github.com/j-stechmann/ollamux/raw/v0.4.0/packaging/ollamux.1
 	sha256sums = 6dc47d66a824ba82f7a010a1b235b394f397682959486c2e731c4ff8f0e9362c
 	sha256sums = a88b8011353909db0dfd5947689d840fad5e397a4cbdf4b805257b66a49dadc8
 	sha256sums = ff38a4c7024b58435ee69cdfd6314cd95e65db6246580003cf80a54ad17693ed
