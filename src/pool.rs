@@ -375,6 +375,19 @@ impl Pool {
         self.affinity.get(id)
     }
 
+    /// Whether `id` currently has a pin that could serve *right now* —
+    /// Up, not over-quota, and a free slot: the same usability test
+    /// `admit_affine` applies before honoring a pin. Read-only (no slot
+    /// is taken); races with concurrent admissions are inherent and
+    /// harmless — this only feeds the advisory X-Ollamux-Affinity header.
+    pub fn pin_usable(&self, id: u64) -> bool {
+        let Some(key) = self.pinned_key(id) else {
+            return false;
+        };
+        let ks = &self.states[key];
+        ks.state() == State::Up && !self.is_over_quota(key) && ks.in_use() < ks.concurrency
+    }
+
     /// Pin (or re-pin) an identity to a key. Called at admission time (so
     /// parallel same-conversation requests share the pin even while the
     /// first response streams) and again on confirmed 2xx success.
@@ -1104,6 +1117,42 @@ mod tests {
     }
 
     // ----- prompt-cache affinity -----
+
+    #[test]
+    fn pin_usable_mirrors_admit_affine_usability() {
+        let p = pool(2, 1);
+        // No pin yet: not usable.
+        assert!(!p.pin_usable(5));
+        let (permit, key) = p.admit_affine(Duration::from_millis(50), Some(5)).unwrap();
+        // Pin exists and key is Up with (this permit just taken, but
+        // concurrency is 1 — the pinned key is now full).
+        if key == 0 {
+            assert!(!p.pin_usable(5), "pinned key full → not usable");
+        }
+        drop(permit);
+        assert!(p.pin_usable(5), "pin Up + free slot → usable");
+        // Cooldown makes the pin unusable.
+        p.mark_cooldown(key, Duration::from_millis(50), "test");
+        assert!(!p.pin_usable(5), "cooling pinned key → not usable");
+        // Dead makes the pin unusable.
+        p.mark_dead(key, "test");
+        assert!(!p.pin_usable(5), "dead pinned key → not usable");
+    }
+
+    #[test]
+    fn pin_usable_false_when_over_quota_or_disabled() {
+        let p = two_key_pool();
+        p.set_usage_threshold(80);
+        p.publish_usage(&usage_snap(&[(0, Some(0.95)), (1, Some(0.10))]));
+        p.pin(11, 0);
+        assert!(p.is_over_quota(0));
+        assert!(!p.pin_usable(11), "over-quota pinned key → not usable");
+        p.set_affinity_enabled(false);
+        assert!(!p.pin_usable(11), "affinity disabled → no usable pin");
+        p.set_affinity_enabled(true);
+        p.publish_usage(&usage_snap(&[(0, Some(0.10))]));
+        assert!(p.pin_usable(11), "back under quota + enabled → usable");
+    }
 
     #[test]
     fn affine_pin_hit_reuses_pinned_key() {

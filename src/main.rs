@@ -252,13 +252,11 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Config>, Stri
             }
         }
     }
-    if !cfg.affinity {
-        // --no-affinity wins over the env; env only reinforces the disable.
-        if std::env::var("OLLAMUX_NO_AFFINITY")
-            .is_ok_and(|v| !v.is_empty() && v != "0" && v != "false")
-        {
-            cfg.affinity = false;
-        }
+    // Both --no-affinity and the env var only ever disable, so there is
+    // no precedence conflict — the env check runs unconditionally.
+    if std::env::var("OLLAMUX_NO_AFFINITY").is_ok_and(|v| !v.is_empty() && v != "0" && v != "false")
+    {
+        cfg.affinity = false;
     }
     Ok(Some(cfg))
 }
@@ -388,5 +386,31 @@ fn sigint_thread<F: Fn()>(notify: F) {
 fn sigint_thread<F: Fn()>(_notify: F) {
     loop {
         std::thread::park();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The env var must disable affinity on its own — a regression guard:
+    /// this check once lived inside `if !cfg.affinity`, making the env var
+    /// silently inert unless the flag was also passed.
+    #[test]
+    fn env_var_disables_affinity_without_flag() {
+        // SAFETY: tests run single-threaded with respect to env mutation
+        // within this test binary's `parse_args` calls; other tests in
+        // this binary do not read OLLAMUX_NO_AFFINITY.
+        // (Rust 2024: env access in tests is unsafe.)
+        unsafe { std::env::set_var("OLLAMUX_NO_AFFINITY", "1") };
+        let cfg = parse_args(std::iter::empty()).expect("args parse");
+        assert!(cfg.is_some_and(|c| !c.affinity), "env alone must disable");
+
+        // Falsy values do not disable.
+        unsafe { std::env::set_var("OLLAMUX_NO_AFFINITY", "0") };
+        let cfg = parse_args(std::iter::empty()).expect("args parse");
+        assert!(cfg.is_some_and(|c| c.affinity), "'0' must not disable");
+
+        unsafe { std::env::remove_var("OLLAMUX_NO_AFFINITY") };
     }
 }

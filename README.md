@@ -155,8 +155,12 @@ the request is routed normally (no waiting on a busy key); a cache miss
 just means the next success re-pins.
 
 - Disable with `--no-affinity` or `OLLAMUX_NO_AFFINITY=1`.
-- Every proxied response carries `X-Ollamux-Affinity: hit|miss|off`
-  (`off` = disabled or the body gave no identity).
+- Responses served by a pool key carry `X-Ollamux-Affinity: hit|miss|off`
+  (`off` = disabled or the body gave no identity; proxy-generated
+  failures where no key was selected — admission rejects, exhausted
+  failover — omit the header). `hit` means a pin existed **and was
+  usable** (healthy, under quota, free slot) at admission; `miss` covers
+  first requests, evictions, and pins that fell through.
 - Helps append-only conversations (the common case: chat turns only
   extend the messages array). Clients that rewrite the system prompt or
   trim history mid-conversation simply get the old rotation behavior.

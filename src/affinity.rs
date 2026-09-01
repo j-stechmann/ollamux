@@ -25,10 +25,12 @@ use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Mutex, MutexGuard};
 
-/// Hash-input cap for the chat prefix (serialized). Bounds CPU per request
-/// on bodies with huge first messages (base64 images); identical to the
-/// `prompt` cap's role. Pinning a prefix beyond this is not meaningful —
-/// such bodies are re-ingested slowly upstream anyway.
+/// Hash-input cap for the chat prefix (serialized). Bounds hash input per
+/// request on bodies with huge first messages (base64 images) — the
+/// message is still fully serialized before truncation, so this bounds
+/// hashing, not serialization cost. Identical to the `prompt` cap's role.
+/// Pinning a prefix beyond this is not meaningful — such bodies are
+/// re-ingested slowly upstream anyway.
 const MAX_PREFIX_BYTES: usize = 64 * 1024;
 /// Hash-input cap for the decoded `prompt` string.
 const MAX_PROMPT_BYTES: usize = 8 * 1024;

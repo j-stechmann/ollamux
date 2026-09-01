@@ -49,9 +49,10 @@ const AFFINITY_HEADER: &str = "X-Ollamux-Affinity";
 /// serves the request (the X-Ollamux-Key gate):
 /// - "off" — affinity disabled, or the body gave no identity (unparseable,
 ///   non-affine path): nothing to consult.
-/// - "hit" — a pin existed for this identity and was usable at admission.
-/// - "miss" — no usable pin (first request of a conversation, evicted, or
-///   the pinned key could not serve so we fell through).
+/// - "hit" — a pin existed for this identity and was usable at admission
+///   (healthy, under quota, free slot — the same test admit_affine applies).
+/// - "miss" — no usable pin: first request of a conversation, evicted, or
+///   the pinned key could not serve so we fell through.
 fn affinity_header_value(hit: bool, enabled: bool, identity: Option<u64>) -> &'static str {
     if !enabled || identity.is_none() {
         return "off";
@@ -280,21 +281,23 @@ impl Server {
                 return (status, 0, None, None);
             }
         };
-        let streaming = wants_stream(&body, is_v1);
+        // Parse the body once; both streaming detection and affinity
+        // identity read the same tree.
+        let parsed: Option<serde_json::Value> = serde_json::from_slice(&body).ok();
+        let streaming = wants_stream(parsed.as_ref(), is_v1);
 
-        // 2. Conversation identity for prompt-cache affinity. Parsed from
-        // the same buffered body; `None` = no affinity (non-affine path,
-        // unparseable body, missing model/prompt). Dropped immediately —
-        // a 16 MiB body must not linger as a serde_json tree.
-        let identity = {
-            let parsed: Option<serde_json::Value> = serde_json::from_slice(&body).ok();
-            crate::affinity::identity_from(parsed.as_ref(), sub_path)
-        };
-        // Whether a usable pin existed *before* this admission (for the
-        // X-Ollamux-Affinity header). Read pre-admission, so a pin written
-        // by an in-flight parallel request counts as a hit on the next one,
-        // not retroactively on this one.
-        let pinned_before = identity.is_some_and(|id| self.pool.pinned_key(id).is_some());
+        // 2. Conversation identity for prompt-cache affinity. `None` =
+        // no affinity (non-affine path, unparseable body, missing
+        // model/prompt). `parsed` is dropped at scope end — a 16 MiB
+        // body must not linger as a serde_json tree.
+        let identity = crate::affinity::identity_from(parsed.as_ref(), sub_path);
+        // Whether a *usable* pin existed *before* this admission (for the
+        // X-Ollamux-Affinity header) — same test admit_affine applies, so
+        // "hit" always means the pinned key could serve and was chosen.
+        // Read pre-admission, so a pin written by an in-flight parallel
+        // request counts as a hit on the next one, not retroactively on
+        // this one.
+        let pinned_before = identity.is_some_and(|id| self.pool.pin_usable(id));
 
         // 2. Admission before dispatch. The permit is held across the whole
         // request and freed by RAII when this function returns.
@@ -810,10 +813,10 @@ fn read_body(req: &mut tiny_http::Request) -> Result<Vec<u8>, bool> {
 }
 
 /// Whether the client asked for a streaming response. Best-effort from the
-/// buffered body: `"stream": true/false` if present, else the endpoint
-/// default (Ollama streams by default; OpenAI-compat does not).
-fn wants_stream(body: &[u8], is_v1: bool) -> bool {
-    let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else {
+/// already-parsed body: `"stream": true/false` if present, else the
+/// endpoint default (Ollama streams by default; OpenAI-compat does not).
+fn wants_stream(parsed: Option<&serde_json::Value>, is_v1: bool) -> bool {
+    let Some(v) = parsed else {
         return false;
     };
     match v.get("stream") {

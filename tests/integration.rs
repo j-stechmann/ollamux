@@ -8,7 +8,7 @@ use ollamux::proxy::Server;
 use std::io::{Read, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 fn pool_with(keys: &[(&str, u32)]) -> Arc<ollamux::Pool> {
     Arc::new(ollamux::Pool::new(
@@ -912,8 +912,8 @@ fn affinity_pinned_key_death_repins_to_survivor() {
         .count();
     assert_eq!(deads, 1, "dead key must not be retried after re-pin");
 
-    // Header says hit (pin existed) even though it fell through to the
-    // survivor on request 1.
+    // Header says miss: the pin existed but the dead key could not serve,
+    // so the request fell through to the survivor (hit = usable pin).
     let aff1 = header_value(&h1, "x-ollamux-affinity").unwrap_or_default();
     assert_eq!(aff1, "miss");
 }
@@ -946,8 +946,20 @@ fn affinity_busy_pinned_key_falls_through_then_returns() {
     };
     let other_idx = 1 - pinned_idx;
 
-    // Occupy the pinned key's only slot at the pool level.
-    let _hold = pool.try_acquire(pinned_idx).unwrap();
+    // Occupy the pinned key's only slot at the pool level. The worker
+    // thread frees its permit shortly after the response bytes reach us,
+    // so poll briefly rather than assuming it is already free.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let _hold = loop {
+        if let Some(permit) = pool.try_acquire(pinned_idx) {
+            break permit;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "pinned key slot never freed (permit leak?)"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    };
     let (s2, _, h2) = post_with_headers(&addr, "/api/chat", CONVO_A_TURN2);
     assert_eq!(s2, 200);
     let served = header_value(&h2, "x-ollamux-key").unwrap();
@@ -959,6 +971,11 @@ fn affinity_busy_pinned_key_falls_through_then_returns() {
             "omk-busykey02"
         }),
         "busy pinned key must fall through, not wait: got {served}, pin was {pinned_suffix}"
+    );
+    assert_eq!(
+        header_value(&h2, "x-ollamux-affinity").unwrap(),
+        "miss",
+        "pinned key had no free slot: not a usable pin, not a hit"
     );
     drop(_hold);
 

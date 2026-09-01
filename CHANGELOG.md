@@ -20,6 +20,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   key-served responses; `aff=` field in verbose logs. Disable via
   `--no-affinity` or `OLLAMUX_NO_AFFINITY=1`.
 
+### Fixed
+
+- `OLLAMUX_NO_AFFINITY=1` is now honored on its own (the env check was
+  nested under the `--no-affinity` branch, so the env var alone did
+  nothing).
+- `X-Ollamux-Affinity` now reports `miss` (not `hit`) when a pin existed
+  but its key could not serve (dead, cooling, over-quota, or full) and
+  the request fell through — matching the documented semantics.
+
 ## [0.4.0] - 2026-09-01
 
 ### Added
