@@ -8,7 +8,7 @@ use ollamux::proxy::Server;
 use std::io::{Read, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 fn pool_with(keys: &[(&str, u32)]) -> Arc<ollamux::Pool> {
     Arc::new(ollamux::Pool::new(
@@ -18,9 +18,9 @@ fn pool_with(keys: &[(&str, u32)]) -> Arc<ollamux::Pool> {
     ))
 }
 
-/// Spawn the real Server proxying to `upstream`; returns base URL.
-fn spawn_server(pool: Arc<ollamux::Pool>, upstream: &str) -> String {
-    let server = Server::with_upstream(pool, upstream);
+/// Spawn the real Server proxying to `upstream`; returns (base URL, pool).
+fn spawn_server(pool: Arc<ollamux::Pool>, upstream: &str) -> (String, Arc<ollamux::Pool>) {
+    let server = Server::with_upstream(pool.clone(), upstream);
     let tiny = tiny_http::Server::http("127.0.0.1:0").unwrap();
     let addr = match tiny.server_addr() {
         tiny_http::ListenAddr::IP(a) => a.to_string(),
@@ -32,7 +32,7 @@ fn spawn_server(pool: Arc<ollamux::Pool>, upstream: &str) -> String {
             server.handle(req);
         }
     });
-    format!("http://{addr}")
+    (format!("http://{addr}"), pool)
 }
 
 fn headers_of(r: &ureq::Response) -> Vec<(String, String)> {
@@ -233,7 +233,7 @@ fn read_http_request(stream: &mut std::net::TcpStream) -> (String, String, Optio
 #[test]
 fn keys_health_and_404_endpoints() {
     let up = Upstream::spawn(|_| (200u16, "OK".into(), "{}".into()));
-    let addr = spawn_server(pool_with(&[("omk-abcd1234", 1)]), &up.url);
+    let (addr, _pool) = spawn_server(pool_with(&[("omk-abcd1234", 1)]), &up.url);
 
     let (status, body, _) = get(&addr, "/_keys");
     assert_eq!(status, 200, "body: {body}");
@@ -278,7 +278,7 @@ fn all_responses_carry_identity_header() {
             )
         }
     });
-    let addr = spawn_server(pool_with(&[("omk-ident001", 1)]), &up.url);
+    let (addr, _pool) = spawn_server(pool_with(&[("omk-ident001", 1)]), &up.url);
 
     for path in ["/_health", "/nonsense"] {
         let (_, _, headers) = get(&addr, path);
@@ -340,7 +340,7 @@ fn no_auth_paths_skip_credentials_and_slots() {
         assert!(path.starts_with("/api/tags"), "unexpected path {path}");
         (200, "OK".into(), r#"{"models":[]}"#.into())
     });
-    let addr = spawn_server(pool_with(&[("omk-notags01", 1)]), &up.url);
+    let (addr, _pool) = spawn_server(pool_with(&[("omk-notags01", 1)]), &up.url);
 
     let (status, body, headers) = get(&addr, "/api/tags");
     assert_eq!(status, 200, "body: {body}");
@@ -384,7 +384,7 @@ fn up_spawn_and_check_query() {
         *seen2.lock().unwrap() = Some(path.to_string());
         (200, "OK".into(), "{}".into())
     });
-    let addr = spawn_server(pool_with(&[("omk-query0001", 1)]), &up.url);
+    let (addr, _pool) = spawn_server(pool_with(&[("omk-query0001", 1)]), &up.url);
     let _ = get(&addr, "/api/tags?foo=bar&z=1");
     let recorded = up.recorded();
     assert_eq!(recorded.len(), 1);
@@ -405,7 +405,7 @@ fn relayed_4xx_bodies_are_verbatim() {
         CALLS.fetch_add(1, Ordering::Relaxed);
         (400, "Bad Request".into(), payload.clone())
     });
-    let addr = spawn_server(pool_with(&[("omk-passthru1", 1)]), &up.url);
+    let (addr, _pool) = spawn_server(pool_with(&[("omk-passthru1", 1)]), &up.url);
     let (status, body) = post(&addr, "/api/generate", r#"{"model":"x"}"#);
     assert_eq!(status, 400);
     assert!(
@@ -422,7 +422,7 @@ fn relayed_4xx_bodies_are_verbatim() {
 #[test]
 fn surface_error_shapes_on_total_failure() {
     // Upstream unreachable → after budget, 502 with the surface's shape.
-    let addr = spawn_server(
+    let (addr, _pool) = spawn_server(
         pool_with(&[("omk-shape0001", 1)]),
         "http://127.0.0.1:1", // nothing listens there
     );
@@ -466,7 +466,7 @@ fn rate_limited_key_rotates_and_cools() {
             (200, "OK".into(), r#"{"ok":true}"#.into())
         }
     });
-    let addr = spawn_server(
+    let (addr, _pool) = spawn_server(
         pool_with(&[("omk-cool00001", 2), ("omk-cool00002", 2)]),
         &up.url,
     );
@@ -495,7 +495,7 @@ fn rate_limited_key_rotates_and_cools() {
 #[test]
 fn all_dead_surfaces_403_hermetically() {
     let up = Upstream::spawn(|_| (401, "Unauthorized".into(), "Unauthorized".into()));
-    let addr = spawn_server(pool_with(&[("omk-dead00001", 1)]), &up.url);
+    let (addr, _pool) = spawn_server(pool_with(&[("omk-dead00001", 1)]), &up.url);
     let (status, body) = post(&addr, "/api/chat", r#"{"model":"x"}"#);
     assert_eq!(status, 403); // all keys dead after the 401
     let info = spawn_info(&addr);
@@ -508,7 +508,7 @@ fn all_dead_surfaces_403_hermetically() {
 #[test]
 fn streaming_passes_through_chunked() {
     let up = Upstream::spawn(|_| (200, "OK".into(), "line1\nline2\n".into()));
-    let addr = spawn_server(pool_with(&[("omk-stream001", 1)]), &up.url);
+    let (addr, _pool) = spawn_server(pool_with(&[("omk-stream001", 1)]), &up.url);
     let (status, body) = post(&addr, "/api/generate", r#"{"model":"x","stream":true}"#);
     assert_eq!(status, 200);
     assert_eq!(body, "line1\nline2\n");
@@ -537,7 +537,7 @@ fn usage_endpoint_aggregates_per_key_without_secrets() {
             other => panic!("unexpected auth {other:?}"),
         }
     });
-    let addr = spawn_server(
+    let (addr, _pool) = spawn_server(
         pool_with(&[("omk-abcd1234", 1), ("omk-efgh5678", 1)]),
         &up.url,
     );
@@ -585,7 +585,7 @@ fn usage_ttl_caches_and_refresh_flag_bypasses() {
         CALLS.fetch_add(1, Ordering::Relaxed);
         (200, "OK".into(), usage_body(0.1, 0.2, "m", 1, "$0.01"))
     });
-    let addr = spawn_server(pool_with(&[("omk-ttlcache001", 1)]), &up.url);
+    let (addr, _pool) = spawn_server(pool_with(&[("omk-ttlcache001", 1)]), &up.url);
 
     let _ = post(&addr, "/_usage", "");
     assert_eq!(up.wait_for_count(1, std::time::Duration::from_secs(5)), 1);
@@ -618,7 +618,7 @@ fn keys_endpoint_never_fetches_but_embeds_snapshot() {
         CALLS.fetch_add(1, Ordering::Relaxed);
         (200, "OK".into(), usage_body(0.5, 0.25, "m", 3, "$3.21"))
     });
-    let addr = spawn_server(pool_with(&[("omk-keysembed1", 1)]), &up.url);
+    let (addr, _pool) = spawn_server(pool_with(&[("omk-keysembed1", 1)]), &up.url);
 
     // Pure in-memory read: no snapshot yet → no usage key, no upstream call.
     let (status, body, _) = get(&addr, "/_keys");
@@ -644,7 +644,7 @@ fn keys_endpoint_never_fetches_but_embeds_snapshot() {
 #[test]
 fn usage_payload_drift_is_reported_per_key_still_200() {
     let up = Upstream::spawn_auth(|_, _| (200, "OK".into(), r#"{"hello":"world"}"#.into()));
-    let addr = spawn_server(pool_with(&[("omk-drift00001", 1)]), &up.url);
+    let (addr, _pool) = spawn_server(pool_with(&[("omk-drift00001", 1)]), &up.url);
     let (status, body, _) = post_with_headers(&addr, "/_usage", "");
     assert_eq!(status, 200, "introspection stays 200 on drift: {body}");
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -662,7 +662,7 @@ fn usage_auth_failure_is_reported_never_marks_dead() {
         Some(a) if a.contains("unauth401") => (401, "Unauthorized".into(), String::new()),
         _ => (200, "OK".into(), usage_body(0.1, 0.1, "m", 1, "$0")),
     });
-    let addr = spawn_server(pool_with(&[("omk-unauth401xx", 1)]), &up.url);
+    let (addr, _pool) = spawn_server(pool_with(&[("omk-unauth401xx", 1)]), &up.url);
     let (status, body, _) = post_with_headers(&addr, "/_usage", "");
     assert_eq!(status, 200);
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -690,7 +690,7 @@ fn usage_upstream_error_body_is_never_relayed() {
         let echoed = auth.unwrap_or_default();
         (500, "Server Error".into(), format!("error with {echoed}"))
     });
-    let addr = spawn_server(pool_with(&[("omk-secret1234", 1)]), &up.url);
+    let (addr, _pool) = spawn_server(pool_with(&[("omk-secret1234", 1)]), &up.url);
     let (status, body, _) = post_with_headers(&addr, "/_usage", "");
     assert_eq!(status, 200);
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -706,7 +706,7 @@ fn usage_upstream_error_body_is_never_relayed() {
 fn usage_all_keys_failing_still_answers_200() {
     // Nothing listens on the upstream port: every fetch takes the network
     // error path. /_usage is observability: never 5xx, report per key.
-    let addr = spawn_server(pool_with(&[("omk-noreach001", 1)]), "http://127.0.0.1:1");
+    let (addr, _pool) = spawn_server(pool_with(&[("omk-noreach001", 1)]), "http://127.0.0.1:1");
     let (status, body) = post(&addr, "/_usage", "");
     assert_eq!(status, 200, "{body}");
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -722,7 +722,7 @@ fn usage_endpoint_method_and_query_handling() {
         CALLS.fetch_add(1, Ordering::Relaxed);
         (200, "OK".into(), usage_body(0.1, 0.2, "m", 1, "$0.01"))
     });
-    let addr = spawn_server(pool_with(&[("omk-methodtest1", 1)]), &up.url);
+    let (addr, _pool) = spawn_server(pool_with(&[("omk-methodtest1", 1)]), &up.url);
 
     // GET works (the documented form)…
     let (status, _, _) = get(&addr, "/_usage");
@@ -758,7 +758,7 @@ fn usage_aware_routing_demotes_over_quota_key() {
         false,
     ));
     pool.set_usage_threshold(80);
-    let addr = spawn_server(pool.clone(), &up.url);
+    let (addr, _pool) = spawn_server(pool.clone(), &up.url);
 
     // Fill the snapshot (both keys fetched in one fan-out).
     let (status, body) = post(&addr, "/_usage", "");
@@ -798,12 +798,349 @@ fn usage_aware_routing_demotes_over_quota_key() {
     assert_eq!(cands.len(), 2, "no data/flag → nobody excluded");
 }
 
+// ---------------------------------------------------------------------------
+// Prompt-cache affinity: same conversation prefix pins to one key so
+// ollama.com's per-account prompt cache stays warm.
+// ---------------------------------------------------------------------------
+
+const CONVO_A: &str = r#"{"model":"gpt-oss:120b","messages":[
+    {"role":"system","content":"You are terse."},
+    {"role":"user","content":"hi"}]}"#;
+const CONVO_A_TURN2: &str = r#"{"model":"gpt-oss:120b","messages":[
+    {"role":"system","content":"You are terse."},
+    {"role":"user","content":"hi"},
+    {"role":"assistant","content":"Hello."},
+    {"role":"user","content":"more"}]}"#;
+
+fn header_value(headers: &[(String, String)], name: &str) -> Option<String> {
+    headers
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v.clone())
+}
+
+fn suffix_of_auth(auth: &str) -> String {
+    // Keys are "omk-<name>"; the pool reports the last four characters.
+    auth.chars()
+        .rev()
+        .take(4)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect()
+}
+
+#[test]
+fn affinity_same_conversation_same_key() {
+    // Two keys; upstream 200s everything. Turn 1 pins (miss), turn 2 and
+    // the parallel-shot re-request must reuse the same key (hit).
+    let up = Upstream::spawn(move |_| {
+        (
+            200,
+            "OK".into(),
+            r#"{"model":"gpt-oss:120b","message":{"role":"assistant","content":"ok"},"done":true}"#
+                .into(),
+        )
+    });
+    let (addr, _pool) = spawn_server(
+        pool_with(&[("omk-affkey001", 4), ("omk-affkey002", 4)]),
+        &up.url,
+    );
+
+    let (s1, _, h1) = post_with_headers(&addr, "/api/chat", CONVO_A);
+    assert_eq!(s1, 200);
+    let (s2, _, h2) = post_with_headers(&addr, "/api/chat", CONVO_A_TURN2);
+    assert_eq!(s2, 200);
+
+    let key1 = header_value(&h1, "x-ollamux-key").expect("key header");
+    let key2 = header_value(&h2, "x-ollamux-key").expect("key header");
+    assert_eq!(key1, key2, "same conversation must pin to one key");
+
+    let aff1 = header_value(&h1, "x-ollamux-affinity").expect("affinity header");
+    let aff2 = header_value(&h2, "x-ollamux-affinity").expect("affinity header");
+    assert_eq!(aff1, "miss", "first request of a conversation: {aff1}");
+    assert_eq!(aff2, "hit", "second request must consult the pin: {aff2}");
+
+    // And the upstream really saw one Authorization across both turns.
+    let auths: Vec<String> = up
+        .recorded()
+        .iter()
+        .filter_map(|r| r.auth.clone())
+        .collect();
+    assert_eq!(auths.len(), 2, "{auths:?}");
+    assert_eq!(auths[0], auths[1], "both turns served by the same key");
+}
+
+#[test]
+fn affinity_pinned_key_death_repins_to_survivor() {
+    // Key "…d1e2" always 401s (dead), key "…a9b8" 200s. First request
+    // fails over to the survivor; the pin follows, so the second request
+    // goes straight to the survivor (retries=0, no new 401).
+    let up = Upstream::spawn_auth(move |_, auth| match auth {
+        Some(a) if a.contains("d1e2") => (
+            401,
+            "Unauthorized".into(),
+            r#"{"error":"Unauthorized"}"#.into(),
+        ),
+        _ => (
+            200,
+            "OK".into(),
+            r#"{"done":true,"message":{"role":"assistant","content":"ok"}}"#.into(),
+        ),
+    });
+    let (addr, _pool) = spawn_server(
+        pool_with(&[("omk-deadd1e2", 1), ("omk-alivea9b8", 1)]),
+        &up.url,
+    );
+
+    let (s1, _, h1) = post_with_headers(&addr, "/api/chat", CONVO_A);
+    assert_eq!(s1, 200, "failover must reach the survivor");
+    let retries1 = header_value(&h1, "x-ollamux-retries").unwrap_or_default();
+    assert_eq!(retries1, "1", "one rotation to the survivor");
+
+    let (s2, _, h2) = post_with_headers(&addr, "/api/chat", CONVO_A_TURN2);
+    assert_eq!(s2, 200);
+    let retries2 = header_value(&h2, "x-ollamux-retries").unwrap_or_default();
+    assert_eq!(retries2, "0", "re-pinned: served directly by the survivor");
+
+    // Exactly one 401 was recorded (the initial pin attempt); the second
+    // request did not revisit the dead key.
+    let deads = up
+        .recorded()
+        .iter()
+        .filter(|r| r.auth.as_deref().is_some_and(|a| a.contains("d1e2")))
+        .count();
+    assert_eq!(deads, 1, "dead key must not be retried after re-pin");
+
+    // Header says miss: the pin existed but the dead key could not serve,
+    // so the request fell through to the survivor (hit = usable pin).
+    let aff1 = header_value(&h1, "x-ollamux-affinity").unwrap_or_default();
+    assert_eq!(aff1, "miss");
+}
+
+#[test]
+fn affinity_busy_pinned_key_falls_through_then_returns() {
+    // Deterministic via slot occupation: pin lands on key 0; with key 0's
+    // slot occupied the same conversation must be served by key 1 (no
+    // waiting on the pinned key), and with both free again the pin wins.
+    let up = Upstream::spawn(move |_| {
+        (
+            200,
+            "OK".into(),
+            r#"{"done":true,"message":{"role":"assistant","content":"ok"}}"#.into(),
+        )
+    });
+    let (addr, pool) = spawn_server(
+        pool_with(&[("omk-busykey01", 1), ("omk-busykey02", 1)]),
+        &up.url,
+    );
+
+    // Warm the pin onto whichever key serves first.
+    let (s1, _, h1) = post_with_headers(&addr, "/api/chat", CONVO_A);
+    assert_eq!(s1, 200);
+    let pinned_suffix = header_value(&h1, "x-ollamux-key").unwrap();
+    let pinned_idx = if pinned_suffix == suffix_of_auth("omk-busykey01") {
+        0
+    } else {
+        1
+    };
+    let other_idx = 1 - pinned_idx;
+
+    // Occupy the pinned key's only slot at the pool level. The worker
+    // thread frees its permit shortly after the response bytes reach us,
+    // so poll briefly rather than assuming it is already free.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let _hold = loop {
+        if let Some(permit) = pool.try_acquire(pinned_idx) {
+            break permit;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "pinned key slot never freed (permit leak?)"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let (s2, _, h2) = post_with_headers(&addr, "/api/chat", CONVO_A_TURN2);
+    assert_eq!(s2, 200);
+    let served = header_value(&h2, "x-ollamux-key").unwrap();
+    assert_eq!(
+        served,
+        suffix_of_auth(if other_idx == 0 {
+            "omk-busykey01"
+        } else {
+            "omk-busykey02"
+        }),
+        "busy pinned key must fall through, not wait: got {served}, pin was {pinned_suffix}"
+    );
+    assert_eq!(
+        header_value(&h2, "x-ollamux-affinity").unwrap(),
+        "miss",
+        "pinned key had no free slot: not a usable pin, not a hit"
+    );
+    drop(_hold);
+
+    // Both slots free again: the pin (now on other_idx) is used directly.
+    let (s3, _, h3) = post_with_headers(&addr, "/api/chat", CONVO_A_TURN2);
+    assert_eq!(s3, 200);
+    assert_eq!(
+        header_value(&h3, "x-ollamux-key").unwrap(),
+        served,
+        "re-pinned identity must win over rr once its key is free"
+    );
+    assert_eq!(header_value(&h3, "x-ollamux-affinity").unwrap(), "hit");
+}
+
+#[test]
+fn no_affinity_disables_pinning() {
+    let up = Upstream::spawn(move |_| {
+        (
+            200,
+            "OK".into(),
+            r#"{"done":true,"message":{"role":"assistant","content":"ok"}}"#.into(),
+        )
+    });
+    let (addr, pool) = spawn_server(
+        pool_with(&[("omk-offkey001", 4), ("omk-offkey002", 4)]),
+        &up.url,
+    );
+    pool.set_affinity_enabled(false);
+
+    // With affinity off, a saturated-key fallback must not stick: serve on
+    // key A, free everything, request again — plain admit() order rules,
+    // so the same conversation may land on either key (assert only that
+    // the header reports off and no pin overrides least-loaded).
+    let (s1, _, h1) = post_with_headers(&addr, "/api/chat", CONVO_A);
+    assert_eq!(s1, 200);
+    let aff1 = header_value(&h1, "x-ollamux-affinity").unwrap();
+    assert_eq!(aff1, "off", "disabled affinity must say off");
+
+    // Pin the map manually (as if it had been used before) and prove the
+    // disabled pool ignores it.
+    pool.pin(12345, 1);
+    let (s2, _, h2) = post_with_headers(&addr, "/api/chat", CONVO_A);
+    assert_eq!(s2, 200);
+    assert_eq!(
+        header_value(&h2, "x-ollamux-affinity").unwrap(),
+        "off",
+        "header must stay off when disabled"
+    );
+    let key2 = header_value(&h2, "x-ollamux-key").unwrap();
+    assert_eq!(
+        key2,
+        suffix_of_auth("omk-offkey001"),
+        "fresh two-key pool, plain admit: least-loaded/rr picks key 0 regardless of the pin"
+    );
+}
+
+#[test]
+fn affinity_header_surface_matrix() {
+    // Present (with key) on: buffered 200, streaming 200, relayed 4xx.
+    // Absent on: no-auth GET, /_keys, /_health, hintful 404.
+    let up = Upstream::spawn(move |path| match path {
+        p if p.starts_with("/api/chat") => (
+            400,
+            "Bad Request".into(),
+            r#"{"error":"bad"}"#.into(), // relayed verbatim (client's fault)
+        ),
+        _ => (200, "OK".into(), r#"{"models":[]}"#.into()),
+    });
+    let (addr, _pool) = spawn_server(
+        pool_with(&[("omk-surface001", 2), ("omk-surface002", 2)]),
+        &up.url,
+    );
+
+    // Buffered non-stream response: header present.
+    let body = r#"{"model":"m","messages":[{"role":"user","content":"x"}],"stream":false}"#;
+    let (_, _, h_ok) = post_with_headers(&addr, "/api/chat", body);
+    assert!(
+        header_value(&h_ok, "x-ollamux-affinity").is_some(),
+        "{h_ok:?}"
+    );
+    assert!(header_value(&h_ok, "x-ollamux-key").is_some());
+
+    // Streaming response: header present in the chunked head. Same
+    // technique as streaming_passes_through_chunked: read only up to the
+    // blank line — the keep-alive connection never EOFs.
+    let stream_body = r#"{"model":"m","messages":[{"role":"user","content":"x"}],"stream":true}"#;
+    let mut req = std::net::TcpStream::connect(addr.trim_start_matches("http://")).unwrap();
+    let http_body = format!(
+        "POST /api/chat HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{stream_body}",
+        stream_body.len()
+    );
+    std::io::Write::write_all(&mut req, http_body.as_bytes()).unwrap();
+    let mut raw = String::new();
+    // Read the head plus the first chunk; stop at the first blank line
+    // (end of headers). Bound the read so a framing bug cannot hang CI.
+    req.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut byte = [0u8; 1];
+    loop {
+        match std::io::Read::read(&mut req, &mut byte) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                raw.push(byte[0] as char);
+                if raw.contains("\r\n\r\n") {
+                    break;
+                }
+            }
+        }
+    }
+    let head_lower = raw.to_lowercase();
+    assert!(
+        head_lower.contains("x-ollamux-affinity:"),
+        "streaming head must carry the affinity header: {raw}"
+    );
+    assert!(head_lower.contains("x-ollamux-key:"), "{raw}");
+    drop(req);
+
+    // Relayed 4xx: header present (a key served it).
+    let (_, _, h_400) = post_with_headers(&addr, "/api/chat", body);
+    assert!(header_value(&h_400, "x-ollamux-affinity").is_some());
+    assert!(header_value(&h_400, "x-ollamux-key").is_some());
+
+    // Exhausted failover (502): no key *served* — all attempts failed
+    // before any response — so both headers are absent (documented:
+    // "admission rejects, exhausted failover — omit the header").
+    // Unreachable upstream → every attempt is retryable until the
+    // budget runs out.
+    let (addr_502, _pool_502) = spawn_server(
+        pool_with(&[("omk-surface003", 2), ("omk-surface004", 2)]),
+        "http://127.0.0.1:1", // nothing listens there
+    );
+    let (status_502, _, h_502) = post_with_headers(&addr_502, "/api/chat", body);
+    assert_eq!(status_502, 502, "{h_502:?}");
+    assert!(
+        header_value(&h_502, "x-ollamux-affinity").is_none(),
+        "exhausted-failover 502 must omit the affinity header: {h_502:?}"
+    );
+    assert!(
+        header_value(&h_502, "x-ollamux-key").is_none(),
+        "exhausted-failover 502 must omit the key header: {h_502:?}"
+    );
+
+    // No-auth: no key, no affinity header.
+    let (_, _, h_tags) = get(&addr, "/api/tags");
+    assert!(
+        header_value(&h_tags, "x-ollamux-affinity").is_none(),
+        "{h_tags:?}"
+    );
+    assert!(header_value(&h_tags, "x-ollamux-key").is_none());
+
+    // Local endpoints: never.
+    for path in ["/_keys", "/_health", "/nonsense"] {
+        let (_, _, h) = get(&addr, path);
+        assert!(
+            header_value(&h, "x-ollamux-affinity").is_none(),
+            "{path} must not carry the affinity header: {h:?}"
+        );
+    }
+}
+
 #[cfg(feature = "net")]
 #[test]
 fn net_failover_money_test() {
     // One-key pool; bogus key: upstream 401 marks the key dead, retry
     // exhausts, proxy answers the all-dead 403 in the surface's shape.
-    let addr = spawn_server(pool_with(&[("omk-money0004", 1)]), "https://ollama.com");
+    let (addr, _pool) = spawn_server(pool_with(&[("omk-money0004", 1)]), "https://ollama.com");
     let (status, body) = post(&addr, "/api/chat", r#"{"model":"x"}"#);
     assert_eq!(status, 403, "body: {body}");
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
