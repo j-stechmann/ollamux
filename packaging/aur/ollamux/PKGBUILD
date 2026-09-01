@@ -14,9 +14,9 @@ conflicts=(ollamux-bin)
 source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz"
         "ollamux.service::$url/raw/v$pkgver/packaging/ollamux.service"
         "ollamux.1::$url/raw/v$pkgver/packaging/ollamux.1")
-sha256sums=('6dc47d66a824ba82f7a010a1b235b394f397682959486c2e731c4ff8f0e9362c'
+sha256sums=('2e390455dd9c5aa02b4d60e66e66682e1758ce8092da3787ec18d0187ce3232c'
             'a88b8011353909db0dfd5947689d840fad5e397a4cbdf4b805257b66a49dadc8'
-            'ff38a4c7024b58435ee69cdfd6314cd95e65db6246580003cf80a54ad17693ed')
+            '883b89299661921a301fc543d5b454ad807fb98c520ca8767305af0eb1675700')
 options=(!lto)
 
 prepare() {
