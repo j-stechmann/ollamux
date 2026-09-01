@@ -1097,6 +1097,26 @@ fn affinity_header_surface_matrix() {
     assert!(header_value(&h_400, "x-ollamux-affinity").is_some());
     assert!(header_value(&h_400, "x-ollamux-key").is_some());
 
+    // Exhausted failover (502): no key *served* — all attempts failed
+    // before any response — so both headers are absent (documented:
+    // "admission rejects, exhausted failover — omit the header").
+    // Unreachable upstream → every attempt is retryable until the
+    // budget runs out.
+    let (addr_502, _pool_502) = spawn_server(
+        pool_with(&[("omk-surface003", 2), ("omk-surface004", 2)]),
+        "http://127.0.0.1:1", // nothing listens there
+    );
+    let (status_502, _, h_502) = post_with_headers(&addr_502, "/api/chat", body);
+    assert_eq!(status_502, 502, "{h_502:?}");
+    assert!(
+        header_value(&h_502, "x-ollamux-affinity").is_none(),
+        "exhausted-failover 502 must omit the affinity header: {h_502:?}"
+    );
+    assert!(
+        header_value(&h_502, "x-ollamux-key").is_none(),
+        "exhausted-failover 502 must omit the key header: {h_502:?}"
+    );
+
     // No-auth: no key, no affinity header.
     let (_, _, h_tags) = get(&addr, "/api/tags");
     assert!(
