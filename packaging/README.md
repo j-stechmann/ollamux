@@ -69,10 +69,21 @@ recent.
 
 ## Releasing
 
-```sh
-git tag -a v0.1.0 -m "ollamux 0.1.0"
-git push origin v0.1.0
-```
+Git flow: `develop` is the integration branch, `master` carries release
+tags; both are PR-only (protected, CI-gated). A release is a version
+bump + tag:
+
+1. Version bump on a `release/vX.Y.Z` branch: `Cargo.toml` (and
+   `Cargo.lock`), `debian/changelog`, `packaging/rpm/ollamux.spec`
+   (Version + `%changelog`), both AUR `PKGBUILD`s *and* their generated
+   `.SRCINFO`, the man page header, and `CHANGELOG.md` (`Unreleased` →
+   `X.Y.Z` + compare links). PR into `develop`, wait for CI, merge.
+2. PR `develop` into `master`, wait for CI, merge.
+3. Tag `master` and push the tag — the release pipeline takes over:
+   ```sh
+   git tag -a vX.Y.Z -m "ollamux X.Y.Z"
+   git push origin vX.Y.Z
+   ```
 
 Everything else is automated; publishing channels run *if and only if*
 their secret exists (see above). Watch the Actions run; the first

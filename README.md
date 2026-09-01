@@ -199,6 +199,17 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
+### Branching model (git flow)
+
+- `develop` is the integration branch, `master` holds release tags.
+  Both are protected: changes land via PR only, gated on the `check`
+  and `packaging-lint` CI checks (enforced for admins too).
+- Feature branches (`feat/...`, `fix/...`, `release/vX.Y.Z`) PR into
+  `develop`.
+- Releases PR `develop` into `master` and tag `vX.Y.Z` on `master`;
+  the tag push triggers the release pipeline
+  ([packaging/README.md](packaging/README.md) has the full checklist).
+
 ## Reliability notes
 
 - Invalid/concurrency counts in the keys file are startup errors, not
