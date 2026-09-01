@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-01
+
 ### Added
 
 - Prompt-cache affinity, on by default: conversation identity (model +
@@ -105,7 +107,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Audit findings: SIGINT masking during shutdown, no-auth request
   paths, request body truncation, and health reset semantics.
 
-[Unreleased]: https://github.com/j-stechmann/ollamux/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/j-stechmann/ollamux/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/j-stechmann/ollamux/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/j-stechmann/ollamux/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/j-stechmann/ollamux/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/j-stechmann/ollamux/compare/v0.1.0...v0.2.0
