@@ -5,8 +5,11 @@
 //!   `Mutex<u32>` slots; the round-robin tie-breaker is an atomic.
 //! - Waiting happens only on a key's own condvar against its own slot
 //!   mutex — never across objects, so no lost wakeups or inversion.
+//! - Usage-derived state (quota-aware routing) is likewise lock-free:
+//!   one `AtomicUsize` threshold and an `AtomicU64` over-quota bitmask,
+//!   both written by the usage tracker and read on the request hot path.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -18,6 +21,8 @@ pub const COOLDOWN_429: Duration = Duration::from_secs(60);
 pub const COOLDOWN_DEAD: Duration = Duration::from_secs(300);
 /// Failures (5xx / network / non-auth 403) before a key is cooled down.
 pub const STRIKES_TO_COOL: u32 = 3;
+/// Atomic encoding for "quota-aware routing disabled".
+const THRESHOLD_DISABLED: usize = 0;
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     // A panic elsewhere must not wedge the proxy forever (review #12a).
@@ -102,6 +107,15 @@ pub struct Pool {
     /// Round-robin tie-breaker: last successful key.
     rr: AtomicUsize,
     verbose: bool,
+    /// Quota-aware routing threshold, in tenths of a percent (e.g. 800 =
+    /// 80%). 0 = disabled. Written once at startup (Relaxed is enough).
+    usage_threshold_x10: AtomicUsize,
+    /// Bit i set = key i's latest known session usage is at/over the
+    /// threshold. Only 64 bits exist, so keys at/over index 64 are never
+    /// demoted rather than aliased onto another key's bit. A 0 value
+    /// must never exclude keys from `candidates()` (data absent = no
+    /// demotion), so it doubles as "no usage known".
+    over_quota_mask: AtomicU64,
 }
 
 /// RAII permit: one of the key's concurrency slots. Held from dispatch
@@ -153,6 +167,35 @@ pub struct KeyInfo {
     pub successes: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    /// Latest known usage (rendered only when a usage snapshot exists).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<UsageBrief>,
+}
+
+/// Usage figures embedded in `/_keys`. Raw fractions are primary (the
+/// upstream's own unit); percents are one-decimal mirrors for humans,
+/// clamped to [0, 100] the same way /_usage renders them. A window the
+/// snapshot does not carry stays absent (field omitted) — it is never
+/// fabricated from the other window.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct UsageBrief {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub weekly: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_pct: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub weekly_pct: Option<f64>,
+    /// True when the key's session usage is at/over the configured
+    /// quota-aware threshold (always false when routing is not enabled).
+    pub over_quota: bool,
+}
+
+/// One-decimal percent mirror of a fraction, clamped to [0, 100] —
+/// identical to usage::pct so /_keys and /_usage can never disagree.
+fn pct(f: f64) -> f64 {
+    (f.clamp(0.0, 1.0) * 1000.0).round() / 10.0
 }
 
 impl Pool {
@@ -170,10 +213,17 @@ impl Pool {
             states,
             rr: AtomicUsize::new(0),
             verbose,
+            usage_threshold_x10: AtomicUsize::new(THRESHOLD_DISABLED),
+            over_quota_mask: AtomicU64::new(0),
         }
     }
 
     pub fn len(&self) -> usize {
+        self.states.len()
+    }
+
+    /// Alias kept for readability at call sites that mean "key count".
+    pub fn total_keys(&self) -> usize {
         self.states.len()
     }
 
@@ -202,6 +252,73 @@ impl Pool {
 
     pub fn state_of(&self, key: usize) -> State {
         self.states[key].state()
+    }
+
+    // ----- usage (quota-aware routing) -----
+
+    /// Enable quota-aware routing with a threshold in whole percent
+    /// (e.g. 80). Called at startup; 0 disables.
+    pub fn set_usage_threshold(&self, pct: u32) {
+        self.usage_threshold_x10
+            .store(pct as usize * 10, Ordering::Relaxed);
+    }
+
+    /// Threshold in tenths of a percent (0 = disabled).
+    #[cfg(test)]
+    fn usage_threshold_x10(&self) -> usize {
+        self.usage_threshold_x10.load(Ordering::Relaxed)
+    }
+
+    /// Receive a fresh usage snapshot from the tracker: rebuild the
+    /// over-quota bitmask atomically. Read-only with respect to key
+    /// health — usage never marks, cools, or settles keys.
+    pub fn publish_usage(&self, snap: &crate::usage::UsageSnapshot) {
+        let threshold = self.usage_threshold_x10.load(Ordering::Relaxed);
+        let mut mask = 0u64;
+        if threshold != THRESHOLD_DISABLED {
+            for k in &snap.keys {
+                // Keys beyond bit 63 cannot be represented in the mask;
+                // skip them (never demoted) instead of folding several
+                // keys onto one bit or shifting out of range.
+                if k.index >= u64::BITS as usize {
+                    continue;
+                }
+                if let Some(session) = k.session {
+                    // Threshold is in tenths of a percent; usage is a
+                    // 0.0–1.0 fraction (compare in tenths of a percent:
+                    // session * 1000 >= threshold).
+                    if (session * 1000.0).clamp(0.0, 1000.0) as usize >= threshold {
+                        mask |= 1u64 << k.index;
+                    }
+                }
+            }
+        }
+        self.over_quota_mask.store(mask, Ordering::Relaxed);
+    }
+
+    /// Latest usage rendering per key for `/_keys`: a pure in-memory read
+    /// of the optional snapshot — never triggers a fetch. Windows absent
+    /// from the snapshot stay absent (never substituted from the other
+    /// window, matching /_usage's honest rendering of partial data).
+    pub fn usage_briefs(&self, snap: &crate::usage::UsageSnapshot) -> Vec<Option<UsageBrief>> {
+        let threshold = self.usage_threshold_x10.load(Ordering::Relaxed);
+        snap.keys
+            .iter()
+            .map(|k| {
+                if k.session.is_none() && k.weekly.is_none() {
+                    return None;
+                }
+                Some(UsageBrief {
+                    session: k.session,
+                    weekly: k.weekly,
+                    session_pct: k.session.map(pct),
+                    weekly_pct: k.weekly.map(pct),
+                    over_quota: threshold != THRESHOLD_DISABLED
+                        && k.session
+                            .is_some_and(|s| (s * 1000.0).clamp(0.0, 1000.0) as usize >= threshold),
+                })
+            })
+            .collect()
     }
 
     /// True if at least one key is selectable right now.
@@ -328,7 +445,28 @@ impl Pool {
                     fails: h.fails,
                     successes: h.successes,
                     last_error: h.last_error.clone(),
+                    usage: None,
                 }
+            })
+            .collect()
+    }
+
+    /// `info()` with usage columns joined in from a snapshot (used by
+    /// `/_keys` when a usage snapshot exists). Joined by index rather
+    /// than zipped: a short snapshot (defensive only — keys are fixed at
+    /// startup) leaves the extra keys' usage absent instead of silently
+    /// truncating the /_keys output.
+    pub fn info_with_usage(
+        &self,
+        snap: &crate::usage::UsageSnapshot,
+    ) -> Vec<(KeyInfo, Option<UsageBrief>)> {
+        let briefs = self.usage_briefs(snap);
+        self.info()
+            .into_iter()
+            .enumerate()
+            .map(|(i, info)| {
+                let usage = briefs.get(i).cloned().flatten();
+                (info, usage)
             })
             .collect()
     }
@@ -337,17 +475,29 @@ impl Pool {
 
     /// Selectable keys right now (State::Up), least-loaded first; the
     /// round-robin counter rotates exact ties. Load = in_use/concurrency.
+    /// When quota-aware routing is enabled, keys whose latest known
+    /// session usage is at/over the threshold are demoted behind fresh
+    /// ones — demoted, never excluded: an over-quota key still serves if
+    /// no fresh key has a free slot, preserving the "never exclude" rule.
     pub fn candidates(&self) -> Vec<usize> {
         let n = self.states.len().max(1) as u64;
         let rr = self.rr.load(Ordering::Relaxed) as u64;
+        let demote_mask = self.over_quota_mask.load(Ordering::Relaxed);
         let mut cands: Vec<usize> = (0..self.states.len())
             .filter(|&i| self.states[i].state() == State::Up)
             .collect();
         cands.sort_by_key(|&i| {
             let ks = &self.states[i];
             let load_x1024 = (ks.in_use() as u64 * 1024) / ks.concurrency as u64;
+            // Mask bit only exists for indices < 64 (see publish_usage):
+            // higher keys are never demoted, never panics on debug shifts.
+            let over = if i < u64::BITS as usize {
+                (demote_mask >> i) & 1
+            } else {
+                0
+            };
             let ord = (i as u64 + rr) % n;
-            (load_x1024, ord)
+            (over, load_x1024, ord)
         });
         cands
     }
@@ -690,5 +840,166 @@ mod tests {
         );
         assert_eq!(lock(&p.states[0].health).strikes, 0);
         assert_eq!(lock(&p.states[0].health).successes, 0);
+    }
+
+    // ----- quota-aware routing -----
+
+    fn usage_snap(entries: &[(usize, Option<f64>)]) -> crate::usage::UsageSnapshot {
+        crate::usage::UsageSnapshot {
+            fetched_at: std::time::Instant::now(),
+            keys: entries
+                .iter()
+                .map(|&(i, session)| crate::usage::KeyUsage {
+                    index: i,
+                    suffix: format!("sfx{i}"),
+                    ok: session.is_some(),
+                    status: session.map(|_| 200),
+                    session,
+                    weekly: session,
+                    session_pct: session.map(|s| (s * 1000.0).round() / 10.0),
+                    weekly_pct: session.map(|s| (s * 1000.0).round() / 10.0),
+                    models: Vec::new(),
+                    cost: None,
+                    error: None,
+                })
+                .collect(),
+        }
+    }
+
+    fn two_key_pool() -> Pool {
+        Pool::new(
+            vec![("omk-quota-key1".into(), 4), ("omk-quota-key2".into(), 4)],
+            4,
+            false,
+        )
+    }
+
+    #[test]
+    fn usage_publish_is_health_read_only() {
+        let p = two_key_pool();
+        p.publish_usage(&usage_snap(&[(0, Some(0.99)), (1, Some(0.01))]));
+        // Usage alone must never mark/cooldown/settle anything.
+        assert_eq!(p.state_of(0), State::Up);
+        assert_eq!(p.state_of(1), State::Up);
+        assert_eq!(lock(&p.states[0].health).fails, 0);
+        assert_eq!(lock(&p.states[1].health).successes, 0);
+    }
+
+    #[test]
+    fn over_threshold_key_demotes_but_never_excluded() {
+        let p = two_key_pool();
+        p.set_usage_threshold(80);
+        assert_eq!(p.usage_threshold_x10(), 800);
+        // Key 0 fresh and idle must win over an over-quota key even if
+        // the over-quota key has had more success (rr tie-break).
+        p.publish_usage(&usage_snap(&[(0, Some(0.10)), (1, Some(0.95))]));
+        p.settle(1, true); // rr favors key 1
+        let cands = p.candidates();
+        assert_eq!(cands, vec![0, 1], "over-quota key sorts last");
+
+        // Only the over-quota key is selectable: it is demoted, never
+        // excluded (disabling the threshold restores plain ordering).
+        p.mark_cooldown(0, Duration::from_secs(60), "test");
+        let cands = p.candidates();
+        assert_eq!(cands, vec![1], "over-quota key still serves when alone");
+
+        // Data absent → mask empty → order unchanged.
+        p.publish_usage(&usage_snap(&[(0, None), (1, None)]));
+        p.mark_cooldown(0, Duration::ZERO, "expired");
+        let cands = p.candidates();
+        assert_eq!(cands.len(), 2, "absent data excludes nobody");
+        assert!(cands.contains(&0) && cands.contains(&1));
+    }
+
+    #[test]
+    fn threshold_disabled_ignores_usage_data() {
+        let p = two_key_pool();
+        // No set_usage_threshold call: publishing an all-over-quota
+        // snapshot must not change ordering at all.
+        p.publish_usage(&usage_snap(&[(0, Some(1.0)), (1, Some(1.0))]));
+        p.settle(1, true);
+        // Both keys load 0 → rr tie-break decides; no crash, no exclusion.
+        let cands = p.candidates();
+        assert_eq!(cands.len(), 2);
+        // And the mask itself stays empty.
+        assert_eq!(p.over_quota_mask.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn usage_briefs_render_and_over_quota_flag() {
+        let p = two_key_pool();
+        p.set_usage_threshold(80);
+        // Failure rows (ok=false, no numbers) render as None.
+        let snap = usage_snap(&[(0, None), (1, Some(0.812))]);
+        let briefs = p.usage_briefs(&snap);
+        assert!(briefs[0].is_none());
+        let b = briefs[1].as_ref().unwrap();
+        assert_eq!(b.session, Some(0.812));
+        assert_eq!(b.session_pct, Some(81.2));
+        assert!(b.over_quota, "81.2% >= 80% threshold");
+    }
+
+    #[test]
+    fn usage_briefs_never_fabricate_missing_windows() {
+        let p = two_key_pool();
+        // Session-only row: weekly must stay absent, not copy session.
+        // (usage_snap's helper mirrors weekly=session, so build the row
+        // by hand to model upstream drift honestly.)
+        let mut row = usage_snap(&[(0, None)]).keys.remove(0);
+        row.session = Some(0.4);
+        row.weekly = None;
+        row.ok = true;
+        let snap = crate::usage::UsageSnapshot {
+            fetched_at: std::time::Instant::now(),
+            keys: vec![row],
+        };
+        let briefs = p.usage_briefs(&snap);
+        let b = briefs[0].as_ref().unwrap();
+        assert_eq!(b.session, Some(0.4));
+        assert_eq!(b.weekly, None);
+        assert_eq!(b.weekly_pct, None);
+        // Weekly-only row: symmetric.
+        let mut row = usage_snap(&[(0, None)]).keys.remove(0);
+        row.weekly = Some(0.2);
+        row.ok = true;
+        let snap = crate::usage::UsageSnapshot {
+            fetched_at: std::time::Instant::now(),
+            keys: vec![row],
+        };
+        let briefs = p.usage_briefs(&snap);
+        let b = briefs[0].as_ref().unwrap();
+        assert_eq!(b.session, None);
+        assert_eq!(b.weekly, Some(0.2));
+        assert!(!b.over_quota, "session absent → never over quota");
+    }
+
+    #[test]
+    fn over_quota_mask_ignores_keys_beyond_64_bits() {
+        // Pool with 65 keys; the last one is over quota. Before the
+        // bounds check this folded bit 64 onto bit 0 (release) or
+        // panicked on the shift (debug).
+        let keys: Vec<(String, u32)> = (0..65).map(|i| (format!("omk-wide{i:04}"), 2)).collect();
+        let p = Pool::new(keys, 4, false);
+        p.set_usage_threshold(80);
+        let entries: Vec<(usize, Option<f64>)> = (0..65)
+            .map(|i| {
+                // Only key 64 is over threshold; bit 63 is the highest
+                // representable one and stays under threshold here.
+                if i == 64 {
+                    (i, Some(0.99))
+                } else {
+                    (i, Some(0.10))
+                }
+            })
+            .collect();
+        p.publish_usage(&usage_snap(&entries));
+        // No aliasing: only bits < 64 may be set, and key 0 must be
+        // untouched even though key 64 is over quota.
+        let mask = p.over_quota_mask.load(Ordering::Relaxed);
+        assert_eq!(mask, 0, "no over-quota key below 64 → empty mask");
+        // candidates() must not panic (debug >> overflow) for any index.
+        let cands = p.candidates();
+        assert_eq!(cands.len(), 65);
+        assert_eq!(cands[0], 0, "key 0 must not inherit key 64's demotion");
     }
 }

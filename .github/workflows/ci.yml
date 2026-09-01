@@ -20,7 +20,7 @@ jobs:
     name: check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -39,7 +39,7 @@ jobs:
         run: |
           pacman -Syu --noconfirm git
           # makepkg ships with pacman (already in the base-devel image)
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: PKGBUILD validity + .SRCINFO freshness
         run: |
           # container jobs run as root; makepkg refuses EUID 0 and needs

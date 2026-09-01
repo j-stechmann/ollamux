@@ -36,7 +36,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -56,7 +56,7 @@ jobs:
           cp README.md LICENSE "ollamux-$VER-${{ matrix.arch }}/"
           tar -czf "ollamux-$VER-${{ matrix.arch }}.tar.gz" "ollamux-$VER-${{ matrix.arch }}"
           sha256sum "ollamux-$VER-${{ matrix.arch }}.tar.gz" > "ollamux-$VER-${{ matrix.arch }}.tar.gz.sha256"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: binary-${{ matrix.arch }}
           path: |
@@ -70,10 +70,10 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - run: ./scripts/vendor-source.sh
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: source
           path: |
@@ -95,7 +95,7 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends build-essential cargo rustc pkg-config dpkg-dev
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: source
       - name: unpack + rustc sanity
@@ -133,7 +133,7 @@ jobs:
           } > "$D/control"
           dpkg-deb --build --root-owner-group "ollamux-$VER-deb" "ollamux_${VER}-1_amd64.deb"
           sha256sum "ollamux_${VER}-1_amd64.deb" > "ollamux_${VER}-1_amd64.deb.sha256"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: deb
           path: |
@@ -153,7 +153,7 @@ jobs:
         run: |
           dnf install -y --setopt=install_weak_deps=False \
             rpm-build cargo rust-packaging systemd-rpm-macros tar xz gzip git
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: source
       - name: assemble rpmbuild tree
@@ -177,7 +177,7 @@ jobs:
           rpmbuild -ba ~/rpmbuild/SPECS/ollamux.spec
           sha256sum ~/rpmbuild/RPMS/x86_64/*.rpm > rpm.sha256
           sha256sum ~/rpmbuild/SRPMS/*.src.rpm > srpm.sha256
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: rpm
           path: |
@@ -194,7 +194,7 @@ jobs:
     outputs:
       upload_url: ${{ steps.create.outputs.upload_url }}
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           merge-multiple: true
       # the rpm job runs in a container and uploads /github/home/rpmbuild/...;
@@ -207,7 +207,7 @@ jobs:
           ls -la *.rpm
       - name: create release
         id: create
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           generate_release_notes: true
           files: |
@@ -228,13 +228,13 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v5
-      - uses: docker/login-action@v3
+      - uses: actions/checkout@v7
+      - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@v7
         with:
           context: .
           file: ./Containerfile
@@ -273,7 +273,7 @@ jobs:
       - name: install tooling
         if: ${{ steps.secret.outputs.available == 'true' }}
         run: pacman -Syu --noconfirm git openssh pacman-contrib
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         if: ${{ steps.secret.outputs.available == 'true' }}
       - name: prepare non-root makepkg user
         if: ${{ steps.secret.outputs.available == 'true' }}
@@ -353,7 +353,7 @@ jobs:
     env:
       COPR_CONFIG: ${{ secrets.COPR_CONFIG }}
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: rpm
       - name: check for COPR config
@@ -398,7 +398,7 @@ jobs:
           else
             echo "available=true" >> "$GITHUB_OUTPUT"
           fi
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         if: ${{ steps.secret.outputs.available == 'true' }}
       - uses: dtolnay/rust-toolchain@stable
         if: ${{ steps.secret.outputs.available == 'true' }}
