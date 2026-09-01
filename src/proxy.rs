@@ -41,6 +41,24 @@ fn identity_header() -> tiny_http::Header {
     hv("X-Ollamux", &format!("ollamux/{}", crate::VERSION))
 }
 
+/// Prompt-cache affinity header (present iff a pool key served the request
+/// — the same gate as X-Ollamux-Key).
+const AFFINITY_HEADER: &str = "X-Ollamux-Affinity";
+
+/// Render the X-Ollamux-Affinity value. Emitted only when a pool key
+/// serves the request (the X-Ollamux-Key gate):
+/// - "off" — affinity disabled, or the body gave no identity (unparseable,
+///   non-affine path): nothing to consult.
+/// - "hit" — a pin existed for this identity and was usable at admission.
+/// - "miss" — no usable pin (first request of a conversation, evicted, or
+///   the pinned key could not serve so we fell through).
+fn affinity_header_value(hit: bool, enabled: bool, identity: Option<u64>) -> &'static str {
+    if !enabled || identity.is_none() {
+        return "off";
+    }
+    if hit { "hit" } else { "miss" }
+}
+
 /// No-auth upstream paths: single attempt; never rotate, never mark keys.
 /// Stored WITH a leading slash; route() passes trimmed paths, so matching
 /// normalizes both (an earlier build compared trimmed to untrimmed and the
@@ -133,29 +151,31 @@ impl Server {
             None => (full_url, None),
         };
 
-        let (status, retries, key) = self.route(req, &path, query.as_deref());
+        let (status, retries, key, aff) = self.route(req, &path, query.as_deref());
 
         if self.pool.verbose() {
             eprintln!(
-                "ollamux: #{id} {method} {path} -> {status}{}{} dur={}ms",
+                "ollamux: #{id} {method} {path} -> {status}{}{}{} dur={}ms",
                 if retries > 0 {
                     format!(" retries={retries}")
                 } else {
                     String::new()
                 },
                 key.map(|s| format!(" key={s}")).unwrap_or_default(),
+                aff.map(|a| format!(" aff={a}")).unwrap_or_default(),
                 started.elapsed().as_millis(),
             );
         }
     }
 
-    /// Returns (client-visible status, retries used, key suffix if proxied).
+    /// Returns (client-visible status, retries used, key suffix if proxied,
+    /// affinity verdict if a key was used).
     fn route(
         &self,
         req: tiny_http::Request,
         path: &str,
         query: Option<&str>,
-    ) -> (u16, usize, Option<String>) {
+    ) -> (u16, usize, Option<String>, Option<&'static str>) {
         let path = path.trim_start_matches('/');
         if path == "_keys" {
             // Pure in-memory read: /_keys must never trigger an upstream
@@ -181,7 +201,7 @@ impl Server {
                     .unwrap_or_else(|_| "[]".to_string()),
             };
             json_response(req, 200, &body, None);
-            return (200, 0, None);
+            return (200, 0, None, None);
         }
         if path == "_usage" {
             let force = query.is_some_and(|q| {
@@ -197,7 +217,7 @@ impl Server {
             };
             let body = usage_json(&snap, self.pool.total_keys());
             json_response(req, 200, &body, None);
-            return (200, 0, None);
+            return (200, 0, None, None);
         }
         if path == "_health" {
             let body = serde_json::json!({
@@ -208,7 +228,7 @@ impl Server {
                 "total_slots": self.pool.total_slots(),
             });
             json_response(req, 200, &body.to_string(), None);
-            return (200, 0, None);
+            return (200, 0, None, None);
         }
         if path.starts_with("api/") {
             return self.proxy(req, path, query, false);
@@ -223,7 +243,7 @@ impl Server {
             r#"{"error":"ollamux (key-rotating proxy for Ollama Cloud, https://ollama.com) serves only /api/*, /v1/*, /_keys, /_usage, /_health — this is not a local Ollama server and has no local models. If you meant a local Ollama, point your client at port 11434 instead; for Ollama Cloud, use /api/… or /v1/… here (models: GET /api/tags; per-key usage: GET /_usage)."}"#,
             None,
         );
-        (404, 0, None)
+        (404, 0, None, None)
     }
 
     // ----- proxy core -----
@@ -234,7 +254,7 @@ impl Server {
         sub_path: &str,
         query: Option<&str>,
         is_v1: bool,
-    ) -> (u16, usize, Option<String>) {
+    ) -> (u16, usize, Option<String>, Option<&'static str>) {
         let no_auth = is_no_auth_path(sub_path);
 
         // 1. Buffer the body (needed for replay across failover attempts).
@@ -257,10 +277,24 @@ impl Server {
                 };
                 let json = error_json(is_v1, &msg, status);
                 json_response(req, status, &json, None);
-                return (status, 0, None);
+                return (status, 0, None, None);
             }
         };
         let streaming = wants_stream(&body, is_v1);
+
+        // 2. Conversation identity for prompt-cache affinity. Parsed from
+        // the same buffered body; `None` = no affinity (non-affine path,
+        // unparseable body, missing model/prompt). Dropped immediately —
+        // a 16 MiB body must not linger as a serde_json tree.
+        let identity = {
+            let parsed: Option<serde_json::Value> = serde_json::from_slice(&body).ok();
+            crate::affinity::identity_from(parsed.as_ref(), sub_path)
+        };
+        // Whether a usable pin existed *before* this admission (for the
+        // X-Ollamux-Affinity header). Read pre-admission, so a pin written
+        // by an in-flight parallel request counts as a hit on the next one,
+        // not retroactively on this one.
+        let pinned_before = identity.is_some_and(|id| self.pool.pinned_key(id).is_some());
 
         // 2. Admission before dispatch. The permit is held across the whole
         // request and freed by RAII when this function returns.
@@ -270,6 +304,8 @@ impl Server {
         // upstream without credentials, and blocking them on dead-key pool
         // state would wrongly take down /api/tags even when ollama.com works.
         if no_auth {
+            // No-auth never pins: there is no key to pin to, and identity
+            // (if any body parsed) is meaningless without one.
             let cx = AttemptCx {
                 body: &body,
                 sub_path,
@@ -278,9 +314,11 @@ impl Server {
                 no_auth: true,
                 streaming,
                 retries: 0,
+                identity: None,
+                pinned_before: false,
             };
             return match self.attempt(&cx, &mut req) {
-                Attempt::Sent(status) => (status, 0, None),
+                Attempt::Sent(status) => (status, 0, None, None),
                 Attempt::Retryable(reason) => {
                     let json = error_json(
                         is_v1,
@@ -291,16 +329,16 @@ impl Server {
                         502,
                     );
                     json_response(req, 502, &json, None);
-                    (502, 0, None)
+                    (502, 0, None, None)
                 }
             };
         }
 
-        let (mut permit, mut key) = match self.pool.admit(WAIT_TIMEOUT) {
+        let (mut permit, mut key) = match self.pool.admit_affine(WAIT_TIMEOUT, identity) {
             Ok(a) => a,
             Err(rej) => {
                 send_reject(req, &rej, is_v1);
-                return (rej.status, 0, None);
+                return (rej.status, 0, None, None);
             }
         };
 
@@ -312,17 +350,44 @@ impl Server {
             no_auth,
             streaming,
             retries,
+            identity,
+            pinned_before,
         };
         loop {
             match self.attempt(&cx, &mut req) {
                 Attempt::Sent(status) => {
                     if let Some(k) = cx.key {
                         self.pool.settle(k, status < 400);
+                        // Pin on confirmed success only. Unlike settle's
+                        // `< 400` (which credits 3xx relays as key-health
+                        // successes), a 3xx means the API never processed
+                        // the prompt — nothing was cached upstream, so it
+                        // must not pin.
+                        if status < 300 {
+                            if let Some(id) = identity {
+                                self.pool.pin(id, k);
+                            }
+                        }
                     }
                     let sfx = cx.key.map(|k| self.pool.suffix_of(k));
-                    return (status, retries, sfx);
+                    let aff_s = if cx.key.is_some() {
+                        Some(affinity_header_value(
+                            pinned_before,
+                            self.pool.affinity_enabled(),
+                            identity,
+                        ))
+                    } else {
+                        None
+                    };
+                    return (status, retries, sfx, aff_s);
                 }
                 Attempt::Retryable(reason) => {
+                    // Unpin the failing key so the flapping key is not
+                    // deterministically re-selected for this conversation
+                    // until it cools (the next 2xx re-pins whoever serves).
+                    if let (Some(id), Some(k)) = (identity, cx.key) {
+                        self.pool.unpin(id, k);
+                    }
                     if retries + 1 >= MAX_ATTEMPTS || no_auth {
                         let msg = format!(
                             "ollamux exhausted all {} failover attempt(s) against {}; last error: {reason}. Per-key state: GET /_keys. The keys each cool down and recover automatically, so retrying later may succeed.",
@@ -331,10 +396,13 @@ impl Server {
                         );
                         let json = error_json(is_v1, &msg, 502);
                         json_response(req, 502, &json, None);
-                        return (502, retries, Some(self.pool.suffix_of(key)));
+                        return (502, retries, Some(self.pool.suffix_of(key)), None);
                     }
                     retries += 1;
                     // Rotate: release this key's slot, admit on another.
+                    // Plain admit (not admit_affine): the rotation must
+                    // pick the next-best key by health/load, not re-select
+                    // via the (just-unpinned) map.
                     drop(permit);
                     match self.pool.admit(WAIT_TIMEOUT) {
                         Ok((p, k)) => {
@@ -342,10 +410,15 @@ impl Server {
                             key = k;
                             cx.key = Some(k);
                             cx.retries = retries;
+                            // Re-pin to the rotation key at admission time
+                            // (same rationale as the initial admit).
+                            if let Some(id) = identity {
+                                self.pool.pin(id, k);
+                            }
                         }
                         Err(rej) => {
                             send_reject(req, &rej, is_v1);
-                            return (rej.status, retries, None);
+                            return (rej.status, retries, None, None);
                         }
                     }
                 }
@@ -365,6 +438,8 @@ impl Server {
             no_auth,
             streaming,
             retries,
+            identity,
+            pinned_before,
         } = cx;
         let url = match query {
             Some(q) if !q.is_empty() => format!("{}/{sub_path}?{q}", self.upstream),
@@ -395,10 +470,30 @@ impl Server {
         let status = resp.status();
         let headers = curated_response_headers(&resp);
         let reader = resp.into_reader();
+        let affinity =
+            affinity_header_value(*pinned_before, self.pool.affinity_enabled(), *identity);
         if *streaming {
-            self.stream_chunked(take(req), status, &headers, reader, *key, *retries)
+            Self::stream_chunked(AffOut {
+                req: take(req),
+                status,
+                headers: &headers,
+                reader: Box::new(reader),
+                key: *key,
+                retries: *retries,
+                affinity,
+                pool: &self.pool,
+            })
         } else {
-            self.respond_buffered(take(req), status, &headers, reader, *key, *retries)
+            Self::respond_buffered(AffOut {
+                req: take(req),
+                status,
+                headers: &headers,
+                reader: Box::new(reader),
+                key: *key,
+                retries: *retries,
+                affinity,
+                pool: &self.pool,
+            })
         }
     }
 
@@ -426,11 +521,16 @@ impl Server {
             key,
             retries,
             no_auth,
+            identity,
+            pinned_before,
             ..
         } = cx;
         let tries = *retries;
+        let affinity =
+            affinity_header_value(*pinned_before, self.pool.affinity_enabled(), *identity);
         if *no_auth {
-            // Nothing to learn about key health; relay verbatim.
+            // Nothing to learn about key health; relay verbatim. No key was
+            // used, so the affinity header is suppressed (see below).
             return Self::relay_error(
                 RelayCx {
                     pool: &self.pool,
@@ -440,6 +540,7 @@ impl Server {
                     prefix: snippet,
                     key: *key,
                     retries: tries,
+                    affinity: None,
                 },
                 reader,
             );
@@ -486,6 +587,7 @@ impl Server {
                         prefix: snippet,
                         key: Some(key),
                         retries: tries,
+                        affinity: Some(affinity),
                     },
                     reader,
                 )
@@ -505,6 +607,7 @@ impl Server {
             prefix,
             key,
             retries,
+            affinity,
         } = cx;
         let mut owned = prefix;
         owned.reserve(1024);
@@ -517,6 +620,9 @@ impl Server {
         }
         if let Some(k) = key {
             resp = resp.with_header(hv("X-Ollamux-Key", &pool.suffix_of(k)));
+            if let Some(a) = affinity {
+                resp = resp.with_header(hv(AFFINITY_HEADER, a));
+            }
         }
         resp = resp.with_header(hv("X-Ollamux-Retries", &retries.to_string()));
         resp = resp.with_header(identity_header());
@@ -527,33 +633,22 @@ impl Server {
     /// Non-streaming success relay via tiny_http: it sets framing
     /// (Content-Length/chunked) and handles HEAD and `Expect: 100-continue`
     /// correctly. The reader streams directly to the socket.
-    fn respond_buffered(
-        &self,
-        req: tiny_http::Request,
-        status: u16,
-        headers: &[(String, String)],
-        reader: impl Read + Send + 'static,
-        key: Option<usize>,
-        retries: usize,
-    ) -> Attempt {
-        let mut hs: Vec<tiny_http::Header> = headers
+    fn respond_buffered(cx: AffOut<'_>) -> Attempt {
+        let mut hs: Vec<tiny_http::Header> = cx
+            .headers
             .iter()
             .filter_map(|(n, v)| tiny_http::Header::from_bytes(n.as_bytes(), v.as_bytes()).ok())
             .collect();
-        if let Some(k) = key {
-            hs.push(hv("X-Ollamux-Key", &self.pool.suffix_of(k)));
+        if let Some(k) = cx.key {
+            hs.push(hv("X-Ollamux-Key", &cx.pool.suffix_of(k)));
+            hs.push(hv(AFFINITY_HEADER, cx.affinity));
         }
-        hs.push(hv("X-Ollamux-Retries", &retries.to_string()));
+        hs.push(hv("X-Ollamux-Retries", &cx.retries.to_string()));
         hs.push(identity_header());
-        let resp = tiny_http::Response::new(
-            tiny_http::StatusCode(status),
-            hs,
-            Box::new(reader),
-            None,
-            None,
-        );
-        match req.respond(resp) {
-            Ok(()) => Attempt::Sent(status),
+        let resp =
+            tiny_http::Response::new(tiny_http::StatusCode(cx.status), hs, cx.reader, None, None);
+        match cx.req.respond(resp) {
+            Ok(()) => Attempt::Sent(cx.status),
             Err(_) => Attempt::Sent(502),
         }
     }
@@ -562,17 +657,11 @@ impl Server {
     /// upstream read so SSE/NDJSON arrive token-incrementally. Write errors
     /// mean the client is gone: drop the upstream reader (permit frees via
     /// RAII; ureq discards its socket when dropped mid-body).
-    fn stream_chunked(
-        &self,
-        req: tiny_http::Request,
-        status: u16,
-        headers: &[(String, String)],
-        reader: impl Read,
-        key: Option<usize>,
-        retries: usize,
-    ) -> Attempt {
-        let http10 = req.http_version() < &tiny_http::HTTPVersion(1, 1);
-        let mut w = req.into_writer();
+    fn stream_chunked(cx: AffOut<'_>) -> Attempt {
+        let status = cx.status;
+        let retries = cx.retries;
+        let http10 = cx.req.http_version() < &tiny_http::HTTPVersion(1, 1);
+        let mut w = cx.req.into_writer();
         let mut head = format!("HTTP/1.1 {status} {}\r\n", reason_phrase(status));
         let ident = identity_header();
         head.push_str(&format!(
@@ -580,11 +669,12 @@ impl Server {
             ident.field.as_str(),
             ident.value.as_str()
         ));
-        if let Some(k) = key {
-            head.push_str(&format!("X-Ollamux-Key: {}\r\n", self.pool.suffix_of(k)));
+        if let Some(k) = cx.key {
+            head.push_str(&format!("X-Ollamux-Key: {}\r\n", cx.pool.suffix_of(k)));
+            head.push_str(&format!("{AFFINITY_HEADER}: {}\r\n", cx.affinity));
         }
         head.push_str(&format!("X-Ollamux-Retries: {retries}\r\n"));
-        for (n, v) in headers {
+        for (n, v) in cx.headers {
             if !n.eq_ignore_ascii_case("content-length") {
                 head.push_str(&format!("{n}: {v}\r\n"));
             }
@@ -599,7 +689,7 @@ impl Server {
         if w.write_all(head.as_bytes()).is_err() || w.flush().is_err() {
             return Attempt::Sent(500);
         }
-        let mut reader = reader.take(CHUNK as u64 * 1_000_000);
+        let mut reader = cx.reader.take(CHUNK as u64 * 1_000_000);
         let mut buf = vec![0u8; CHUNK];
         loop {
             match reader.read(&mut buf) {
@@ -626,7 +716,7 @@ impl Server {
                         let _ = w.write_all(b"0\r\n\r\n");
                         let _ = w.flush();
                     }
-                    if self.pool.verbose() {
+                    if cx.pool.verbose() {
                         eprintln!("ollamux: upstream died mid-stream: {e}");
                     }
                     return Attempt::Sent(502);
@@ -642,7 +732,8 @@ impl Server {
 }
 
 /// Per-attempt context, threaded through dispatch → classify. `key` is
-/// `None` for credential-less attempts (no-auth endpoints).
+/// `None` for credential-less attempts (no-auth endpoints). `identity` is
+/// request-scoped (constant across failover attempts) — only `key` rotates.
 struct AttemptCx<'a> {
     body: &'a [u8],
     sub_path: &'a str,
@@ -651,6 +742,9 @@ struct AttemptCx<'a> {
     no_auth: bool,
     streaming: bool,
     retries: usize,
+    identity: Option<u64>,
+    /// Whether a usable pin existed before admission (header "hit"/"miss").
+    pinned_before: bool,
 }
 
 /// Bundled args for `relay_error_impl` (keeps the clippy arg count sane).
@@ -662,6 +756,24 @@ struct RelayCx<'a> {
     prefix: Vec<u8>,
     key: Option<usize>,
     retries: usize,
+    /// Pre-rendered X-Ollamux-Affinity value; `None` suppresses the header
+    /// (no-auth / local endpoints).
+    affinity: Option<&'a str>,
+}
+
+/// Bundled args for the success relays (`respond_buffered` /
+/// `stream_chunked`); mirrors RelayCx's arg-count discipline.
+struct AffOut<'a> {
+    req: tiny_http::Request,
+    status: u16,
+    headers: &'a [(String, String)],
+    reader: Box<dyn std::io::Read>,
+    key: Option<usize>,
+    retries: usize,
+    affinity: &'a str,
+    /// Pool back-reference for suffix rendering (the relays are free
+    /// functions on the impl but must not take `&self` — see arg count).
+    pool: &'a Pool,
 }
 
 /// One upstream attempt's outcome.

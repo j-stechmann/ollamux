@@ -9,7 +9,8 @@
 //!   one `AtomicUsize` threshold and an `AtomicU64` over-quota bitmask,
 //!   both written by the usage tracker and read on the request hot path.
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use crate::affinity::AffinityMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -23,6 +24,10 @@ pub const COOLDOWN_DEAD: Duration = Duration::from_secs(300);
 pub const STRIKES_TO_COOL: u32 = 3;
 /// Atomic encoding for "quota-aware routing disabled".
 const THRESHOLD_DISABLED: usize = 0;
+/// Entries in the prompt-cache affinity pin map. Identities are u64
+/// conversation prefixes; a localhost single-user proxy will essentially
+/// never reach this, and eviction is harmless (one cache miss, self-heals).
+const AFFINITY_CAP: usize = 4096;
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     // A panic elsewhere must not wedge the proxy forever (review #12a).
@@ -116,6 +121,12 @@ pub struct Pool {
     /// must never exclude keys from `candidates()` (data absent = no
     /// demotion), so it doubles as "no usage known".
     over_quota_mask: AtomicU64,
+    /// Prompt-cache affinity (on by default; `--no-affinity` disables).
+    /// Write-once at startup like the usage threshold.
+    affinity_enabled: AtomicBool,
+    /// identity -> key that last admitted it (see affinity.rs). Consulted
+    /// by `admit_affine`; advisory only.
+    affinity: AffinityMap,
 }
 
 /// RAII permit: one of the key's concurrency slots. Held from dispatch
@@ -215,6 +226,8 @@ impl Pool {
             verbose,
             usage_threshold_x10: AtomicUsize::new(THRESHOLD_DISABLED),
             over_quota_mask: AtomicU64::new(0),
+            affinity_enabled: AtomicBool::new(true),
+            affinity: AffinityMap::new(AFFINITY_CAP),
         }
     }
 
@@ -324,6 +337,58 @@ impl Pool {
     /// True if at least one key is selectable right now.
     pub fn healthy_any(&self) -> bool {
         self.states.iter().any(|st| st.state() == State::Up)
+    }
+
+    /// Whether `key` is currently demoted by quota-aware routing. Mask-
+    /// derived (routing-time semantics, identical to `candidates()`), not
+    /// snapshot-derived: threshold disabled → never; index ≥ 64 → never
+    /// (no mask bit exists); otherwise the mask bit decides.
+    pub fn is_over_quota(&self, key: usize) -> bool {
+        if self.usage_threshold_x10.load(Ordering::Relaxed) == THRESHOLD_DISABLED {
+            return false;
+        }
+        if key >= u64::BITS as usize {
+            return false;
+        }
+        (self.over_quota_mask.load(Ordering::Relaxed) >> key) & 1 == 1
+    }
+
+    // ----- prompt-cache affinity -----
+
+    /// Disable prompt-cache affinity (`--no-affinity` / env). Write-once at
+    /// startup, mirroring `set_usage_threshold`.
+    pub fn set_affinity_enabled(&self, on: bool) {
+        self.affinity_enabled.store(on, Ordering::Relaxed);
+    }
+
+    pub fn affinity_enabled(&self) -> bool {
+        self.affinity_enabled.load(Ordering::Relaxed)
+    }
+
+    /// Pinned key for `id`, if affinity is on and the pin exists. The
+    /// returned key is *not* health-checked here — callers re-check state
+    /// under the pool's normal races (same as candidates()).
+    pub fn pinned_key(&self, id: u64) -> Option<usize> {
+        if !self.affinity_enabled() {
+            return None;
+        }
+        self.affinity.get(id)
+    }
+
+    /// Pin (or re-pin) an identity to a key. Called at admission time (so
+    /// parallel same-conversation requests share the pin even while the
+    /// first response streams) and again on confirmed 2xx success.
+    pub fn pin(&self, id: u64, key: usize) {
+        if self.affinity_enabled() {
+            self.affinity.put(id, key);
+        }
+    }
+
+    /// Unpin `id` iff it points at `key`: a retryable failure (429/401/5xx)
+    /// on the pinned key must not deterministically re-select the flapping
+    /// key for every subsequent same-conversation request until it cools.
+    pub fn unpin(&self, id: u64, key: usize) {
+        self.affinity.remove_if(id, key);
     }
 
     /// The secret for key `i`. Only used to build the Authorization header.
@@ -618,6 +683,41 @@ impl Pool {
                 retry_after_s: Some(1),
             }),
         }
+    }
+
+    /// Affinity-aware admission: try the pinned key first (only when it can
+    /// serve *right now* — Up, not over-quota, free slot), else fall through
+    /// to plain `admit()` unchanged. Deliberately no bounded wait on the
+    /// pinned key: while the pin frees up, another key may be fully idle,
+    /// and 2s+ of guaranteed added latency for a maybe-warm cache is the
+    /// wrong trade for an interactive proxy. A miss costs one cold prefix,
+    /// then the success re-pin heals it.
+    ///
+    /// On success the identity is pinned to the admitted key immediately
+    /// (not only after the upstream succeeds): streaming responses can hold
+    /// a slot for minutes, and a parallel same-conversation request must
+    /// share the pin, not miss it and split the upstream cache.
+    pub fn admit_affine(
+        &self,
+        timeout: Duration,
+        id: Option<u64>,
+    ) -> Result<(Permit<'_>, usize), Reject> {
+        if let Some(id) = id {
+            if let Some(key) = self.pinned_key(id) {
+                let usable = self.states[key].state() == State::Up && !self.is_over_quota(key);
+                if usable {
+                    if let Some(p) = self.try_acquire(key) {
+                        self.pin(id, key);
+                        return Ok((p, key));
+                    }
+                }
+            }
+        }
+        let (p, key) = self.admit(timeout)?;
+        if let Some(id) = id {
+            self.pin(id, key);
+        }
+        Ok((p, key))
     }
 }
 
@@ -1001,5 +1101,198 @@ mod tests {
         let cands = p.candidates();
         assert_eq!(cands.len(), 65);
         assert_eq!(cands[0], 0, "key 0 must not inherit key 64's demotion");
+    }
+
+    // ----- prompt-cache affinity -----
+
+    #[test]
+    fn affine_pin_hit_reuses_pinned_key() {
+        let p = pool(2, 2);
+        // First admission pins (rr favors key 0 on a fresh pool).
+        let (permit, key) = p.admit_affine(Duration::from_millis(50), Some(42)).unwrap();
+        drop(permit);
+        // Second admission with the same identity must land on the same
+        // key even though both keys are fresh (a plain admit would
+        // tie-break by load/rr, not by history).
+        let (_permit2, key2) = p.admit_affine(Duration::from_millis(50), Some(42)).unwrap();
+        assert_eq!(key, key2, "same identity must pin to the same key");
+        // A different identity is not pinned: fresh pool, rr now favors
+        // the other key after settle-less success (rr unchanged) — the
+        // load/rr ordering decides, not the map.
+        let (_p3, key3) = p.admit_affine(Duration::from_millis(50), Some(43)).unwrap();
+        assert_ne!(key3, key, "different identity must not inherit the pin");
+    }
+
+    #[test]
+    fn affine_falls_back_when_pinned_dead_or_cooling() {
+        let p = pool(2, 1);
+        let (_a, key) = p.admit_affine(Duration::from_millis(50), Some(7)).unwrap();
+        drop(_a);
+        p.mark_dead(key, "test 401");
+        // Pinned key is dead: must fall through to plain admit and pick
+        // the survivor.
+        let (_b, key2) = p.admit_affine(Duration::from_millis(50), Some(7)).unwrap();
+        assert_ne!(key2, key, "dead pinned key must not be selected");
+        // And the fallback re-pinned the identity to the survivor.
+        drop(_b);
+        let (_c, key3) = p.admit_affine(Duration::from_millis(50), Some(7)).unwrap();
+        assert_eq!(key2, key3, "fallback must re-pin to the serving key");
+
+        // Same shape with a cooldown (recoverable, not dead).
+        let p2 = pool(2, 1);
+        let (_d, k1) = p2.admit_affine(Duration::from_millis(50), Some(9)).unwrap();
+        drop(_d);
+        p2.mark_cooldown(k1, Duration::from_millis(500), "429");
+        let (_e, k2) = p2.admit_affine(Duration::from_millis(50), Some(9)).unwrap();
+        assert_ne!(k2, k1, "cooling pinned key must not be selected");
+    }
+
+    #[test]
+    fn affine_falls_back_when_pinned_at_capacity() {
+        let p = pool(2, 1);
+        let (_a, pinned) = p.admit_affine(Duration::from_millis(50), Some(5)).unwrap();
+        // Pinned key's only slot is held: same identity must not block on
+        // it — the other key's free slot wins immediately.
+        let (_b, other) = p.admit_affine(Duration::from_millis(50), Some(5)).unwrap();
+        assert_ne!(other, pinned, "full pinned key must fall through");
+        // Re-pin moved to the fallback key (admission-time pin).
+        drop(_b);
+        let (_c, again) = p.admit_affine(Duration::from_millis(50), Some(5)).unwrap();
+        assert_eq!(again, other, "fallback re-pins the identity");
+        drop(_c);
+        drop(_a);
+        // All free again: identity still points at the fallback key.
+        let (_d, after) = p.admit_affine(Duration::from_millis(50), Some(5)).unwrap();
+        assert_eq!(after, other, "re-pin survives while the pin is valid");
+    }
+
+    #[test]
+    fn affine_respects_over_quota_demotion() {
+        let p = two_key_pool();
+        p.set_usage_threshold(80);
+        p.publish_usage(&usage_snap(&[(0, Some(0.95)), (1, Some(0.10))]));
+        // Pin to the over-quota key 0.
+        p.pin(11, 0);
+        assert!(p.is_over_quota(0));
+        assert!(!p.is_over_quota(1));
+        // Over-quota pinned key must not win while a fresh key exists —
+        // affinity never overrides quota-aware demotion.
+        let (_a, key) = p.admit_affine(Duration::from_millis(50), Some(11)).unwrap();
+        assert_eq!(key, 1, "over-quota pin must fall through to fresh key");
+        // Demote-never-exclude: with key 1 gone, the over-quota pinned
+        // key still serves.
+        p.mark_dead(1, "test");
+        let (_b, key2) = p.admit_affine(Duration::from_millis(50), Some(11)).unwrap();
+        assert_eq!(key2, 0, "over-quota key still serves when alone");
+    }
+
+    #[test]
+    fn affine_threshold_disabled_never_blocks_pin() {
+        let p = two_key_pool();
+        // No set_usage_threshold: mask stays 0 even when usage is
+        // published; a pinned key must still be used.
+        p.publish_usage(&usage_snap(&[(0, Some(1.0)), (1, Some(0.0))]));
+        assert!(!p.is_over_quota(0), "disabled threshold → never over quota");
+        p.pin(3, 0);
+        let (_a, key) = p.admit_affine(Duration::from_millis(50), Some(3)).unwrap();
+        assert_eq!(key, 0, "pin must hold without quota-aware routing");
+    }
+
+    #[test]
+    fn is_over_quota_ignores_keys_beyond_64_bits() {
+        let keys: Vec<(String, u32)> = (0..65).map(|i| (format!("omk-aff{i:04}"), 2)).collect();
+        let p = Pool::new(keys, 4, false);
+        p.set_usage_threshold(80);
+        let entries: Vec<(usize, Option<f64>)> = (0..65)
+            .map(|i| (i, Some(if i == 64 { 0.99 } else { 0.10 })))
+            .collect();
+        p.publish_usage(&usage_snap(&entries));
+        assert!(
+            !p.is_over_quota(64),
+            "index 64 has no mask bit → never over quota"
+        );
+        assert!(!p.is_over_quota(0));
+        // And admission must not panic for a pinned high index.
+        p.pin(1, 64);
+        let (_a, _k) = p.admit_affine(Duration::from_millis(50), Some(1)).unwrap();
+    }
+
+    #[test]
+    fn affine_disabled_ignores_map() {
+        let p = pool(2, 2);
+        let (_a, _key) = p.admit_affine(Duration::from_millis(50), Some(21)).unwrap();
+        drop(_a);
+        p.set_affinity_enabled(false);
+        assert!(!p.affinity_enabled());
+        // Pin still in the map, but affinity off: with both keys fresh the
+        // rr tie-break repeats the same pick a plain admit() would make.
+        // To prove the pin is ignored, saturate the would-be pinned key:
+        // with affinity ON a same-identity request would block/fall to the
+        // other key only via the map; with it OFF, plain admit() must
+        // prefer the free key instantly.
+        let p = pool(2, 1);
+        let (_a, _key) = p.admit_affine(Duration::from_millis(50), Some(21)).unwrap();
+        p.set_affinity_enabled(false);
+        drop(_a);
+        // Direct proof: pin an identity to key 1 while key 0 is the
+        // natural (rr/least-loaded) pick, then disable affinity — the
+        // natural pick must win.
+        let p2 = two_key_pool();
+        p2.pin(99, 1);
+        p2.set_affinity_enabled(false);
+        let (_c, natural) = p2
+            .admit_affine(Duration::from_millis(50), Some(99))
+            .unwrap();
+        assert_eq!(natural, 0, "disabled affinity: plain admit order wins");
+    }
+
+    #[test]
+    fn affine_concurrent_same_identity_respects_slots() {
+        let p = std::sync::Arc::new(pool(2, 1));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let p = std::sync::Arc::clone(&p);
+                std::thread::spawn(move || {
+                    let (permit, _key) = p
+                        .admit_affine(Duration::from_millis(500), Some(77))
+                        .unwrap_or_else(|e| panic!("admit failed: {e:?}"));
+                    std::thread::sleep(Duration::from_millis(10));
+                    drop(permit);
+                    true
+                })
+            })
+            .collect();
+        let mut total = 0;
+        for h in handles {
+            h.join().unwrap();
+            total += 1;
+        }
+        assert_eq!(total, 8);
+        assert_eq!(p.states[0].in_use() + p.states[1].in_use(), 0);
+        // Map has exactly the one identity, pointing at one of the keys.
+        assert_eq!(p.affinity.len(), 1);
+    }
+
+    #[test]
+    fn unpin_only_affects_current_pin() {
+        let p = pool(2, 1);
+        p.pin(1, 0);
+        p.unpin(1, 0);
+        assert_eq!(p.pinned_key(1), None);
+        // Re-pin; unpinning with the wrong key must not drop it.
+        p.pin(1, 1);
+        p.unpin(1, 0);
+        assert_eq!(p.pinned_key(1), Some(1));
+    }
+
+    #[test]
+    fn affine_pin_survives_unrelated_identity_churn() {
+        let p = pool(1, 1);
+        for i in 0..50 {
+            p.pin(i, 0);
+        }
+        assert!(p.pinned_key(49).is_some());
+        assert!(p.pinned_key(0).is_some(), "well under cap: nothing evicted");
+        assert_eq!(p.affinity.len(), 50);
     }
 }

@@ -140,6 +140,28 @@ takes requests when no fresh key has a free slot. Failed usage fetches
 keep the previous snapshot; with the feature off, routing behaves exactly
 as before.
 
+## Prompt-cache affinity (on by default)
+
+Ollama Cloud caches prompt prefixes server-side, per account (i.e. per
+API key). ollamux's normal least-loaded routing would send successive
+requests of one conversation to different keys and re-ingest the same
+prefix every turn. With affinity, ollamux computes a conversation
+identity from the request body (`model` + the leading system messages +
+first user message for chat; `model` + first 8 KiB of the prompt for
+`/api/generate` and `/v1/completions`) and pins it to the key that last
+served it — as long as that key is healthy, has a free slot, and is not
+demoted by `--usage-aware`. When the pinned key cannot serve right now,
+the request is routed normally (no waiting on a busy key); a cache miss
+just means the next success re-pins.
+
+- Disable with `--no-affinity` or `OLLAMUX_NO_AFFINITY=1`.
+- Every proxied response carries `X-Ollamux-Affinity: hit|miss|off`
+  (`off` = disabled or the body gave no identity).
+- Helps append-only conversations (the common case: chat turns only
+  extend the messages array). Clients that rewrite the system prompt or
+  trim history mid-conversation simply get the old rotation behavior.
+- The pin map holds 4096 conversations (LRU-evicted, in-memory only).
+
 ## What failover means here
 
 - **429** (rate limit): the key cools down (60 s, or the server's
@@ -165,7 +187,9 @@ a mysterious upstream one — see `/_keys` for per-key state.
   shutdown notices, and upstream error snippets; fatal errors always print.
 - Response headers include `X-Ollamux` (ollamux/version — every response,
   including relayed upstream errors, is attributable), `X-Ollamux-Key`
-  (which key served it) and `X-Ollamux-Retries`.
+  (which key served it), `X-Ollamux-Retries` and `X-Ollamux-Affinity`
+  (prompt-cache affinity: `hit`/`miss`/`off`; present only when a key
+  served the request).
 - `SIGINT` (ctrl-c) drains in-flight requests for up to 5 s, then exits;
   press again to force-quit.
 - Request bodies are buffered up to 16 MiB (needed for replay across

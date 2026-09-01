@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Prompt-cache affinity, on by default: conversation identity (model +
+  leading system messages + first non-system message for chat; model +
+  first 8 KiB of the prompt for generate/completions) is pinned to the
+  API key that warmed ollama.com's server-side prompt cache — same-
+  conversation requests reuse one key instead of round-robining, for
+  faster first tokens. Best-effort: a busy/dead/cooling/over-quota
+  pinned key never blocks; the request routes normally and the next
+  success re-pins. New `X-Ollamux-Affinity: hit|miss|off` header on
+  key-served responses; `aff=` field in verbose logs. Disable via
+  `--no-affinity` or `OLLAMUX_NO_AFFINITY=1`.
+
 ## [0.4.0] - 2026-09-01
 
 ### Added

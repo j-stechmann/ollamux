@@ -21,6 +21,8 @@ struct Config {
     verbose: bool,
     /// Quota-aware routing threshold in percent (None = disabled).
     usage_aware: Option<u32>,
+    /// Prompt-cache affinity (default on; --no-affinity disables).
+    affinity: bool,
 }
 
 fn main() {
@@ -64,6 +66,8 @@ fn main() {
     if let Some(pct) = cfg.usage_aware {
         pool.set_usage_threshold(pct);
     }
+    // Prompt-cache affinity is on by default; --no-affinity / env disables.
+    pool.set_affinity_enabled(cfg.affinity);
     let proxy = Arc::new(ollamux::proxy::Server::new(pool.clone()));
 
     let addr = cfg.addr.clone();
@@ -173,6 +177,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Config>, Stri
         keys_path: None,
         verbose: false,
         usage_aware: None,
+        affinity: true,
     };
     let mut it = args.peekable();
     // Splits `--opt=value` into (`--opt`, Some(`value`)); plain `--opt`
@@ -218,6 +223,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Config>, Stri
                 cfg.keys_path = Some(std::path::PathBuf::from(value()?));
             }
             "-v" | "--verbose" => cfg.verbose = true,
+            "--no-affinity" => cfg.affinity = false,
             "--usage-aware" => {
                 // `--usage-aware=PCT`, `--usage-aware PCT`, or bare
                 // `--usage-aware` (default threshold). A following token
@@ -246,6 +252,14 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Config>, Stri
             }
         }
     }
+    if !cfg.affinity {
+        // --no-affinity wins over the env; env only reinforces the disable.
+        if std::env::var("OLLAMUX_NO_AFFINITY")
+            .is_ok_and(|v| !v.is_empty() && v != "0" && v != "false")
+        {
+            cfg.affinity = false;
+        }
+    }
     Ok(Some(cfg))
 }
 
@@ -258,7 +272,7 @@ fn print_help() {
         "ollamux {} — key-rotating proxy for the Ollama Cloud API
 
 USAGE:
-    ollamux [--addr HOST:PORT] [--keys PATH] [--usage-aware[=PCT]] [-v]
+    ollamux [--addr HOST:PORT] [--keys PATH] [--usage-aware[=PCT]] [--no-affinity] [-v]
 
 OPTIONS:
     -a, --addr <HOST:PORT>   Listen address [default: {DEFAULT_ADDR}]
@@ -268,6 +282,11 @@ OPTIONS:
                              usage is at/over PCT percent are served last
                              (never excluded). Default PCT: {DEFAULT_USAGE_AWARE}.
                              Also via OLLAMUX_USAGE_AWARE (flag wins).
+    --no-affinity            Disable prompt-cache affinity: by default
+                             requests with the same conversation prefix are
+                             pinned to the API key that warmed ollama.com's
+                             server-side prompt cache (faster first tokens).
+                             Also via OLLAMUX_NO_AFFINITY=1 (flag wins).
     -v, --verbose            Verbose stderr (startup banner, per-request log,
                              key cooldowns/deaths, upstream snippets)
     -h, --help               This help
@@ -284,6 +303,8 @@ KEYS:
 
 ENDPOINTS:
     /api/*, /v1/*   proxied to https://ollama.com with key rotation
+                    (prompt-cache affinity by default; X-Ollamux-Affinity
+                    response header: hit/miss/off)
     /_keys          per-key health JSON (embeds usage when known)
     /_usage         per-key Ollama Cloud usage JSON (?refresh=1 forces,
                     at most one fetch attempt per 5 s)
