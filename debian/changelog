@@ -1,3 +1,11 @@
+ollamux (0.4.0-1) unstable; urgency=medium
+
+  * New: usage introspection (/_usage) and quota-aware key routing
+    (--usage-aware[=PCT], default 80).
+  * /_keys now embeds per-key usage data.
+
+ -- Jonathan Stechmann <69059260+j-stechmann@users.noreply.github.com>  Tue, 01 Sep 2026 13:30:00 +0000
+
 ollamux (0.3.0-1) unstable; urgency=medium
 
   * Logging is now silent by default; -v enables banner, request log
