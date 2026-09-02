@@ -20,7 +20,7 @@ pub const COOLDOWN_429: Duration = Duration::from_secs(60);
 /// kept as a named constant for clarity in `/_keys` output.
 #[allow(dead_code)]
 pub const COOLDOWN_DEAD: Duration = Duration::from_secs(300);
-/// Failures (5xx / network / non-auth 403) before a key is cooled down.
+/// Consecutive upstream 5xx responses before a key is cooled down.
 pub const STRIKES_TO_COOL: u32 = 3;
 /// Atomic encoding for "quota-aware routing disabled".
 const THRESHOLD_DISABLED: usize = 0;
