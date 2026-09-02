@@ -10,6 +10,9 @@ openapi: 3.0.3
 info:
   title: ollamux
   version: 0.5.0
+  license:
+    name: GPL-2.0-or-later
+    url: https://github.com/j-stechmann/ollamux/blob/master/LICENSE
   description: |
     **ollamux** — an **Olla**ma **mu**ltiple**x**er: a key-rotating reverse
     proxy for the [Ollama Cloud API](https://ollama.com). It serves several
@@ -53,9 +56,9 @@ info:
 
     ### Response headers on proxied traffic
 
-    Every response carries `X-Ollamux: ollamux/<version>`. Responses served
-    by a pool key additionally carry `X-Ollamux-Key` (key suffix), and
-    `X-Ollamux-Retries` (failover attempts used). `X-Ollamux-Affinity`
+    Every response carries `X-Ollamux: ollamux/<version>`. Proxied traffic
+    carries `X-Ollamux-Retries` (failover attempts used); responses served
+    by a pool key additionally carry `X-Ollamux-Key` (key suffix). `X-Ollamux-Affinity`
     reports prompt-cache affinity: `hit` (a usable pin existed at admission),
     `miss` (no usable pin), or `off` (disabled / no conversation identity);
     proxy-generated failures where no key was selected omit the header.
@@ -276,7 +279,9 @@ paths:
             application/json:
               schema: {$ref: '#/components/schemas/ErrorEnvelope'}
         '502':
-          description: All failover attempts exhausted (see X-Ollamux-Retries).
+          description: >
+            All failover attempts exhausted. Proxy-generated response, so it
+            carries neither X-Ollamux-Retries nor X-Ollamux-Key.
           content:
             application/json:
               schema: {$ref: '#/components/schemas/ErrorEnvelope'}
@@ -681,13 +686,15 @@ components:
         ok: {type: boolean}
         status:
           type: integer
-          description: Upstream HTTP status for this key's fetch (200 on success).
+          description: >
+            Upstream HTTP status for this key's fetch (200 on success);
+            omitted when the fetch never got a response.
         session:
           type: number
-          description: Session usage fraction (0.0–1.0); null means unknown, never 0.
+          description: Session usage fraction (0.0–1.0); omitted means unknown, never 0.
         weekly:
           type: number
-          description: Weekly usage fraction (0.0–1.0).
+          description: Weekly usage fraction (0.0–1.0); omitted means unknown, never 0.
         session_pct: {type: number}
         weekly_pct: {type: number}
         models:

@@ -78,7 +78,8 @@ bump + tag:
    (Version + `%changelog`), both AUR `PKGBUILD`s *and* their generated
    `.SRCINFO`, the man page header, and `CHANGELOG.md` (`Unreleased` →
    `X.Y.Z` + compare links). Also bump `info.version` in `openapi.yaml`
-   (only that field — the spec is otherwise version-independent).
+   (the spec is otherwise version-independent — the `0.5.0` values inside
+   `example` fields are illustrative, not fixtures).
    PR into `develop`, wait for CI, merge.
 2. PR `develop` into `master`, wait for CI, merge.
 3. Tag `master` and push the tag — the release pipeline takes over:
