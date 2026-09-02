@@ -85,6 +85,11 @@ Everything else answers `404` with a hint — this is **not** a local Ollama
 server; it serves no models and `ollama list` against it shows the cloud
 model list, not local models.
 
+The full API surface is described in [`openapi.yaml`](openapi.yaml)
+(OpenAPI 3.0): the proxied Ollama/OpenAI paths, the `/_keys`, `/_usage`,
+`/_health` introspection endpoints, and ollamux's response headers and
+error envelope.
+
 ## Usage introspection
 
 Ollama Cloud meters usage per account (fraction of your plan's cap, not

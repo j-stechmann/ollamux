@@ -1,0 +1,896 @@
+# OpenAPI 3.0 specification for ollamux.
+#
+# ollamux is a key-rotating reverse proxy for the Ollama Cloud API
+# (https://ollama.com). Everything under /api/* and /v1/* is relayed
+# verbatim to https://ollama.com — request and response bodies are not
+# rewritten — so the schemas below document the *well-known* Ollama /
+# OpenAI-compatible shapes plus ollamux's own introspection endpoints
+# (/_keys, /_usage, /_health) and its proxy-generated error envelope.
+openapi: 3.0.3
+info:
+  title: ollamux
+  version: 0.5.0
+  description: |
+    **ollamux** — an **Olla**ma **mu**ltiple**x**er: a key-rotating reverse
+    proxy for the [Ollama Cloud API](https://ollama.com). It serves several
+    API keys combined behind one local endpoint: requests are spread across
+    keys (round-robin, least-loaded first), and when a key is rate-limited,
+    rejected, or invalid, the request silently retries on the next key
+    before anything reaches your client.
+
+    ### What is proxied
+
+    * `/api/*` — Ollama native API, relayed verbatim to `https://ollama.com`.
+    * `/v1/*` — OpenAI-compatible surface, relayed verbatim.
+    * Any other path answers `404` with a hint: this is **not** a local
+      Ollama server; it serves no local models.
+
+    Bodies are relayed byte-exact in both directions; query strings are
+    forwarded untouched. Request bodies are buffered (needed for replay
+    across failover) up to **16 MiB** — larger bodies get `413`.
+
+    ### Failover and key rotation
+
+    * `429` upstream: the key cools down (60 s, or the server's
+      `Retry-After`, capped at 5 min) and the request retries on the next key.
+    * `401`/`403 Unauthorized`: the key is marked dead until restart; the
+      request retries on the next key.
+    * `5xx` / network errors: retry on the next key; three consecutive
+      failures put a key in cooldown.
+    * Any other upstream status (e.g. `400`) is relayed verbatim — it is not
+      a key-health signal.
+    * Failover happens *before the first response byte*, so streaming
+      responses (NDJSON and SSE) are never corrupted mid-flight by a key
+      switch. At most **3** upstream attempts are made per request.
+
+    ### Authentication
+
+    ollamux itself performs **no client authentication** — it is a
+    localhost-trust tool. Your client's `Authorization` header is ignored:
+    the proxy substitutes its own pool key. Requests to `/api/tags`,
+    `/api/version`, and `/v1/models` are special-cased and never consume a
+    pool key (they are valid upstream without credentials).
+
+    ### Response headers on proxied traffic
+
+    Every response carries `X-Ollamux: ollamux/<version>`. Responses served
+    by a pool key additionally carry `X-Ollamux-Key` (key suffix), and
+    `X-Ollamux-Retries` (failover attempts used). `X-Ollamux-Affinity`
+    reports prompt-cache affinity: `hit` (a usable pin existed at admission),
+    `miss` (no usable pin), or `off` (disabled / no conversation identity);
+    proxy-generated failures where no key was selected omit the header.
+
+    ### Error envelope
+
+    Proxy-generated errors use the Ollama shape (`{"error": "..."}`) under
+    `/api/*` and the OpenAI shape (`{"error": {message, type, param, code}}`)
+    under `/v1/*` — see `ErrorEnvelope`.
+security: []
+servers:
+  - url: http://127.0.0.1:11435
+    description: >
+      Default listener (loopback only, deliberately not port 11434 so it can
+      run alongside a real local Ollama). Override at startup with --addr.
+tags:
+  - name: proxy (Ollama native)
+    description: >
+      Relay of the Ollama Cloud native API. All /api/* paths are proxied
+      verbatim; the ones listed here are the most-used surface.
+  - name: proxy (OpenAI-compatible)
+    description: >
+      Relay of the OpenAI-compatible /v1/* surface (chat/completions,
+      completions, models, …). All /v1/* paths are proxied verbatim.
+  - name: introspection
+    description: >
+      ollamux-local endpoints for per-key health, usage, and liveness. These
+      are answered in-memory and never touch the upstream (/_usage may fetch
+      ollama.com/api/usage, but /_keys never does).
+paths:
+  /_health:
+    get:
+      tags: [introspection]
+      summary: Liveness and pool shape
+      description: >
+        In-memory read. `ok` is true when at least one key is currently
+        selectable (Up). Never contacts the upstream.
+      operationId: getHealth
+      responses:
+        '200':
+          description: Pool summary.
+          headers:
+            X-Ollamux: {$ref: '#/components/headers/X-Ollamux'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Health'}
+  /_keys:
+    get:
+      tags: [introspection]
+      summary: Per-key pool state
+      description: >
+        Pure in-memory read: never triggers an upstream fetch (incident
+        readers rely on it being instant). When a usage snapshot exists
+        (from /_usage or --usage-aware), each row embeds the latest known
+        usage under `usage`; otherwise the field is absent. Secrets are
+        never exposed — only key suffixes.
+      operationId: getKeys
+      responses:
+        '200':
+          description: One row per configured key, in key-file order.
+          headers:
+            X-Ollamux: {$ref: '#/components/headers/X-Ollamux'}
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: '#/components/schemas/KeyInfo'}
+  /_usage:
+    get:
+      tags: [introspection]
+      summary: Per-key Ollama Cloud usage
+      description: >
+        Fans out to the undocumented `GET https://ollama.com/api/usage`
+        endpoint with every configured key in parallel and answers with one
+        row per key (suffixes only, never secrets). Usage is a *fraction of
+        the plan's cap* (0.0–1.0), not a token count; there are no reset
+        timestamps upstream (the session window rolls over roughly every
+        5 hours, the weekly one every 7 days).
+      operationId: getUsage
+      parameters:
+        - name: refresh
+          in: query
+          required: false
+          description: >
+            Any value other than `0` or `false` forces a refresh instead of
+            serving the cache. Forced refreshes are rate-limited to at most
+            one upstream fetch attempt per 5 s — a `refresh=1` inside that
+            window serves the cached snapshot. `stale` keeps reflecting the
+            60 s TTL, not this guard; the guard counts attempts, not
+            successes, so failed rounds back off instead of fanning out.
+          schema:
+            type: string
+            example: '1'
+      responses:
+        '200':
+          description: >
+            Envelope with freshness metadata plus one row per key. Failed
+            per-key fetches carry `error` instead of numbers; upstream error
+            bodies are never relayed (they could echo the key). A fetch that
+            fails entirely keeps the previous good snapshot.
+          headers:
+            X-Ollamux: {$ref: '#/components/headers/X-Ollamux'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/UsageEnvelope'}
+  /:
+    get:
+      tags: [introspection]
+      summary: Unknown-path hint (404)
+      description: >
+        Everything outside `/api/*`, `/v1/*`, `/_keys`, `/_usage` and
+        `/_health` answers 404 with a hintful JSON body — the top confusion
+        is expecting a local Ollama server. Shown here for `/`; any unknown
+        path behaves identically.
+      operationId: getRoot
+      responses:
+        '404':
+          description: Hintful not-found (see UnknownPathHint).
+          headers:
+            X-Ollamux: {$ref: '#/components/headers/X-Ollamux'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/UnknownPathHint'}
+
+  /api/tags:
+    get:
+      tags: [proxy (Ollama native)]
+      summary: List available models
+      description: >
+        Relayed to `https://ollama.com/api/tags`. Never consumes a pool key,
+        never rotates, never marks key health. `ollama list` against the
+        proxy shows the cloud model list, not local models.
+      operationId: listOllamaModels
+      responses:
+        '200':
+          description: Upstream model list, relayed verbatim.
+          headers:
+            X-Ollamux: {$ref: '#/components/headers/X-Ollamux'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/OllamaModelList'}
+        '502':
+          description: >
+            ollamux could not reach the upstream. No automatic retry applies
+            to this endpoint — repeat the request.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErrorEnvelope'}
+  /api/version:
+    get:
+      tags: [proxy (Ollama native)]
+      summary: Upstream version
+      description: >
+        Relayed to `https://ollama.com/api/version`. Never consumes a pool
+        key, never rotates, never marks key health. (This reports the
+        upstream version, not ollamux's — ollamux identifies itself via
+        `X-Ollamux`.)
+      operationId: getOllamaVersion
+      responses:
+        '200':
+          description: Upstream version, relayed verbatim.
+          headers:
+            X-Ollamux: {$ref: '#/components/headers/X-Ollamux'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/OllamaVersion'}
+        '502':
+          description: Upstream unreachable (no automatic retry).
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErrorEnvelope'}
+  /api/chat:
+    post:
+      tags: [proxy (Ollama native)]
+      summary: Chat completion (Ollama native)
+      description: >
+        Relayed to `https://ollama.com/api/chat` with key rotation,
+        per-key concurrency slots, and failover. Streams NDJSON by default
+        (`"stream": false` for a single JSON object). Conversation identity
+        is derived from `model` + leading system messages + first user
+        message for prompt-cache affinity; responses carry
+        `X-Ollamux-Affinity: hit|miss|off`.
+      operationId: ollamaChat
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/OllamaChatRequest'}
+      responses:
+        '200':
+          description: >
+            Upstream response, relayed verbatim. NDJSON chunks when
+            streaming, a single JSON object otherwise.
+          headers:
+            X-Ollamux: {$ref: '#/components/headers/X-Ollamux'}
+            X-Ollamux-Key: {$ref: '#/components/headers/X-Ollamux-Key'}
+            X-Ollamux-Retries: {$ref: '#/components/headers/X-Ollamux-Retries'}
+            X-Ollamux-Affinity: {$ref: '#/components/headers/X-Ollamux-Affinity'}
+          content:
+            application/x-ndjson:
+              schema: {$ref: '#/components/schemas/OllamaChatChunk'}
+            application/json:
+              schema: {$ref: '#/components/schemas/OllamaChatFinal'}
+        '413':
+          description: Request body exceeds the 16 MiB buffering cap.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErrorEnvelope'}
+        '429':
+          description: >
+            Overloaded locally (all keys at their concurrency limit / all
+            cooling down). Honors `Retry-After`.
+          headers:
+            Retry-After:
+              description: Seconds to wait before retrying.
+              schema: {type: integer, format: int64}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErrorEnvelope'}
+        '502':
+          description: All failover attempts exhausted (see X-Ollamux-Retries).
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErrorEnvelope'}
+  /api/generate:
+    post:
+      tags: [proxy (Ollama native)]
+      summary: Text generation (Ollama native)
+      description: >
+        Relayed to `https://ollama.com/api/generate` with key rotation and
+        failover. Streams NDJSON by default. Affinity identity is `model` +
+        first 8 KiB of `prompt`.
+      operationId: ollamaGenerate
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/OllamaGenerateRequest'}
+      responses:
+        '200':
+          description: Upstream response, relayed verbatim (NDJSON or single JSON).
+          headers:
+            X-Ollamux: {$ref: '#/components/headers/X-Ollamux'}
+            X-Ollamux-Key: {$ref: '#/components/headers/X-Ollamux-Key'}
+            X-Ollamux-Retries: {$ref: '#/components/headers/X-Ollamux-Retries'}
+            X-Ollamux-Affinity: {$ref: '#/components/headers/X-Ollamux-Affinity'}
+          content:
+            application/x-ndjson:
+              schema: {$ref: '#/components/schemas/OllamaGenerateChunk'}
+            application/json:
+              schema: {$ref: '#/components/schemas/OllamaGenerateFinal'}
+        '413':
+          description: Request body exceeds the 16 MiB buffering cap.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErrorEnvelope'}
+        '429':
+          description: Overloaded locally. Honors `Retry-After`.
+          headers:
+            Retry-After:
+              description: Seconds to wait before retrying.
+              schema: {type: integer, format: int64}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErrorEnvelope'}
+        '502':
+          description: All failover attempts exhausted.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErrorEnvelope'}
+  /api/{path}:
+    parameters:
+      - name: path
+        in: path
+        required: true
+        schema: {type: string, minLength: 1}
+        description: >
+          Any remaining Ollama API sub-path (e.g. `show`, `ps`, `embeddings`).
+          Relayed verbatim to `https://ollama.com/api/<path>` — no request
+          rewriting, models must exist on ollama.com.
+    get:
+      tags: [proxy (Ollama native)]
+      summary: Relay any GET under /api/
+      operationId: proxyOllamaGet
+      responses:
+        '2XX':
+          description: Upstream response, relayed verbatim.
+          headers:
+            X-Ollamux: {$ref: '#/components/headers/X-Ollamux'}
+        default:
+          description: >
+            Upstream status relayed verbatim (4xx other than
+            401/403-Unauthorized is the client's fault and passes through
+            untouched), or a proxy-generated 413/429/502 — see `ErrorEnvelope`.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErrorEnvelope'}
+    post:
+      tags: [proxy (Ollama native)]
+      summary: Relay any POST under /api/
+      operationId: proxyOllamaPost
+      requestBody:
+        content:
+          application/json:
+            schema: {type: object, additionalProperties: true}
+      responses:
+        '2XX':
+          description: Upstream response, relayed verbatim.
+          headers:
+            X-Ollamux: {$ref: '#/components/headers/X-Ollamux'}
+        default:
+          description: Upstream status or proxy-generated error (see above).
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErrorEnvelope'}
+
+  /v1/models:
+    get:
+      tags: [proxy (OpenAI-compatible)]
+      summary: List models (OpenAI-compatible)
+      description: >
+        Relayed to `https://ollama.com/v1/models`. Never consumes a pool
+        key, never rotates, never marks key health.
+      operationId: listOpenAIModels
+      responses:
+        '200':
+          description: Upstream model list, relayed verbatim.
+          headers:
+            X-Ollamux: {$ref: '#/components/headers/X-Ollamux'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/OpenAIModelList'}
+        '502':
+          description: Upstream unreachable (no automatic retry).
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErrorEnvelope'}
+  /v1/chat/completions:
+    post:
+      tags: [proxy (OpenAI-compatible)]
+      summary: Chat completion (OpenAI-compatible)
+      description: >
+        Relayed to `https://ollama.com/v1/chat/completions` with key
+        rotation and failover. Unlike the Ollama native API, the OpenAI
+        surface defaults to **non-streaming**; SSE only when
+        `"stream": true`. Affinity identity: `model` + leading system
+        messages + first user message.
+      operationId: openaiChatCompletions
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/OpenAIChatRequest'}
+      responses:
+        '200':
+          description: >
+            Upstream response, relayed verbatim: a single JSON object, or an
+            SSE stream of `data:` chunks when `"stream": true`.
+          headers:
+            X-Ollamux: {$ref: '#/components/headers/X-Ollamux'}
+            X-Ollamux-Key: {$ref: '#/components/headers/X-Ollamux-Key'}
+            X-Ollamux-Retries: {$ref: '#/components/headers/X-Ollamux-Retries'}
+            X-Ollamux-Affinity: {$ref: '#/components/headers/X-Ollamux-Affinity'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/OpenAIChatCompletion'}
+            text/event-stream:
+              schema: {type: string}
+        '413':
+          description: Request body exceeds the 16 MiB buffering cap.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErrorEnvelope'}
+        '429':
+          description: Overloaded locally. Honors `Retry-After`.
+          headers:
+            Retry-After:
+              description: Seconds to wait before retrying.
+              schema: {type: integer, format: int64}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErrorEnvelope'}
+        '502':
+          description: All failover attempts exhausted.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErrorEnvelope'}
+  /v1/completions:
+    post:
+      tags: [proxy (OpenAI-compatible)]
+      summary: Text completion (OpenAI-compatible)
+      description: >
+        Relayed to `https://ollama.com/v1/completions` with key rotation and
+        failover. Non-streaming by default; SSE when `"stream": true`.
+        Affinity identity: `model` + first 8 KiB of `prompt`.
+      operationId: openaiCompletions
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [model, prompt]
+              additionalProperties: true
+              properties:
+                model: {type: string}
+                prompt: {type: string}
+                stream: {type: boolean, default: false}
+      responses:
+        '200':
+          description: Upstream response, relayed verbatim.
+          headers:
+            X-Ollamux: {$ref: '#/components/headers/X-Ollamux'}
+            X-Ollamux-Key: {$ref: '#/components/headers/X-Ollamux-Key'}
+            X-Ollamux-Retries: {$ref: '#/components/headers/X-Ollamux-Retries'}
+            X-Ollamux-Affinity: {$ref: '#/components/headers/X-Ollamux-Affinity'}
+          content:
+            application/json:
+              schema: {type: object, additionalProperties: true}
+            text/event-stream:
+              schema: {type: string}
+        '413':
+          description: Request body exceeds the 16 MiB buffering cap.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErrorEnvelope'}
+        '429':
+          description: Overloaded locally. Honors `Retry-After`.
+          headers:
+            Retry-After:
+              description: Seconds to wait before retrying.
+              schema: {type: integer, format: int64}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErrorEnvelope'}
+        '502':
+          description: All failover attempts exhausted.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErrorEnvelope'}
+  /v1/{path}:
+    parameters:
+      - name: path
+        in: path
+        required: true
+        schema: {type: string, minLength: 1}
+        description: >
+          Any remaining OpenAI-compatible sub-path (e.g. `embeddings`).
+          Relayed verbatim to `https://ollama.com/v1/<path>`.
+    get:
+      tags: [proxy (OpenAI-compatible)]
+      summary: Relay any GET under /v1/
+      operationId: proxyOpenAIGet
+      responses:
+        '2XX':
+          description: Upstream response, relayed verbatim.
+          headers:
+            X-Ollamux: {$ref: '#/components/headers/X-Ollamux'}
+        default:
+          description: Upstream status or proxy-generated error.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErrorEnvelope'}
+    post:
+      tags: [proxy (OpenAI-compatible)]
+      summary: Relay any POST under /v1/
+      operationId: proxyOpenAIPost
+      requestBody:
+        content:
+          application/json:
+            schema: {type: object, additionalProperties: true}
+      responses:
+        '2XX':
+          description: Upstream response, relayed verbatim.
+          headers:
+            X-Ollamux: {$ref: '#/components/headers/X-Ollamux'}
+        default:
+          description: Upstream status or proxy-generated error.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErrorEnvelope'}
+
+components:
+  headers:
+    X-Ollamux:
+      description: >
+        Present on every response, including relayed upstream errors:
+        `ollamux/<version>` — lets a client tell ollamux apart from a real
+        Ollama server or a CDN error page.
+      schema: {type: string, example: 'ollamux/0.5.0'}
+    X-Ollamux-Key:
+      description: >
+        Suffix of the pool key that served the request. Present only when a
+        pool key served it (never on /_keys, /_usage, /_health, 404 hints,
+        or no-auth paths such as /api/tags).
+      schema: {type: string, example: '1234'}
+    X-Ollamux-Retries:
+      description: >
+        Number of failover attempts used before this response (0 = first
+        key succeeded). Present on proxied traffic only.
+      schema: {type: integer, minimum: 0}
+    X-Ollamux-Affinity:
+      description: >
+        Prompt-cache affinity verdict: `hit` (a pin existed and was usable —
+        healthy, under quota, free slot — at admission), `miss` (first
+        request of a conversation, evicted, or the pinned key fell through),
+        or `off` (affinity disabled or the body gave no identity). Present
+        only when a pool key served the request.
+      schema: {type: string, enum: [hit, miss, off]}
+  schemas:
+    # ----- introspection -----
+    Health:
+      type: object
+      required: [service, version, ok, keys, total_slots]
+      properties:
+        service: {type: string, enum: [ollamux]}
+        version: {type: string, example: '0.5.0'}
+        ok:
+          type: boolean
+          description: True when at least one key is selectable right now.
+        keys:
+          type: integer
+          description: Number of configured keys.
+        total_slots:
+          type: integer
+          description: Sum of per-key concurrency limits.
+    KeyState:
+      type: string
+      enum: [up, cooldown, dead]
+      description: >
+        `up` = selectable. `cooldown` = temporarily backed off (429 or
+        repeated failures); expires lazily. `dead` = upstream rejected the
+        key as invalid (401/403); stays dead until restart.
+    UsageBrief:
+      type: object
+      description: >
+        Latest known usage embedded in a /_keys row (absent when no usage
+        snapshot exists, or when the key row carried no numbers). Windows
+        absent from the snapshot stay absent — never fabricated from the
+        other window.
+      required: [over_quota]
+      properties:
+        session:
+          type: number
+          description: Session usage as a fraction of the plan cap (0.0–1.0).
+        weekly:
+          type: number
+          description: Weekly usage as a fraction of the plan cap (0.0–1.0).
+        session_pct: {type: number, description: One-decimal percent mirror of `session`.}
+        weekly_pct: {type: number, description: One-decimal percent mirror of `weekly`.}
+        over_quota:
+          type: boolean
+          description: >
+            True when session usage is at/over the --usage-aware threshold
+            (always false when quota-aware routing is disabled).
+    KeyInfo:
+      type: object
+      required:
+        - index
+        - suffix
+        - state
+        - concurrency
+        - in_use
+        - waiters
+        - strikes
+        - fails
+        - successes
+      properties:
+        index: {type: integer, description: Zero-based position in the keys file.}
+        suffix: {type: string, description: Last characters of the key — never the secret.}
+        state: {$ref: '#/components/schemas/KeyState'}
+        concurrency: {type: integer, description: 'Max in-flight requests for this key (KEY:N, default 3).'}
+        in_use: {type: integer, description: Slots currently held.}
+        waiters: {type: integer, description: Requests currently blocked waiting for a slot on this key.}
+        cooldown_left_s:
+          type: integer
+          description: Seconds until the cooldown expires (cooldown state only).
+        strikes:
+          type: integer
+          description: Consecutive failures; reset by any confirmed upstream success.
+        fails: {type: integer, description: Lifetime failed upstream attempts.}
+        successes: {type: integer, description: Lifetime confirmed upstream successes.}
+        last_error:
+          type: string
+          description: Most recent failure reason (absent before the first failure).
+        usage:
+          $ref: '#/components/schemas/UsageBrief'
+    ModelUsage:
+      type: object
+      required: [name, request_count]
+      properties:
+        name: {type: string}
+        request_count: {type: integer, format: int64}
+    UsageEnvelope:
+      type: object
+      required: [updated, age_s, stale, session_window, keys]
+      properties:
+        updated:
+          type: integer
+          format: int64
+          description: Unix seconds when the snapshot was fetched.
+        age_s:
+          type: integer
+          description: Age of the snapshot in seconds.
+        stale:
+          type: boolean
+          description: >
+            True when age_s >= 60 (the serve TTL): the snapshot is still
+            served, but a newer one exists or will be fetched on demand.
+        session_window:
+          type: string
+          description: Human hint; the upstream publishes no reset timestamps.
+        keys:
+          type: array
+          items: {$ref: '#/components/schemas/KeyUsage'}
+    KeyUsage:
+      type: object
+      required: [index, suffix, ok]
+      description: One per-key usage row. `ok:false` rows carry `error` only.
+      properties:
+        index: {type: integer}
+        suffix: {type: string}
+        ok: {type: boolean}
+        status:
+          type: integer
+          description: Upstream HTTP status for this key's fetch (200 on success).
+        session:
+          type: number
+          description: Session usage fraction (0.0–1.0); null means unknown, never 0.
+        weekly:
+          type: number
+          description: Weekly usage fraction (0.0–1.0).
+        session_pct: {type: number}
+        weekly_pct: {type: number}
+        models:
+          type: array
+          description: Top models of the session window (upstream may omit).
+          items: {$ref: '#/components/schemas/ModelUsage'}
+        cost:
+          type: string
+          description: Reported 4-week rolling cost, passed through verbatim.
+        error:
+          type: string
+          description: >
+            Per-key failure reason (e.g. `unauthorized`, `rate limited
+            (upstream 429)`, `endpoint changed (unexpected payload)`) —
+            generated by ollamux; upstream bodies are never relayed here.
+    UnknownPathHint:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+          description: >
+            Explanation that ollamux serves only /api/*, /v1/*, /_keys,
+            /_usage, /_health and is not a local Ollama server.
+
+    # ----- error envelope -----
+    ErrorEnvelope:
+      description: >
+        Proxy-generated errors use the Ollama shape under /api/* and the
+        OpenAI shape under /v1/*. Upstream 4xx errors (other than the
+        failover-triggering 401/403) are relayed byte-exact and may have
+        any shape.
+      oneOf:
+        - $ref: '#/components/schemas/OllamaError'
+        - $ref: '#/components/schemas/OpenAIError'
+    OllamaError:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+          description: Human-readable error; ollamux-generated messages mention ollamux explicitly.
+      example: {error: 'ollamux is overloaded: … Per-key state: GET /_keys'}
+    OpenAIError:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [message, type]
+          properties:
+            message: {type: string}
+            type: {type: string, enum: [ollamux_error]}
+            param:
+              type: string
+              nullable: true
+            code: {type: string, example: 'ollamux_429'}
+
+    # ----- Ollama native (loose schemas; bodies are relayed verbatim) -----
+    OllamaMessage:
+      type: object
+      required: [role, content]
+      additionalProperties: true
+      properties:
+        role: {type: string, enum: [system, user, assistant, tool]}
+        content: {type: string}
+        images:
+          type: array
+          items: {type: string}
+          description: Base64-encoded images.
+    OllamaChatRequest:
+      type: object
+      required: [model, messages]
+      additionalProperties: true
+      description: >
+        Ollama /api/chat request. All Ollama fields (options, tools,
+        format, keep_alive, think, …) pass through verbatim.
+      properties:
+        model: {type: string}
+        messages:
+          type: array
+          items: {$ref: '#/components/schemas/OllamaMessage'}
+        stream:
+          type: boolean
+          default: true
+          description: Ollama streams by default; false returns one JSON object.
+    OllamaChatChunk:
+      type: object
+      additionalProperties: true
+      description: One NDJSON streaming chunk (message delta + done:false).
+      properties:
+        model: {type: string}
+        created_at: {type: string}
+        message:
+          type: object
+          additionalProperties: true
+          properties:
+            role: {type: string}
+            content: {type: string}
+        done: {type: boolean, enum: [false]}
+    OllamaChatFinal:
+      type: object
+      additionalProperties: true
+      description: Final non-streamed object or last NDJSON chunk (done:true).
+      properties:
+        model: {type: string}
+        created_at: {type: string}
+        message:
+          type: object
+          additionalProperties: true
+        done: {type: boolean, enum: [true]}
+        done_reason: {type: string}
+        total_duration: {type: integer, format: int64}
+    OllamaGenerateRequest:
+      type: object
+      required: [model, prompt]
+      additionalProperties: true
+      properties:
+        model: {type: string}
+        prompt: {type: string}
+        stream: {type: boolean, default: true}
+    OllamaGenerateChunk:
+      type: object
+      additionalProperties: true
+      description: One NDJSON streaming chunk.
+      properties:
+        model: {type: string}
+        created_at: {type: string}
+        response: {type: string}
+        done: {type: boolean, enum: [false]}
+    OllamaGenerateFinal:
+      type: object
+      additionalProperties: true
+      description: Final generation object (done:true).
+      properties:
+        model: {type: string}
+        created_at: {type: string}
+        response: {type: string}
+        done: {type: boolean, enum: [true]}
+        total_duration: {type: integer, format: int64}
+    OllamaModelList:
+      type: object
+      additionalProperties: true
+      required: [models]
+      properties:
+        models:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+            properties:
+              name: {type: string}
+              model: {type: string}
+              size: {type: integer, format: int64}
+              digest: {type: string}
+    OllamaVersion:
+      type: object
+      required: [version]
+      additionalProperties: true
+      properties:
+        version: {type: string}
+
+    # ----- OpenAI-compatible (loose schemas; bodies are relayed verbatim) -----
+    OpenAIChatRequest:
+      type: object
+      required: [model, messages]
+      additionalProperties: true
+      description: >
+        Standard OpenAI chat-completions request; all fields pass through
+        verbatim.
+      properties:
+        model: {type: string}
+        messages:
+          type: array
+          items:
+            type: object
+            required: [role, content]
+            additionalProperties: true
+            properties:
+              role: {type: string}
+              content: {}
+        stream: {type: boolean, default: false}
+    OpenAIChatCompletion:
+      type: object
+      additionalProperties: true
+      properties:
+        id: {type: string}
+        object: {type: string, enum: [chat.completion]}
+        choices:
+          type: array
+          items: {type: object, additionalProperties: true}
+        usage: {type: object, additionalProperties: true}
+    OpenAIModelList:
+      type: object
+      additionalProperties: true
+      required: [object, data]
+      properties:
+        object: {type: string, enum: [list]}
+        data:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+            properties:
+              id: {type: string}
+              object: {type: string, enum: [model]}
