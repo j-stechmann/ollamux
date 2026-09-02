@@ -278,6 +278,15 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/ErrorEnvelope'}
+        '403':
+          description: >
+            All pool keys have been marked dead by the upstream (401/403 on
+            prior attempts). Dead keys stay dead until restart; per-key
+            state: GET /_keys. Proxy-generated response, so it carries
+            neither X-Ollamux-Retries nor X-Ollamux-Key.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErrorEnvelope'}
         '502':
           description: >
             All failover attempts exhausted. Proxy-generated response, so it
@@ -326,8 +335,19 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/ErrorEnvelope'}
+        '403':
+          description: >
+            All pool keys have been marked dead by the upstream (401/403 on
+            prior attempts). Dead keys stay dead until restart; per-key
+            state: GET /_keys. Proxy-generated response, so it carries
+            neither X-Ollamux-Retries nor X-Ollamux-Key.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErrorEnvelope'}
         '502':
-          description: All failover attempts exhausted.
+          description: >
+            All failover attempts exhausted. Proxy-generated response, so it
+            carries neither X-Ollamux-Retries nor X-Ollamux-Key.
           content:
             application/json:
               schema: {$ref: '#/components/schemas/ErrorEnvelope'}
@@ -354,7 +374,8 @@ paths:
           description: >
             Upstream status relayed verbatim (4xx other than
             401/403-Unauthorized is the client's fault and passes through
-            untouched), or a proxy-generated 413/429/502 — see `ErrorEnvelope`.
+            untouched), or a proxy-generated 413/429/403/502 — see
+            `ErrorEnvelope`.
           content:
             application/json:
               schema: {$ref: '#/components/schemas/ErrorEnvelope'}
@@ -443,8 +464,19 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/ErrorEnvelope'}
+        '403':
+          description: >
+            All pool keys have been marked dead by the upstream (401/403 on
+            prior attempts). Dead keys stay dead until restart; per-key
+            state: GET /_keys. Proxy-generated response, so it carries
+            neither X-Ollamux-Retries nor X-Ollamux-Key.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErrorEnvelope'}
         '502':
-          description: All failover attempts exhausted.
+          description: >
+            All failover attempts exhausted. Proxy-generated response, so it
+            carries neither X-Ollamux-Retries nor X-Ollamux-Key.
           content:
             application/json:
               schema: {$ref: '#/components/schemas/ErrorEnvelope'}
@@ -496,8 +528,19 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/ErrorEnvelope'}
+        '403':
+          description: >
+            All pool keys have been marked dead by the upstream (401/403 on
+            prior attempts). Dead keys stay dead until restart; per-key
+            state: GET /_keys. Proxy-generated response, so it carries
+            neither X-Ollamux-Retries nor X-Ollamux-Key.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErrorEnvelope'}
         '502':
-          description: All failover attempts exhausted.
+          description: >
+            All failover attempts exhausted. Proxy-generated response, so it
+            carries neither X-Ollamux-Retries nor X-Ollamux-Key.
           content:
             application/json:
               schema: {$ref: '#/components/schemas/ErrorEnvelope'}
@@ -687,8 +730,10 @@ components:
         status:
           type: integer
           description: >
-            Upstream HTTP status for this key's fetch (200 on success);
-            omitted when the fetch never got a response.
+            Upstream HTTP status for this key's fetch; present only on
+            `ok:true` rows, where it is always 200. Failure rows (`ok:false`)
+            omit it regardless of whether a response arrived — the reason is
+            in `error`.
         session:
           type: number
           description: Session usage fraction (0.0–1.0); omitted means unknown, never 0.
