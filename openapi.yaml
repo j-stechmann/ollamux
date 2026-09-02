@@ -38,8 +38,9 @@ info:
       `Retry-After`, capped at 5 min) and the request retries on the next key.
     * `401`/`403 Unauthorized`: the key is marked dead until restart; the
       request retries on the next key.
-    * `5xx` / network errors: retry on the next key; three consecutive
-      failures put a key in cooldown.
+    * `5xx`: retry on the next key; three consecutive `5xx` responses put a
+      key in cooldown (network errors also retry on the next key, but do not
+      count toward key health).
     * Any other upstream status (e.g. `400`) is relayed verbatim — it is not
       a key-health signal.
     * Failover happens *before the first response byte*, so streaming
@@ -283,7 +284,10 @@ paths:
             All pool keys have been marked dead by the upstream (401/403 on
             prior attempts). Dead keys stay dead until restart; per-key
             state: GET /_keys. Proxy-generated response, so it carries
-            neither X-Ollamux-Retries nor X-Ollamux-Key.
+            neither X-Ollamux-Retries nor X-Ollamux-Key. Note: an upstream
+            403 *without* the Ollama `Unauthorized` body (e.g. a CDN/WAF
+            block page) is relayed verbatim instead and *does* carry both
+            headers — distinguish by header presence, not status alone.
           content:
             application/json:
               schema: {$ref: '#/components/schemas/ErrorEnvelope'}
@@ -340,7 +344,10 @@ paths:
             All pool keys have been marked dead by the upstream (401/403 on
             prior attempts). Dead keys stay dead until restart; per-key
             state: GET /_keys. Proxy-generated response, so it carries
-            neither X-Ollamux-Retries nor X-Ollamux-Key.
+            neither X-Ollamux-Retries nor X-Ollamux-Key. Note: an upstream
+            403 *without* the Ollama `Unauthorized` body (e.g. a CDN/WAF
+            block page) is relayed verbatim instead and *does* carry both
+            headers — distinguish by header presence, not status alone.
           content:
             application/json:
               schema: {$ref: '#/components/schemas/ErrorEnvelope'}
@@ -358,9 +365,12 @@ paths:
         required: true
         schema: {type: string, minLength: 1}
         description: >
-          Any remaining Ollama API sub-path (e.g. `show`, `ps`, `embeddings`).
-          Relayed verbatim to `https://ollama.com/api/<path>` — no request
-          rewriting, models must exist on ollama.com.
+          Any remaining Ollama API sub-path (e.g. `show`, `ps`, `embeddings`),
+          including nested paths (`blobs/<digest>`). Note the `{path}`
+          template matches a single path segment under OpenAPI rules, but
+          ollamux relays any depth verbatim to
+          `https://ollama.com/api/<path>` — no request rewriting, models
+          must exist on ollama.com.
     get:
       tags: [proxy (Ollama native)]
       summary: Relay any GET under /api/
@@ -469,7 +479,10 @@ paths:
             All pool keys have been marked dead by the upstream (401/403 on
             prior attempts). Dead keys stay dead until restart; per-key
             state: GET /_keys. Proxy-generated response, so it carries
-            neither X-Ollamux-Retries nor X-Ollamux-Key.
+            neither X-Ollamux-Retries nor X-Ollamux-Key. Note: an upstream
+            403 *without* the Ollama `Unauthorized` body (e.g. a CDN/WAF
+            block page) is relayed verbatim instead and *does* carry both
+            headers — distinguish by header presence, not status alone.
           content:
             application/json:
               schema: {$ref: '#/components/schemas/ErrorEnvelope'}
@@ -533,7 +546,10 @@ paths:
             All pool keys have been marked dead by the upstream (401/403 on
             prior attempts). Dead keys stay dead until restart; per-key
             state: GET /_keys. Proxy-generated response, so it carries
-            neither X-Ollamux-Retries nor X-Ollamux-Key.
+            neither X-Ollamux-Retries nor X-Ollamux-Key. Note: an upstream
+            403 *without* the Ollama `Unauthorized` body (e.g. a CDN/WAF
+            block page) is relayed verbatim instead and *does* carry both
+            headers — distinguish by header presence, not status alone.
           content:
             application/json:
               schema: {$ref: '#/components/schemas/ErrorEnvelope'}
@@ -551,8 +567,10 @@ paths:
         required: true
         schema: {type: string, minLength: 1}
         description: >
-          Any remaining OpenAI-compatible sub-path (e.g. `embeddings`).
-          Relayed verbatim to `https://ollama.com/v1/<path>`.
+          Any remaining OpenAI-compatible sub-path (e.g. `embeddings`),
+          including nested paths (`models/<id>`). Note the `{path}`
+          template matches a single path segment under OpenAPI rules, but
+          ollamux relays any depth verbatim to `https://ollama.com/v1/<path>`.
     get:
       tags: [proxy (OpenAI-compatible)]
       summary: Relay any GET under /v1/
@@ -611,7 +629,9 @@ components:
         healthy, under quota, free slot — at admission), `miss` (first
         request of a conversation, evicted, or the pinned key fell through),
         or `off` (affinity disabled or the body gave no identity). Present
-        only when a pool key served the request.
+        only when a pool key served the request. Advisory: `hit` refers to
+        admission only — after a failover the request may be served by a
+        different key than the pin.
       schema: {type: string, enum: [hit, miss, off]}
   schemas:
     # ----- introspection -----
