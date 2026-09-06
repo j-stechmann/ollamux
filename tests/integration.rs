@@ -557,10 +557,12 @@ fn usage_endpoint_aggregates_per_key_without_secrets() {
     assert!(v["age_s"].is_u64(), "{body}");
     assert_eq!(v["stale"], false, "{body}");
 
-    // Per-key rows: ok/error vocabulary, suffixes only.
+    // Per-key rows: ok/error vocabulary, suffixes only. Tier comes from
+    // the keys' concurrency (both KEY:1 here → free).
     let rows = v["keys"].as_array().unwrap();
     let row_a = rows.iter().find(|r| r["suffix"] == "1234").unwrap();
     assert_eq!(row_a["ok"], true, "{body}");
+    assert_eq!(row_a["tier"], json_str("free"), "{body}");
     assert_eq!(row_a["session"], 0.037);
     assert_eq!(row_a["session_pct"], 3.7);
     assert_eq!(row_a["weekly_pct"], 0.7);
@@ -568,7 +570,60 @@ fn usage_endpoint_aggregates_per_key_without_secrets() {
     assert_eq!(row_a["cost"], json_str("$1.23"));
     let row_b = rows.iter().find(|r| r["suffix"] == "5678").unwrap();
     assert_eq!(row_b["session_pct"], 81.0);
+    assert_eq!(row_b["tier"], json_str("free"), "{body}");
 
+    // Aggregate: both keys are free tier (weight 1), so the sum is the
+    // plain weighted sum — 0.037 + 0.81 rounded to 3 decimals (the raw
+    // fp sum would print 0.8470000000000001).
+    assert_eq!(v["aggregate"]["session"], 0.847, "{body}");
+    assert_eq!(v["aggregate"]["weekly"], 0.427, "{body}");
+    assert_eq!(
+        v["aggregate"]["unit"],
+        json_str("free-plan cap equivalents"),
+        "{body}"
+    );
+
+    // No secret ever.
+    assert!(!body.contains("omk-abcd1234"), "secret leaked: {body}");
+    assert!(!body.contains("omk-efgh5678"), "secret leaked: {body}");
+}
+
+/// Mixed-tier pool: tier is inferred from per-key concurrency (KEY:N →
+/// free=1, pro=3, max=10) and the aggregate weights each key's usage
+/// fraction by its tier's cap, expressed in free-plan-cap units
+/// (free ×1, pro ×50, max ×250 = 5× pro).
+#[test]
+fn usage_aggregate_weights_keys_by_inferred_tier() {
+    let payload_free = usage_body(0.037, 0.007, "gpt-oss:120b", 42, "$1.23");
+    let payload_max = usage_body(0.81, 0.42, "qwen3-coder:480b", 7, "$0.10");
+    let up = Upstream::spawn_auth(move |path, auth| {
+        assert!(path.starts_with("/api/usage"), "unexpected path {path}");
+        match auth {
+            Some(a) if a.contains("abcd1234") => (200, "OK".into(), payload_free.clone()),
+            Some(a) if a.contains("efgh5678") => (200, "OK".into(), payload_max.clone()),
+            other => panic!("unexpected auth {other:?}"),
+        }
+    });
+    // Free tier (KEY:1) + max tier (KEY:10).
+    let (addr, _pool) = spawn_server(
+        pool_with(&[("omk-abcd1234", 1), ("omk-efgh5678", 10)]),
+        &up.url,
+    );
+
+    let (status, body, _) = post_with_headers(&addr, "/_usage", "");
+    assert_eq!(status, 200, "body: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let rows = v["keys"].as_array().unwrap();
+    let row_a = rows.iter().find(|r| r["suffix"] == "1234").unwrap();
+    assert_eq!(row_a["tier"], json_str("free"), "{body}");
+    let row_b = rows.iter().find(|r| r["suffix"] == "5678").unwrap();
+    assert_eq!(row_b["tier"], json_str("max"), "{body}");
+
+    // Weighted aggregate in free-plan-cap units:
+    //   session 0.037×1 + 0.81×250 = 202.537
+    //   weekly  0.007×1 + 0.42×250 = 105.007
+    assert_eq!(v["aggregate"]["session"], 202.537, "{body}");
+    assert_eq!(v["aggregate"]["weekly"], 105.007, "{body}");
     // No secret ever.
     assert!(!body.contains("omk-abcd1234"), "secret leaked: {body}");
     assert!(!body.contains("omk-efgh5678"), "secret leaked: {body}");
@@ -621,10 +676,12 @@ fn keys_endpoint_never_fetches_but_embeds_snapshot() {
     let (addr, _pool) = spawn_server(pool_with(&[("omk-keysembed1", 1)]), &up.url);
 
     // Pure in-memory read: no snapshot yet → no usage key, no upstream call.
+    // Tier is always present (derived from the key's own concurrency).
     let (status, body, _) = get(&addr, "/_keys");
     assert_eq!(status, 200);
     let info: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert!(info[0].get("usage").is_none(), "no snapshot yet: {body}");
+    assert_eq!(info[0]["tier"], json_str("free"), "{body}");
     assert_eq!(CALLS.load(Ordering::Relaxed), 0, "/_keys must never fetch");
 
     // A /_usage call populates the snapshot…
@@ -637,6 +694,7 @@ fn keys_endpoint_never_fetches_but_embeds_snapshot() {
     assert_eq!(info2[0]["usage"]["session"], 0.5, "{body2}");
     assert_eq!(info2[0]["usage"]["session_pct"], 50.0);
     assert_eq!(info2[0]["usage"]["weekly_pct"], 25.0, "{body2}");
+    assert_eq!(info2[0]["tier"], json_str("free"), "{body2}");
     assert_eq!(CALLS.load(Ordering::Relaxed), 1);
     assert_eq!(info2[0]["state"], "up", "usage must not touch key health");
 }

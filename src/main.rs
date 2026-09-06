@@ -303,9 +303,10 @@ ENDPOINTS:
     /api/*, /v1/*   proxied to https://ollama.com with key rotation
                     (prompt-cache affinity by default; X-Ollamux-Affinity
                     response header: hit/miss/off)
-    /_keys          per-key health JSON (embeds usage when known)
-    /_usage         per-key Ollama Cloud usage JSON (?refresh=1 forces,
-                    at most one fetch attempt per 5 s)
+    /_keys          per-key health JSON (tier + embeds usage when known)
+    /_usage         per-key Ollama Cloud usage JSON plus a tier-weighted
+                    pool aggregate (?refresh=1 forces, at most one fetch
+                    attempt per 5 s)
     /_health        liveness JSON",
         ollamux::VERSION
     );
