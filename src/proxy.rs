@@ -216,7 +216,7 @@ impl Server {
             } else {
                 self.usage.get()
             };
-            let body = usage_json(&snap, self.pool.total_keys());
+            let body = usage_json(&snap, &self.pool);
             json_response(req, 200, &body, None);
             return (200, 0, None, None);
         }
@@ -927,24 +927,45 @@ fn curated_response_headers(resp: &ureq::Response) -> Vec<(String, String)> {
 }
 
 /// Render a usage snapshot as the /_usage response body: envelope with
-/// freshness, one row per pool key (ok:data or ok:false + error). Key
-/// count comes from the pool so a snapshot older than a keys-file change
-/// (impossible — keys are fixed at startup, but be defensive) rows as
-/// failures rather than truncating silently.
-fn usage_json(snap: &crate::usage::UsageSnapshot, expected: usize) -> String {
+/// freshness, one row per pool key (ok:data or ok:false + error), and a
+/// pool-wide tier-weighted aggregate. Key count comes from the pool so a
+/// snapshot older than a keys-file change (impossible — keys are fixed at
+/// startup, but be defensive) rows as failures rather than truncating
+/// silently.
+fn usage_json(snap: &crate::usage::UsageSnapshot, pool: &Pool) -> String {
     let updated = snap.updated_unix();
     let age_s = snap.fetched_at.elapsed().as_secs();
+    let concurrencies = pool.concurrencies();
     let keys: Vec<serde_json::Value> = snap
         .keys
         .iter()
-        .map(|k| serde_json::to_value(k).unwrap_or_default())
+        .map(|k| {
+            // Tier is injected at render time (not a KeyUsage field):
+            // the wire model mirrors the upstream payload, while tier is
+            // ollamux's own view of the pool — same split as /_keys
+            // merging usage briefs into KeyInfo.
+            let mut v = serde_json::to_value(k).unwrap_or_default();
+            v["tier"] = serde_json::Value::String(
+                crate::usage::tier_for(concurrencies.get(k.index).copied().unwrap_or(1))
+                    .0
+                    .to_string(),
+            );
+            v
+        })
         .chain(
             // Missing rows (pool grew? defensive only) render as failures.
-            (snap.keys.len()..expected).map(|i| {
-                serde_json::json!({"index": i, "suffix": "?", "ok": false, "error": "no usage data"})
+            (snap.keys.len()..pool.total_keys()).map(|i| {
+                serde_json::json!({
+                    "index": i, "suffix": "?", "ok": false,
+                    "tier": crate::usage::tier_for(
+                        concurrencies.get(i).copied().unwrap_or(1),
+                    ).0,
+                    "error": "no usage data",
+                })
             }),
         )
         .collect();
+    let agg = crate::usage::aggregate(snap, &concurrencies);
     // Re-fetch when the snapshot is older than the TTL but still served
     // (stale-while-revalidate): tell the client so it can decide.
     let stale = age_s >= crate::usage::USAGE_TTL.as_secs();
@@ -953,6 +974,11 @@ fn usage_json(snap: &crate::usage::UsageSnapshot, expected: usize) -> String {
         "age_s": age_s,
         "stale": stale,
         "session_window": "about 5 hours (rolling; no reset timestamps upstream)",
+        "aggregate": {
+            "session": agg.session,
+            "weekly": agg.weekly,
+            "unit": crate::usage::AGGREGATE_UNIT,
+        },
         "keys": keys,
     })
     .to_string()

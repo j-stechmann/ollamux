@@ -112,10 +112,12 @@ paths:
       summary: Per-key pool state
       description: >
         Pure in-memory read: never triggers an upstream fetch (incident
-        readers rely on it being instant). When a usage snapshot exists
-        (from /_usage or --usage-aware), each row embeds the latest known
-        usage under `usage`; otherwise the field is absent. Secrets are
-        never exposed — only key suffixes.
+        readers rely on it being instant). Each row carries the key's plan
+        `tier` (inferred from per-key concurrency, KEY:N: free=1, pro=3,
+        max=10). When a usage snapshot exists (from /_usage or
+        --usage-aware), each row embeds the latest known usage under
+        `usage`; otherwise the field is absent. Secrets are never exposed —
+        only key suffixes.
       operationId: getKeys
       responses:
         '200':
@@ -137,7 +139,11 @@ paths:
         row per key (suffixes only, never secrets). Usage is a *fraction of
         the plan's cap* (0.0–1.0), not a token count; there are no reset
         timestamps upstream (the session window rolls over roughly every
-        5 hours, the weekly one every 7 days).
+        5 hours, the weekly one every 7 days). The envelope also carries an
+        `aggregate`: each row's fraction weighted by its key's plan tier
+        (inferred from per-key concurrency, KEY:N: free=1, pro=3, max=10;
+        weights ×1/×50/×250) and summed across all keys — including ones
+        currently on cooldown (usage fetching is health-blind).
       operationId: getUsage
       parameters:
         - name: refresh
@@ -156,10 +162,12 @@ paths:
       responses:
         '200':
           description: >
-            Envelope with freshness metadata plus one row per key. Failed
-            per-key fetches carry `error` instead of numbers; upstream error
-            bodies are never relayed (they could echo the key). A fetch that
-            fails entirely keeps the previous good snapshot.
+            Envelope with freshness metadata, a tier-weighted pool-wide
+            `aggregate`, and one row per key (each carrying its inferred
+            `tier`). Failed per-key fetches carry `error` instead of
+            numbers; upstream error bodies are never relayed (they could
+            echo the key). A fetch that fails entirely keeps the previous
+            good snapshot.
           headers:
             X-Ollamux: {$ref: '#/components/headers/X-Ollamux'}
           content:
@@ -686,6 +694,7 @@ components:
         - suffix
         - state
         - concurrency
+        - tier
         - in_use
         - waiters
         - strikes
@@ -696,6 +705,13 @@ components:
         suffix: {type: string, description: Last characters of the key — never the secret.}
         state: {$ref: '#/components/schemas/KeyState'}
         concurrency: {type: integer, description: 'Max in-flight requests for this key (KEY:N, default 3).'}
+        tier:
+          type: string
+          description: >
+            Plan tier inferred from `concurrency`: exactly 1 → `free`,
+            2–3 → `pro`, 4 and beyond → `max` (more concurrency than a
+            tier's normal limit is the next tier up). Derived from the
+            key's own configuration, independent of any usage snapshot.
         in_use: {type: integer, description: Slots currently held.}
         waiters: {type: integer, description: Requests currently blocked waiting for a slot on this key.}
         cooldown_left_s:
@@ -719,7 +735,7 @@ components:
         request_count: {type: integer, format: int64}
     UsageEnvelope:
       type: object
-      required: [updated, age_s, stale, session_window, keys]
+      required: [updated, age_s, stale, session_window, aggregate, keys]
       properties:
         updated:
           type: integer
@@ -736,17 +752,25 @@ components:
         session_window:
           type: string
           description: Human hint; the upstream publishes no reset timestamps.
+        aggregate: {$ref: '#/components/schemas/UsageAggregate'}
         keys:
           type: array
           items: {$ref: '#/components/schemas/KeyUsage'}
     KeyUsage:
       type: object
-      required: [index, suffix, ok]
+      required: [index, suffix, ok, tier]
       description: One per-key usage row. `ok:false` rows carry `error` only.
       properties:
         index: {type: integer}
         suffix: {type: string}
         ok: {type: boolean}
+        tier:
+          type: string
+          description: >
+            Plan tier inferred from the key's concurrency (KEY:N): exactly
+            1 → `free`, 2–3 → `pro`, 4 and beyond → `max`. Injected by
+            ollamux at render time (not part of the upstream payload); it
+            is also the tier whose weight the aggregate applies.
         status:
           type: integer
           description: >
@@ -775,6 +799,32 @@ components:
             Per-key failure reason (e.g. `unauthorized`, `rate limited
             (upstream 429)`, `endpoint changed (unexpected payload)`) —
             generated by ollamux; upstream bodies are never relayed here.
+    UsageAggregate:
+      type: object
+      description: >
+        Pool-wide usage sum weighted by plan tier: every ok row's usage
+        fraction (a fraction of *its own plan's cap*) times its tier's
+        cap weight (free ×1, pro ×50, max ×250), summed across all keys
+        including ones currently on cooldown — usage fetching never
+        consults pool health. A key marked dead (401/403) is expected to
+        fail its own usage fetch the same way and therefore contributes
+        nothing. Rounded to 3 decimals; a window no ok row reports is
+        `null`, never 0.
+      required: [session, weekly, unit]
+      properties:
+        session:
+          type: number
+          nullable: true
+          description: Session-window sum in free-plan-cap equivalents.
+        weekly:
+          type: number
+          nullable: true
+          description: Weekly-window sum in free-plan-cap equivalents.
+        unit:
+          type: string
+          description: >
+            Always `free-plan cap equivalents`: weights are multiples of
+            the free plan's usage cap (pro = 50× free, max = 5× pro).
     UnknownPathHint:
       type: object
       required: [error]

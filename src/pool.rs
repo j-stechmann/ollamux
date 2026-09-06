@@ -170,6 +170,10 @@ pub struct KeyInfo {
     pub suffix: String,
     pub state: State,
     pub concurrency: u32,
+    /// Plan tier inferred from `concurrency` (free=1, pro=3, max=10; more
+    /// concurrency than normal is the next tier up). Always present: it
+    /// derives from the key's own configuration, never from a snapshot.
+    pub tier: &'static str,
     pub in_use: u32,
     pub waiters: u32,
     pub cooldown_left_s: Option<u64>,
@@ -255,6 +259,13 @@ impl Pool {
 
     pub fn suffix_of(&self, key: usize) -> String {
         crate::config::suffix(&self.keys[key])
+    }
+
+    /// Per-key concurrency limits, index-aligned with snapshot keys (the
+    /// key list is fixed at startup). Usage rendering derives each key's
+    /// plan tier from this (`crate::usage::tier_for`).
+    pub fn concurrencies(&self) -> Vec<u32> {
+        self.states.iter().map(|s| s.concurrency).collect()
     }
 
     fn log(&self, msg: String) {
@@ -511,6 +522,7 @@ impl Pool {
                     suffix: self.suffix_of(i),
                     state,
                     concurrency: st.concurrency,
+                    tier: crate::usage::tier_for(st.concurrency).0,
                     in_use: st.in_use(),
                     waiters: *lock(&st.waiters),
                     cooldown_left_s: if state == State::Cooldown {
