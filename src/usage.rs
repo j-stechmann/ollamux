@@ -23,6 +23,14 @@
 //! client traffic drives key health; a truly dead key dies on its next
 //! real request). /_keys embedding never fetches upstream either: it is
 //! a pure in-memory read that merely renders the latest snapshot.
+//!
+//! The tracker also derives a pool-wide aggregate: every key's usage
+//! fraction (a fraction of *its own plan's cap*) is weighted by the plan
+//! tier implied by its concurrency (see `tier_for`) and summed, so the
+//! total reads in free-plan-cap equivalents. Fetching is health-blind, so
+//! keys on cooldown contribute like any other; error rows (e.g. a dead
+//! key's own 401, its expected outcome) carry no numbers and cannot
+//! contribute.
 
 use crate::pool::Pool;
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
@@ -41,6 +49,35 @@ const MIN_REFRESH: Duration = Duration::from_secs(5);
 /// timeout beyond these).
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+// Plan-tier weighting. The usage endpoint reports each key's usage as a
+// fraction of that key's own plan cap, so summing raw fractions across a
+// mixed pool is meaningless: a pro key at 81% of its (much larger) cap has
+// burned far more capacity than a free key at 81% of its tiny one. Weight
+// every key's fraction by its plan's cap, expressed in free-plan-cap
+// units, and the aggregate reads as "how many free-plan caps of usage has
+// this pool served". We have no absolute cap numbers, only relative ones:
+// pro has 50x free's cap and max 5x pro's (50 * 5 = 250). Tiers are
+// inferred from the per-key concurrency in the keys file (KEY:N), which
+// matches Ollama Cloud's plan limits (free=1, pro=3, max=10).
+/// Free tier: weight 1.0 — the unit the aggregate is denominated in.
+const FREE_WEIGHT: f64 = 1.0;
+/// Pro tier: 50x free's usage cap.
+const PRO_WEIGHT: f64 = 50.0;
+/// Max tier: 5x pro's cap (250x free).
+const MAX_WEIGHT: f64 = 250.0;
+
+/// Tier name and weight for a key with concurrency `conc` (KEY:N; N is
+/// always >= 1 — parsing clamps 0 to 1 and rejects junk). More concurrency
+/// than a tier's normal limit means the next tier up: exactly 1 is free,
+/// 2..=3 is pro, 4 and beyond is max.
+pub fn tier_for(conc: u32) -> (&'static str, f64) {
+    match conc {
+        1 => ("free", FREE_WEIGHT),
+        2..=3 => ("pro", PRO_WEIGHT),
+        _ => ("max", MAX_WEIGHT),
+    }
+}
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     // Same poison-tolerance as the pool (pool.rs lock()).
@@ -258,6 +295,64 @@ impl UsageSnapshot {
                     .saturating_sub(self.fetched_at.elapsed().as_secs())
             })
             .unwrap_or(0)
+    }
+}
+
+/// Pool-wide usage aggregate, weighted by plan tier (see `tier_for`):
+/// the sum of every key's usage fraction times its tier weight, i.e.
+/// usage measured in free-plan-cap equivalents. Windows with no
+/// contributing key are `None` (rendered `null`, never fabricated as 0
+/// or omitted — the envelope's schema has both fields required-nullable,
+/// so serialization must always emit them).
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+pub struct UsageAggregate {
+    pub session: Option<f64>,
+    pub weekly: Option<f64>,
+}
+
+/// Unit label for the aggregate: weights are free-plan-cap multiples, so
+/// the sum reads in free-plan-cap equivalents.
+pub const AGGREGATE_UNIT: &str = "free-plan cap equivalents";
+
+/// Round to 3 decimals: upstream fractions carry 3 decimals and tier
+/// weights are integers, so only fp addition noise is trimmed (an
+/// unrounded 0.037 + 0.81 serializes as 0.8470000000000001). Unlike
+/// `pct` there is no [0,1] clamp — a weighted sum legitimately exceeds 1.
+fn round3(v: f64) -> f64 {
+    (v * 1000.0).round() / 1000.0
+}
+
+/// Aggregate a snapshot across all ok rows, weighted by the tier each
+/// key's concurrency implies (`concurrencies` is index-aligned with
+/// `snap.keys`). Every key participates regardless of pool health —
+/// cooldown/dead state never touches usage fetching, so cooling keys
+/// contribute like any other; error rows (`ok:false`, e.g. a dead key's
+/// own 401 on /api/usage, its expected outcome) carry no numbers and
+/// cannot contribute. A window only some keys report is summed over
+/// exactly those keys; a window no ok row reports stays `None` (never
+/// fabricated as 0).
+pub fn aggregate(snap: &UsageSnapshot, concurrencies: &[u32]) -> UsageAggregate {
+    let mut session = 0.0f64;
+    let mut weekly = 0.0f64;
+    let mut session_seen = false;
+    let mut weekly_seen = false;
+    for k in &snap.keys {
+        let conc = concurrencies.get(k.index).copied().unwrap_or(1);
+        let (_, weight) = tier_for(conc);
+        if k.ok {
+            if let Some(s) = k.session {
+                session += s * weight;
+                session_seen = true;
+            }
+            if let Some(w) = k.weekly {
+                weekly += w * weight;
+                weekly_seen = true;
+            }
+        }
+    }
+    UsageAggregate {
+        session: session_seen.then(|| round3(session)),
+        weekly: weekly_seen.then(|| round3(weekly)),
     }
 }
 
@@ -860,5 +955,131 @@ mod tests {
         std::thread::sleep(Duration::from_millis(140));
         let _ = t.get(); // window elapsed → refetch
         assert_eq!(CALLS.load(std::sync::atomic::Ordering::Relaxed), 2);
+    }
+
+    // ----- tier weighting and aggregate -----
+
+    #[test]
+    fn tier_for_matches_concurrency_to_plan_tier() {
+        // 1 → free; 2..=3 → pro; 4 and beyond → max ("more concurrency
+        // than normal is the next tier up").
+        assert_eq!(tier_for(1), ("free", FREE_WEIGHT));
+        assert_eq!(tier_for(2), ("pro", PRO_WEIGHT));
+        assert_eq!(tier_for(3), ("pro", PRO_WEIGHT));
+        assert_eq!(tier_for(4), ("max", MAX_WEIGHT));
+        assert_eq!(tier_for(10), ("max", MAX_WEIGHT));
+        assert_eq!(tier_for(u32::MAX), ("max", MAX_WEIGHT));
+    }
+
+    fn agg_row(index: usize, ok: bool, session: Option<f64>, weekly: Option<f64>) -> KeyUsage {
+        KeyUsage {
+            index,
+            suffix: format!("sfx{index}"),
+            ok,
+            status: ok.then_some(200),
+            session,
+            weekly,
+            session_pct: session.map(pct),
+            weekly_pct: weekly.map(pct),
+            models: Vec::new(),
+            cost: None,
+            error: (!ok).then(|| "test failure".to_string()),
+        }
+    }
+
+    fn agg_snap(keys: Vec<KeyUsage>) -> UsageSnapshot {
+        UsageSnapshot {
+            fetched_at: Instant::now(),
+            keys,
+        }
+    }
+
+    #[test]
+    fn aggregate_weights_by_tier() {
+        // free(1) at 3.7% + max(250) at 81% = 202.537 free-cap units.
+        let snap = agg_snap(vec![
+            agg_row(0, true, Some(0.037), Some(0.007)),
+            agg_row(1, true, Some(0.81), Some(0.42)),
+        ]);
+        let a = aggregate(&snap, &[1, 10]);
+        assert_eq!(a.session, Some(202.537), "0.037*1 + 0.81*250");
+        assert_eq!(a.weekly, Some(105.007), "0.007*1 + 0.42*250");
+    }
+
+    #[test]
+    fn aggregate_adds_up_across_tiers_without_fp_noise() {
+        // The classic fp trap: 0.037 + 0.81 raw-sums to
+        // 0.8470000000000001; round3 must render the honest 0.847.
+        let snap = agg_snap(vec![
+            agg_row(0, true, Some(0.037), None),
+            agg_row(1, true, Some(0.81), None),
+        ]);
+        let a = aggregate(&snap, &[1, 1]);
+        assert_eq!(a.session, Some(0.847));
+        assert_eq!(a.weekly, None, "window nobody reported stays null");
+    }
+
+    #[test]
+    fn aggregate_excludes_error_rows_and_nulls_when_all_fail() {
+        let snap = agg_snap(vec![
+            agg_row(0, false, None, None),
+            agg_row(1, true, Some(0.5), None),
+        ]);
+        let a = aggregate(&snap, &[3, 3]);
+        assert_eq!(a.session, Some(25.0), "0.5 * pro weight, error row skipped");
+        assert_eq!(a.weekly, None);
+        // No ok row at all → both windows null, never 0.
+        let snap = agg_snap(vec![agg_row(0, false, None, None)]);
+        let a = aggregate(&snap, &[1]);
+        assert_eq!(a, UsageAggregate::default());
+    }
+
+    #[test]
+    fn aggregate_sums_window_only_over_rows_that_report_it() {
+        // Mixed report: key 0 has session only, key 1 weekly only — each
+        // window sums over exactly its contributors ("never fabricate").
+        let snap = agg_snap(vec![
+            agg_row(0, true, Some(0.4), None),
+            agg_row(1, true, None, Some(0.2)),
+        ]);
+        let a = aggregate(&snap, &[1, 1]);
+        assert_eq!(a.session, Some(0.4));
+        assert_eq!(a.weekly, Some(0.2));
+    }
+
+    #[test]
+    fn aggregate_default_weight_is_free_for_short_slices() {
+        // Defensive: a shorter concurrency slice must not panic; missing
+        // entries fall back to free weight.
+        let snap = agg_snap(vec![agg_row(0, true, Some(0.037), Some(0.007))]);
+        let a = aggregate(&snap, &[]);
+        assert_eq!(a.session, Some(0.037));
+        assert_eq!(a.weekly, Some(0.007));
+    }
+
+    #[test]
+    fn aggregate_includes_keys_on_cooldown() {
+        // The pin for "aggregate covers cooldown keys": usage fetching is
+        // health-blind, so a key cooling down after a 429 still has its
+        // usage fetched and must contribute to the sum.
+        let pool = Arc::new(Pool::new(
+            vec![("omk-usage-cd01".into(), 3), ("omk-usage-cd02".into(), 1)],
+            4,
+            false,
+        ));
+        pool.mark_cooldown(0, Duration::from_secs(60), "429 test");
+        let t = UsageTracker::new(pool, "https://ollama.com").with_fetch(|i, _, _| {
+            Ok(serde_json::from_str::<UsagePayload>(&if i == 0 {
+                r#"{"limits":{"session":{"usage":0.5},"weekly":{"usage":0.2}}}"#.to_string()
+            } else {
+                r#"{"limits":{"session":{"usage":0.1},"weekly":{"usage":0.1}}}"#.to_string()
+            })
+            .unwrap())
+        });
+        let snap = t.get();
+        assert!(snap.keys[0].ok, "cooldown key's usage fetch must succeed");
+        let a = aggregate(&snap, &[3, 1]);
+        assert_eq!(a.session, Some(25.1), "0.5*50 + 0.1*1");
+        assert_eq!(a.weekly, Some(10.1), "0.2*50 + 0.1*1");
     }
 }

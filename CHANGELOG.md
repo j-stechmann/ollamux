@@ -5,7 +5,21 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.6.0] - 2026-09-06
+
+### Added
+
+- `/_usage` now reports a pool-wide aggregate alongside the per-key rows:
+  each key's usage fraction (a fraction of *its own* plan cap) is weighted
+  by the plan tier inferred from its per-key concurrency (`KEY:N` — free=1
+  → ×1, pro=3 → ×50, max=10 → ×250; more concurrency than normal counts as
+  the next tier up) and summed, so the total reads in free-plan-cap
+  equivalents. All keys contribute, including ones on cooldown (usage
+  fetching never consults key health); dead keys are expected to fail
+  their own usage fetch the same way and contribute nothing. Rounded to 3
+  decimals; windows nobody reported are `null`, never 0.
+- `/_usage` rows and `/_keys` rows now carry the key's inferred plan
+  `tier` (`free`/`pro`/`max`).
 
 ## [0.5.0] - 2026-09-01
 
@@ -107,7 +121,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Audit findings: SIGINT masking during shutdown, no-auth request
   paths, request body truncation, and health reset semantics.
 
-[Unreleased]: https://github.com/j-stechmann/ollamux/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/j-stechmann/ollamux/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/j-stechmann/ollamux/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/j-stechmann/ollamux/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/j-stechmann/ollamux/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/j-stechmann/ollamux/compare/v0.2.0...v0.3.0

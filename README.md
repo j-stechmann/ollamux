@@ -78,12 +78,17 @@ than hammering upstream. Requests that wait too long get an honest `429`.
 | `/api/*`       | Proxied to `https://ollama.com` with rotation    |
 | `/v1/*`        | Proxied (OpenAI-compatible surface) with rotation|
 | `/_keys`       | Per-key health JSON (suffixes only, no secrets)  |
-| `/_usage`      | Per-key Ollama Cloud usage JSON (`?refresh=1` forces a refresh, at most one fetch attempt per 5 s) |
+| `/_usage`      | Per-key usage JSON + tier-weighted pool aggregate (`?refresh=1` forces a refresh, at most one fetch attempt per 5 s) |
 | `/_health`     | `{"ok":…, "keys":…, "total_slots":…}`            |
 
 Everything else answers `404` with a hint — this is **not** a local Ollama
 server; it serves no models and `ollama list` against it shows the cloud
 model list, not local models.
+
+The full API surface is described in [`openapi.yaml`](openapi.yaml)
+(OpenAPI 3.0): the proxied Ollama/OpenAI paths, the `/_keys`, `/_usage`,
+`/_health` introspection endpoints, and ollamux's response headers and
+error envelope.
 
 ## Usage introspection
 
@@ -112,17 +117,32 @@ out on every request.
 `/_usage` fans out to the usage endpoint with every configured key in
 parallel and answers with one row per key (suffixes only, never secrets):
 fresh session/weekly fractions plus percents, top models, the 4-week
-rolling cost, or a per-key error otherwise. Responses are cached for 60 s
-(`updated`/`age_s`/`stale` fields tell you the age); `/_keys` embeds the
-latest known usage per key from the same cache — it never triggers an
-upstream call itself, and usage checks never touch key health (a 401 there
-is reported, not treated as a dead key).
+rolling cost, or a per-key error otherwise. Each row also carries the
+key's plan `tier`, inferred from its per-key concurrency (`KEY:N` —
+free=1, pro=3, max=10; more concurrency than normal is the next tier up).
+Responses are cached for 60 s (`updated`/`age_s`/`stale` fields tell you
+the age); `/_keys` embeds the latest known usage per key from the same
+cache — it never triggers an upstream call itself, and usage checks never
+touch key health (a 401 there is reported, not treated as a dead key).
+
+The envelope's `aggregate` sums every key's usage fraction weighted by its
+tier's cap — free ×1, pro ×50, max ×250 (pro has 50× free's usage cap, max
+5× pro's) — so the total reads in *free-plan-cap equivalents*: a pro key
+at 81% of its cap has burned 40.5 free-caps of usage. All keys contribute,
+including ones currently on cooldown (usage fetching is health-blind); a
+dead key (401/403) is expected to fail its own usage fetch the same way
+and contributes nothing. Windows nobody reported are `null`, never 0.
 
 ```json
-{"updated":1756620000,"age_s":3,"stale":false,"keys":[
-  {"index":0,"suffix":"1234","ok":true,"session":0.037,"weekly":0.007,
-   "session_pct":3.7,"weekly_pct":0.7,
-   "models":[{"name":"gpt-oss:120b","request_count":42}],"cost":"$1.23"}]}
+{"updated":1756620000,"age_s":3,"stale":false,
+ "aggregate":{"session":202.537,"weekly":105.007,
+              "unit":"free-plan cap equivalents"},
+ "keys":[
+   {"index":0,"suffix":"1234","ok":true,"tier":"free","session":0.037,"weekly":0.007,
+    "session_pct":3.7,"weekly_pct":0.7,
+    "models":[{"name":"gpt-oss:120b","request_count":42}],"cost":"$1.23"},
+   {"index":1,"suffix":"5678","ok":true,"tier":"max","session":0.81,"weekly":0.42,
+    "session_pct":81.0,"weekly_pct":42.0,"cost":"$0.10"}]}
 ```
 
 ## Quota-aware key selection
@@ -205,7 +225,8 @@ a mysterious upstream one — see `/_keys` for per-key state.
 
 - Usage introspection is read-only reporting; there is no token accounting
   or historical dashboard — `/_usage` mirrors what ollama.com exposes per
-  account.
+  account (the only derived figure is the tier-weighted pool `aggregate`,
+  which ollama.com itself does not publish).
 - No request rewriting: models must exist on ollama.com.
 - A dead key stays dead until restart (`/_keys` shows why). Restarting is
   cheap: it's stateless.
