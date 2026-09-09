@@ -1026,7 +1026,7 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_adds_up_across_tiers_without_fp_noise() {
+    fn aggregate_averages_across_tiers_without_fp_noise() {
         // The classic fp trap: 0.037 + 0.81 raw-sums to
         // 0.8470000000000001; round3 must render the honest mean 0.424
         // ((0.037 + 0.81) / 2 with equal weights).
@@ -1088,7 +1088,7 @@ mod tests {
     fn aggregate_includes_keys_on_cooldown() {
         // The pin for "aggregate covers cooldown keys": usage fetching is
         // health-blind, so a key cooling down after a 429 still has its
-        // usage fetched and must contribute to the sum.
+        // usage fetched and must contribute to the mean.
         let pool = Arc::new(Pool::new(
             vec![("omk-usage-cd01".into(), 3), ("omk-usage-cd02".into(), 1)],
             4,
