@@ -78,7 +78,7 @@ than hammering upstream. Requests that wait too long get an honest `429`.
 | `/api/*`       | Proxied to `https://ollama.com` with rotation    |
 | `/v1/*`        | Proxied (OpenAI-compatible surface) with rotation|
 | `/_keys`       | Per-key health JSON (suffixes only, no secrets)  |
-| `/_usage`      | Per-key usage JSON + tier-weighted pool aggregate (`?refresh=1` forces a refresh, at most one fetch attempt per 5 s) |
+| `/_usage`      | Per-key usage JSON + pool-capacity aggregate (`?refresh=1` forces a refresh, at most one fetch attempt per 5 s) |
 | `/_health`     | `{"ok":…, "keys":…, "total_slots":…}`            |
 
 Everything else answers `404` with a hint — this is **not** a local Ollama
@@ -125,18 +125,22 @@ the age); `/_keys` embeds the latest known usage per key from the same
 cache — it never triggers an upstream call itself, and usage checks never
 touch key health (a 401 there is reported, not treated as a dead key).
 
-The envelope's `aggregate` sums every key's usage fraction weighted by its
-tier's cap — free ×1, pro ×50, max ×250 (pro has 50× free's usage cap, max
-5× pro's) — so the total reads in *free-plan-cap equivalents*: a pro key
-at 81% of its cap has burned 40.5 free-caps of usage. All keys contribute,
-including ones currently on cooldown (usage fetching is health-blind); a
-dead key (401/403) is expected to fail its own usage fetch the same way
-and contributes nothing. Windows nobody reported are `null`, never 0.
+The envelope's `aggregate` is the capacity-weighted mean of every
+reporting key's usage fraction, weighted by its tier's cap — free ×1,
+pro ×50, max ×250 (pro has 50× free's usage cap, max 5× pro's) — so it
+reads as *the fraction of the pool's combined capacity in use* and stays
+in 0.0–1.0 like the per-key numbers: a single-key pool reproduces that
+key's own fraction, and applications built for the per-key range need no
+adjustment. All keys contribute, including ones currently on cooldown
+(usage fetching is health-blind); a dead key (401/403) is expected to
+fail its own usage fetch the same way and contributes nothing (its
+weight is excluded from the denominator, so it never dilutes the
+number). Windows nobody reported are `null`, never 0.
 
 ```json
 {"updated":1756620000,"age_s":3,"stale":false,
- "aggregate":{"session":202.537,"weekly":105.007,
-              "unit":"free-plan cap equivalents"},
+ "aggregate":{"session":0.807,"weekly":0.418,
+              "unit":"pool capacity fraction"},
  "keys":[
    {"index":0,"suffix":"1234","ok":true,"tier":"free","session":0.037,"weekly":0.007,
     "session_pct":3.7,"weekly_pct":0.7,
@@ -225,8 +229,8 @@ a mysterious upstream one — see `/_keys` for per-key state.
 
 - Usage introspection is read-only reporting; there is no token accounting
   or historical dashboard — `/_usage` mirrors what ollama.com exposes per
-  account (the only derived figure is the tier-weighted pool `aggregate`,
-  which ollama.com itself does not publish).
+  account (the only derived figure is the capacity-weighted pool
+  `aggregate`, which ollama.com itself does not publish).
 - No request rewriting: models must exist on ollama.com.
 - A dead key stays dead until restart (`/_keys` shows why). Restarting is
   cheap: it's stateless.

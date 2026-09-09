@@ -9,7 +9,7 @@
 openapi: 3.0.3
 info:
   title: ollamux
-  version: 0.6.0
+  version: 0.7.0
   license:
     name: GPL-2.0-or-later
     url: https://github.com/j-stechmann/ollamux/blob/master/LICENSE
@@ -140,9 +140,10 @@ paths:
         the plan's cap* (0.0–1.0), not a token count; there are no reset
         timestamps upstream (the session window rolls over roughly every
         5 hours, the weekly one every 7 days). The envelope also carries an
-        `aggregate`: each row's fraction weighted by its key's plan tier
-        (inferred from per-key concurrency, KEY:N: free=1, pro=3, max=10;
-        weights ×1/×50/×250) and summed across all keys — including ones
+        `aggregate`: the capacity-weighted mean of the reporting rows'
+        fractions, weighted by each key's plan tier (inferred from per-key
+        concurrency, KEY:N: free=1, pro=3, max=10; weights ×1/×50/×250) —
+        a number in 0.0–1.0 like the per-key rows, including keys
         currently on cooldown (usage fetching is health-blind).
       operationId: getUsage
       parameters:
@@ -162,8 +163,9 @@ paths:
       responses:
         '200':
           description: >
-            Envelope with freshness metadata, a tier-weighted pool-wide
-            `aggregate`, and one row per key (each carrying its inferred
+            Envelope with freshness metadata, a capacity-weighted
+            pool-wide `aggregate` (a 0.0–1.0 fraction like the per-key
+            rows), and one row per key (each carrying its inferred
             `tier`). Failed per-key fetches carry `error` instead of
             numbers; upstream error bodies are never relayed (they could
             echo the key). A fetch that fails entirely keeps the previous
@@ -619,7 +621,7 @@ components:
         Present on every response, including relayed upstream errors:
         `ollamux/<version>` — lets a client tell ollamux apart from a real
         Ollama server or a CDN error page.
-      schema: {type: string, example: 'ollamux/0.6.0'}
+      schema: {type: string, example: 'ollamux/0.7.0'}
     X-Ollamux-Key:
       description: >
         Suffix of the pool key that served the request. Present only when a
@@ -648,7 +650,7 @@ components:
       required: [service, version, ok, keys, total_slots]
       properties:
         service: {type: string, enum: [ollamux]}
-        version: {type: string, example: '0.6.0'}
+        version: {type: string, example: '0.7.0'}
         ok:
           type: boolean
           description: True when at least one key is selectable right now.
@@ -802,29 +804,37 @@ components:
     UsageAggregate:
       type: object
       description: >
-        Pool-wide usage sum weighted by plan tier: every ok row's usage
+        Pool-wide usage as a capacity-weighted mean: every ok row's usage
         fraction (a fraction of *its own plan's cap*) times its tier's
-        cap weight (free ×1, pro ×50, max ×250), summed across all keys
-        including ones currently on cooldown — usage fetching never
-        consults pool health. A key marked dead (401/403) is expected to
-        fail its own usage fetch the same way and therefore contributes
-        nothing. Rounded to 3 decimals; a window no ok row reports is
-        `null`, never 0.
+        cap weight (free ×1, pro ×50, max ×250), summed and divided by
+        the summed weights of exactly the keys that reported the window
+        — so the result is a fraction in 0.0–1.0 like the per-key rows
+        (a single-key pool reproduces that key's own fraction, and dead
+        keys never dilute the number). Keys on cooldown contribute too —
+        usage fetching never consults pool health. A key marked dead
+        (401/403) is expected to fail its own usage fetch the same way
+        and therefore contributes nothing. Rounded to 3 decimals; a
+        window no ok row reports is `null`, never 0.
       required: [session, weekly, unit]
       properties:
         session:
           type: number
           nullable: true
-          description: Session-window sum in free-plan-cap equivalents.
+          description: >
+            Session-window fraction of the reporting keys' combined
+            capacity (0.0–1.0).
         weekly:
           type: number
           nullable: true
-          description: Weekly-window sum in free-plan-cap equivalents.
+          description: >
+            Weekly-window fraction of the reporting keys' combined
+            capacity (0.0–1.0).
         unit:
           type: string
           description: >
-            Always `free-plan cap equivalents`: weights are multiples of
-            the free plan's usage cap (pro = 50× free, max = 5× pro).
+            Always `pool capacity fraction`: the aggregate is a
+            capacity-weighted mean of the per-key fractions, weighted by
+            the free plan's cap multiples (pro = 50× free, max = 5× pro).
     UnknownPathHint:
       type: object
       required: [error]

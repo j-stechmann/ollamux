@@ -1,6 +1,6 @@
 # Maintainer: Jonathan Stechmann <69059260+j-stechmann@users.noreply.github.com>
 pkgname=ollamux
-pkgver=0.6.0
+pkgver=0.7.0
 pkgrel=1
 pkgdesc='Key-rotating reverse proxy for the Ollama Cloud API'
 url='https://github.com/j-stechmann/ollamux'
@@ -14,9 +14,9 @@ conflicts=(ollamux-bin)
 source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz"
         "ollamux.service::$url/raw/v$pkgver/packaging/ollamux.service"
         "ollamux.1::$url/raw/v$pkgver/packaging/ollamux.1")
-sha256sums=('2e390455dd9c5aa02b4d60e66e66682e1758ce8092da3787ec18d0187ce3232c'
+sha256sums=('d474c46bb5f0663171a9017dfe8b291f3bf4f539671394457ba72e772624e4b9'
             'a88b8011353909db0dfd5947689d840fad5e397a4cbdf4b805257b66a49dadc8'
-            '883b89299661921a301fc543d5b454ad807fb98c520ca8767305af0eb1675700')
+            '887e22720df1a4f00a7f24e3450b7406a44dac2116e08f06111325a302aa2c26')
 options=(!lto)
 
 prepare() {
