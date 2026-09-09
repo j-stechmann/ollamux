@@ -26,10 +26,11 @@
 //!
 //! The tracker also derives a pool-wide aggregate: every key's usage
 //! fraction (a fraction of *its own plan's cap*) is weighted by the plan
-//! tier implied by its concurrency (see `tier_for`) and summed, so the
-//! total reads in free-plan-cap equivalents. Fetching is health-blind, so
-//! keys on cooldown contribute like any other; error rows (e.g. a dead
-//! key's own 401, its expected outcome) carry no numbers and cannot
+//! tier implied by its concurrency (see `tier_for`) and averaged, so the
+//! total reads as the fraction of the pool's combined capacity in use —
+//! a number in [0, 1] like the per-key values. Fetching is health-blind,
+//! so keys on cooldown contribute like any other; error rows (e.g. a
+//! dead key's own 401, its expected outcome) carry no numbers and cannot
 //! contribute.
 
 use crate::pool::Pool;
@@ -51,15 +52,17 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 // Plan-tier weighting. The usage endpoint reports each key's usage as a
-// fraction of that key's own plan cap, so summing raw fractions across a
-// mixed pool is meaningless: a pro key at 81% of its (much larger) cap has
-// burned far more capacity than a free key at 81% of its tiny one. Weight
-// every key's fraction by its plan's cap, expressed in free-plan-cap
-// units, and the aggregate reads as "how many free-plan caps of usage has
-// this pool served". We have no absolute cap numbers, only relative ones:
-// pro has 50x free's cap and max 5x pro's (50 * 5 = 250). Tiers are
-// inferred from the per-key concurrency in the keys file (KEY:N), which
-// matches Ollama Cloud's plan limits (free=1, pro=3, max=10).
+// fraction of that key's own plan cap, so summing or averaging raw
+// fractions across a mixed pool is meaningless: a pro key at 81% of its
+// (much larger) cap has burned far more capacity than a free key at 81%
+// of its tiny one. Weight every key's fraction by its plan's cap,
+// expressed in free-plan-cap units, and take the weighted mean — the
+// aggregate then reads as "what fraction of the pool's combined capacity
+// has been used", in [0, 1] like the per-key numbers. We have no
+// absolute cap numbers, only relative ones: pro has 50x free's cap and
+// max 5x pro's (50 * 5 = 250). Tiers are inferred from the per-key
+// concurrency in the keys file (KEY:N), which matches Ollama Cloud's
+// plan limits (free=1, pro=3, max=10).
 /// Free tier: weight 1.0 — the unit the aggregate is denominated in.
 const FREE_WEIGHT: f64 = 1.0;
 /// Pro tier: 50x free's usage cap.
@@ -298,42 +301,54 @@ impl UsageSnapshot {
     }
 }
 
-/// Pool-wide usage aggregate, weighted by plan tier (see `tier_for`):
-/// the sum of every key's usage fraction times its tier weight, i.e.
-/// usage measured in free-plan-cap equivalents. Windows with no
-/// contributing key are `None` (rendered `null`, never fabricated as 0
-/// or omitted — the envelope's schema has both fields required-nullable,
-/// so serialization must always emit them).
+/// Pool-wide usage aggregate: the capacity-weighted mean of every
+/// contributing key's usage fraction, weighted by plan tier (see
+/// `tier_for`). Like the per-key fractions it stays in [0, 1] and reads
+/// as "the fraction of the pool's combined plan capacity that has been
+/// used" (a single-key pool therefore reproduces that key's own
+/// fraction, so consumers of per-key usage need no adjustment).
+/// Windows with no contributing key are `None` (rendered `null`, never
+/// fabricated as 0 or omitted — the envelope's schema has both fields
+/// required-nullable, so serialization must always emit them).
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
 pub struct UsageAggregate {
     pub session: Option<f64>,
     pub weekly: Option<f64>,
 }
 
-/// Unit label for the aggregate: weights are free-plan-cap multiples, so
-/// the sum reads in free-plan-cap equivalents.
-pub const AGGREGATE_UNIT: &str = "free-plan cap equivalents";
+/// Unit label for the aggregate: a capacity-weighted mean of per-key
+/// fractions, so it reads as the fraction of the pool's combined plan
+/// capacity that has been used.
+pub const AGGREGATE_UNIT: &str = "pool capacity fraction";
 
-/// Round to 3 decimals: upstream fractions carry 3 decimals and tier
-/// weights are integers, so only fp addition noise is trimmed (an
-/// unrounded 0.037 + 0.81 serializes as 0.8470000000000001). Unlike
-/// `pct` there is no [0,1] clamp — a weighted sum legitimately exceeds 1.
+/// Round to 3 decimals. With the mean, the division genuinely produces
+/// more decimals than the wire contract carries (e.g. 202.537/251 =
+/// 0.806920…), so this is a precision cut, not just fp-noise trimming.
+/// Unlike `pct` there is no [0,1] clamp — an upstream fraction above 1.0
+/// would legitimately surface.
 fn round3(v: f64) -> f64 {
     (v * 1000.0).round() / 1000.0
 }
 
-/// Aggregate a snapshot across all ok rows, weighted by the tier each
-/// key's concurrency implies (`concurrencies` is index-aligned with
-/// `snap.keys`). Every key participates regardless of pool health —
+/// Aggregate a snapshot across all ok rows as the capacity-weighted mean
+/// over the tier weights implied by each key's concurrency
+/// (`concurrencies` is index-aligned with `snap.keys`): each window's
+/// weighted sum is divided by the summed weights of exactly the keys
+/// that reported it, so the result is a fraction in [0, 1] like the
+/// per-key values (weights are all >= 1, so the divisor never vanishes).
+/// Every key participates regardless of pool health —
 /// cooldown/dead state never touches usage fetching, so cooling keys
 /// contribute like any other; error rows (`ok:false`, e.g. a dead key's
 /// own 401 on /api/usage, its expected outcome) carry no numbers and
-/// cannot contribute. A window only some keys report is summed over
-/// exactly those keys; a window no ok row reports stays `None` (never
-/// fabricated as 0).
+/// cannot contribute. A window only some keys report is averaged over
+/// exactly those keys (their weights form the denominator, so dead
+/// keys never dilute the number); a window no ok row reports stays
+/// `None` (never fabricated as 0).
 pub fn aggregate(snap: &UsageSnapshot, concurrencies: &[u32]) -> UsageAggregate {
     let mut session = 0.0f64;
     let mut weekly = 0.0f64;
+    let mut session_w = 0.0f64;
+    let mut weekly_w = 0.0f64;
     let mut session_seen = false;
     let mut weekly_seen = false;
     for k in &snap.keys {
@@ -342,17 +357,19 @@ pub fn aggregate(snap: &UsageSnapshot, concurrencies: &[u32]) -> UsageAggregate 
         if k.ok {
             if let Some(s) = k.session {
                 session += s * weight;
+                session_w += weight;
                 session_seen = true;
             }
             if let Some(w) = k.weekly {
                 weekly += w * weight;
+                weekly_w += weight;
                 weekly_seen = true;
             }
         }
     }
     UsageAggregate {
-        session: session_seen.then(|| round3(session)),
-        weekly: weekly_seen.then(|| round3(weekly)),
+        session: session_seen.then(|| round3(session / session_w)),
+        weekly: weekly_seen.then(|| round3(weekly / weekly_w)),
     }
 }
 
@@ -996,37 +1013,46 @@ mod tests {
 
     #[test]
     fn aggregate_weights_by_tier() {
-        // free(1) at 3.7% + max(250) at 81% = 202.537 free-cap units.
+        // free(1) at 3.7% + max(250) at 81%: the weighted mean is
+        // (0.037*1 + 0.81*250) / 251 = 0.807 — the max key dominates,
+        // and the number stays in [0, 1].
         let snap = agg_snap(vec![
             agg_row(0, true, Some(0.037), Some(0.007)),
             agg_row(1, true, Some(0.81), Some(0.42)),
         ]);
         let a = aggregate(&snap, &[1, 10]);
-        assert_eq!(a.session, Some(202.537), "0.037*1 + 0.81*250");
-        assert_eq!(a.weekly, Some(105.007), "0.007*1 + 0.42*250");
+        assert_eq!(a.session, Some(0.807), "(0.037*1 + 0.81*250) / 251");
+        assert_eq!(a.weekly, Some(0.418), "(0.007*1 + 0.42*250) / 251");
     }
 
     #[test]
     fn aggregate_adds_up_across_tiers_without_fp_noise() {
         // The classic fp trap: 0.037 + 0.81 raw-sums to
-        // 0.8470000000000001; round3 must render the honest 0.847.
+        // 0.8470000000000001; round3 must render the honest mean 0.424
+        // ((0.037 + 0.81) / 2 with equal weights).
         let snap = agg_snap(vec![
             agg_row(0, true, Some(0.037), None),
             agg_row(1, true, Some(0.81), None),
         ]);
         let a = aggregate(&snap, &[1, 1]);
-        assert_eq!(a.session, Some(0.847));
+        assert_eq!(a.session, Some(0.424));
         assert_eq!(a.weekly, None, "window nobody reported stays null");
     }
 
     #[test]
     fn aggregate_excludes_error_rows_and_nulls_when_all_fail() {
+        // Only the ok row contributes, and a single contributor's
+        // weighted mean is exactly its own fraction.
         let snap = agg_snap(vec![
             agg_row(0, false, None, None),
             agg_row(1, true, Some(0.5), None),
         ]);
         let a = aggregate(&snap, &[3, 3]);
-        assert_eq!(a.session, Some(25.0), "0.5 * pro weight, error row skipped");
+        assert_eq!(
+            a.session,
+            Some(0.5),
+            "0.5 * pro weight / pro weight, error row skipped"
+        );
         assert_eq!(a.weekly, None);
         // No ok row at all → both windows null, never 0.
         let snap = agg_snap(vec![agg_row(0, false, None, None)]);
@@ -1035,9 +1061,10 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_sums_window_only_over_rows_that_report_it() {
+    fn aggregate_averages_window_only_over_rows_that_report_it() {
         // Mixed report: key 0 has session only, key 1 weekly only — each
-        // window sums over exactly its contributors ("never fabricate").
+        // window averages over exactly its contributors ("never
+        // fabricate"), and the per-window denominator follows them.
         let snap = agg_snap(vec![
             agg_row(0, true, Some(0.4), None),
             agg_row(1, true, None, Some(0.2)),
@@ -1079,7 +1106,7 @@ mod tests {
         let snap = t.get();
         assert!(snap.keys[0].ok, "cooldown key's usage fetch must succeed");
         let a = aggregate(&snap, &[3, 1]);
-        assert_eq!(a.session, Some(25.1), "0.5*50 + 0.1*1");
-        assert_eq!(a.weekly, Some(10.1), "0.2*50 + 0.1*1");
+        assert_eq!(a.session, Some(0.492), "(0.5*50 + 0.1*1) / 51");
+        assert_eq!(a.weekly, Some(0.198), "(0.2*50 + 0.1*1) / 51");
     }
 }

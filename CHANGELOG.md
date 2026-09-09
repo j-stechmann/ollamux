@@ -5,6 +5,25 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- Breaking: the `/_usage` `aggregate` is now the **capacity-weighted
+  mean** of the reporting keys' usage fractions (each fraction weighted
+  by its tier's cap — free ×1, pro ×50, max ×250 — summed and divided by
+  the summed weights of exactly the keys that reported the window), so
+  it stays in 0.0–1.0 like the per-key rows: a single-key pool
+  reproduces that key's own fraction and consumers of the per-key range
+  need no adjustment. Previously the aggregate was the weighted *sum* in
+  free-plan-cap equivalents (e.g. 202.537 for a free key at 3.7% plus a
+  max key at 81%; the same pool now reports 0.807, "pool capacity
+  fraction"). Error rows still contribute nothing and their weight is
+  excluded from the denominator; all other semantics (cooldown keys
+  included, unreported windows `null`, 3-decimal rounding) are
+  unchanged. The `unit` field changed from `free-plan cap equivalents`
+  to `pool capacity fraction`.
+
 ## [0.6.0] - 2026-09-06
 
 ### Added

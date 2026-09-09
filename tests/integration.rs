@@ -572,14 +572,14 @@ fn usage_endpoint_aggregates_per_key_without_secrets() {
     assert_eq!(row_b["session_pct"], 81.0);
     assert_eq!(row_b["tier"], json_str("free"), "{body}");
 
-    // Aggregate: both keys are free tier (weight 1), so the sum is the
-    // plain weighted sum — 0.037 + 0.81 rounded to 3 decimals (the raw
-    // fp sum would print 0.8470000000000001).
-    assert_eq!(v["aggregate"]["session"], 0.847, "{body}");
-    assert_eq!(v["aggregate"]["weekly"], 0.427, "{body}");
+    // Aggregate: both keys are free tier (weight 1), so the weighted
+    // mean is the plain mean — (0.037 + 0.81) / 2, rounded to 3 decimals
+    // (the raw fp sum would print 0.8470000000000001 before the divide).
+    assert_eq!(v["aggregate"]["session"], 0.424, "{body}");
+    assert_eq!(v["aggregate"]["weekly"], 0.214, "{body}");
     assert_eq!(
         v["aggregate"]["unit"],
-        json_str("free-plan cap equivalents"),
+        json_str("pool capacity fraction"),
         "{body}"
     );
 
@@ -589,9 +589,9 @@ fn usage_endpoint_aggregates_per_key_without_secrets() {
 }
 
 /// Mixed-tier pool: tier is inferred from per-key concurrency (KEY:N →
-/// free=1, pro=3, max=10) and the aggregate weights each key's usage
-/// fraction by its tier's cap, expressed in free-plan-cap units
-/// (free ×1, pro ×50, max ×250 = 5× pro).
+/// free=1, pro=3, max=10) and the aggregate is the capacity-weighted
+/// mean of each key's usage fraction, weights in free-plan-cap units
+/// (free ×1, max ×250 = 5× pro).
 #[test]
 fn usage_aggregate_weights_keys_by_inferred_tier() {
     let payload_free = usage_body(0.037, 0.007, "gpt-oss:120b", 42, "$1.23");
@@ -619,11 +619,11 @@ fn usage_aggregate_weights_keys_by_inferred_tier() {
     let row_b = rows.iter().find(|r| r["suffix"] == "5678").unwrap();
     assert_eq!(row_b["tier"], json_str("max"), "{body}");
 
-    // Weighted aggregate in free-plan-cap units:
-    //   session 0.037×1 + 0.81×250 = 202.537
-    //   weekly  0.007×1 + 0.42×250 = 105.007
-    assert_eq!(v["aggregate"]["session"], 202.537, "{body}");
-    assert_eq!(v["aggregate"]["weekly"], 105.007, "{body}");
+    // Capacity-weighted mean in [0, 1] like the per-key fractions:
+    //   session (0.037×1 + 0.81×250) / (1 + 250) = 202.537 / 251 = 0.807
+    //   weekly  (0.007×1 + 0.42×250) / (1 + 250) = 105.007 / 251 = 0.418
+    assert_eq!(v["aggregate"]["session"], 0.807, "{body}");
+    assert_eq!(v["aggregate"]["weekly"], 0.418, "{body}");
     // No secret ever.
     assert!(!body.contains("omk-abcd1234"), "secret leaked: {body}");
     assert!(!body.contains("omk-efgh5678"), "secret leaked: {body}");
