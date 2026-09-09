@@ -928,7 +928,7 @@ fn curated_response_headers(resp: &ureq::Response) -> Vec<(String, String)> {
 
 /// Render a usage snapshot as the /_usage response body: envelope with
 /// freshness, one row per pool key (ok:data or ok:false + error), and a
-/// pool-wide tier-weighted aggregate. Key count comes from the pool so a
+/// pool-wide capacity-weighted aggregate. Key count comes from the pool so a
 /// snapshot older than a keys-file change (impossible — keys are fixed at
 /// startup, but be defensive) rows as failures rather than truncating
 /// silently.

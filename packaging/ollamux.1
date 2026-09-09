@@ -97,7 +97,7 @@ l l.
 /api/*|Proxied to https://ollama.com with key rotation
 /v1/*|Proxied (OpenAI-compatible surface) with rotation
 /_keys|Per-key health JSON (key suffixes only, no secrets; tier + embeds latest known usage when a usage snapshot exists)
-/_usage|Per-key usage JSON from the (undocumented) GET /api/usage upstream endpoint, fan-out across all keys, 60s cache, plus a tier-weighted pool aggregate; ?refresh=1 forces a refresh (rate-limited to one fetch attempt per 5s)
+/_usage|Per-key usage JSON from the (undocumented) GET /api/usage upstream endpoint, fan-out across all keys, 60s cache, plus a pool-capacity aggregate; ?refresh=1 forces a refresh (rate-limited to one fetch attempt per 5s)
 /_health|Liveness JSON: {"ok":...,"keys":...,"total_slots":...}
 .TE
 .PP
@@ -114,11 +114,13 @@ health: a 401 there is reported in /_usage but does not mark the key
 dead. /_keys is a pure in-memory read and never triggers upstream usage
 calls. Each key's plan tier is inferred from its per-key concurrency
 (free=1, pro=3, max=10; more concurrency than normal is the next tier
-up), and /_usage also reports the pool-wide sum of every key's fraction
-weighted by its tier's cap (free \(mu1, pro \(mu50, max \(mu250), in
-free-plan-cap equivalents \(em including keys on cooldown; a dead key
-is expected to fail its own usage fetch the same way and contributes
-nothing.
+up), and /_usage also reports the pool-wide capacity-weighted mean of
+every reporting key's fraction weighted by its tier's cap (free
+\(mu1, pro \(mu50, max \(mu250) \(em a fraction in 0.0\(en1.0 like the
+per-key numbers, so a single-key pool reproduces that key's own
+fraction \(em including keys on cooldown; a dead key is expected to
+fail its own usage fetch the same way and contributes nothing (its
+weight is excluded from the denominator).
 .SH QUOTA-AWARE KEY SELECTION
 With
 .B \-\-usage-aware[= \fIPCT \fR]
