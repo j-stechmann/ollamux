@@ -1,3 +1,12 @@
+ollamux (0.7.0-1) unstable; urgency=medium
+
+  * Changed (breaking): /_usage `aggregate` is now the capacity-weighted
+    mean of the reporting keys' usage fractions (stays in 0.0-1.0 like
+    per-key rows) instead of the weighted sum in free-plan-cap
+    equivalents; the `unit` field changed to `pool capacity fraction`.
+
+ -- Jonathan Stechmann <69059260+j-stechmann@users.noreply.github.com>  Wed, 09 Sep 2026 12:00:00 +0000
+
 ollamux (0.6.0-1) unstable; urgency=medium
 
   * New: /_usage pool-wide usage aggregate, tier-weighted by each key's

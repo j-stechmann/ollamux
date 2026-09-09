@@ -9,7 +9,7 @@
 openapi: 3.0.3
 info:
   title: ollamux
-  version: 0.6.0
+  version: 0.7.0
   license:
     name: GPL-2.0-or-later
     url: https://github.com/j-stechmann/ollamux/blob/master/LICENSE
@@ -621,7 +621,7 @@ components:
         Present on every response, including relayed upstream errors:
         `ollamux/<version>` — lets a client tell ollamux apart from a real
         Ollama server or a CDN error page.
-      schema: {type: string, example: 'ollamux/0.6.0'}
+      schema: {type: string, example: 'ollamux/0.7.0'}
     X-Ollamux-Key:
       description: >
         Suffix of the pool key that served the request. Present only when a
@@ -650,7 +650,7 @@ components:
       required: [service, version, ok, keys, total_slots]
       properties:
         service: {type: string, enum: [ollamux]}
-        version: {type: string, example: '0.6.0'}
+        version: {type: string, example: '0.7.0'}
         ok:
           type: boolean
           description: True when at least one key is selectable right now.
