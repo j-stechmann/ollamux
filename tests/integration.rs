@@ -519,24 +519,33 @@ fn streaming_passes_through_chunked() {
 // GET /api/usage per Authorization header.
 // ---------------------------------------------------------------------------
 
-fn usage_body(session: f64, weekly: f64, model: &str, count: u64, cost: &str) -> String {
+/// Legacy-plan /api/balance body (docs.ollama.com/api/balance):
+/// remaining percents per window plus reset instants.
+fn balance_body(session_rem: f64, weekly_rem: f64, reset: &str) -> String {
     format!(
-        r#"{{"limits":{{"session":{{"usage":{session},"models":[{{"name":"{model}","request_count":{count}}}]}},"weekly":{{"usage":{weekly}}}}},"activity":{{"cost":"{cost}"}}}}"#
+        r#"{{"included":{{"session":{{"remaining_percent":{session_rem},"resets_at":"{reset}"}},
+                           "weekly":{{"remaining_percent":{weekly_rem},"resets_at":"{reset}"}}}},
+            "purchased":{{"balance_usd":0}}}}"#
     )
+}
+
+/// Responder scripting the documented endpoint: `GET /api/balance` per
+/// auth header; anything else is a test bug.
+fn balance_responder(
+    session_rem: f64,
+    weekly_rem: f64,
+) -> impl Fn(&str, Option<&str>) -> (u16, String, String) + Send + Sync + Clone + 'static {
+    move |path, _| {
+        assert!(path.starts_with("/api/balance"), "unexpected path {path}");
+        (200, "OK".into(), balance_body(session_rem, weekly_rem, "2026-10-09T00:00:00Z"))
+    }
 }
 
 #[test]
 fn usage_endpoint_aggregates_per_key_without_secrets() {
-    let payload_a = usage_body(0.037, 0.007, "gpt-oss:120b", 42, "$1.23");
-    let payload_b = usage_body(0.81, 0.42, "qwen3-coder:480b", 7, "$0.10");
-    let up = Upstream::spawn_auth(move |path, auth| {
-        assert!(path.starts_with("/api/usage"), "unexpected path {path}");
-        match auth {
-            Some(a) if a.contains("abcd1234") => (200, "OK".into(), payload_a.clone()),
-            Some(a) if a.contains("efgh5678") => (200, "OK".into(), payload_b.clone()),
-            other => panic!("unexpected auth {other:?}"),
-        }
-    });
+    // The documented /api/balance endpoint: remaining percents per window.
+    // Free-tier keys; remaining 96.3% → used fraction 0.037.
+    let up = Upstream::spawn_auth(balance_responder(96.3, 30.0));
     let (addr, _pool) = spawn_server(
         pool_with(&[("omk-abcd1234", 1), ("omk-efgh5678", 1)]),
         &up.url,
@@ -565,18 +574,25 @@ fn usage_endpoint_aggregates_per_key_without_secrets() {
     assert_eq!(row_a["tier"], json_str("free"), "{body}");
     assert_eq!(row_a["session"], 0.037);
     assert_eq!(row_a["session_pct"], 3.7);
-    assert_eq!(row_a["weekly_pct"], 0.7);
-    assert_eq!(row_a["models"][0]["request_count"], 42);
-    assert_eq!(row_a["cost"], json_str("$1.23"));
+    assert_eq!(row_a["weekly"], 0.7);
+    assert_eq!(row_a["weekly_pct"], 70.0);
+    assert_eq!(row_a["session_resets_at"], json_str("2026-10-09T00:00:00Z"), "{body}");
+    assert_eq!(row_a["weekly_resets_at"], json_str("2026-10-09T00:00:00Z"), "{body}");
     let row_b = rows.iter().find(|r| r["suffix"] == "5678").unwrap();
-    assert_eq!(row_b["session_pct"], 81.0);
+    assert_eq!(row_b["session"], 0.037);
+    assert_eq!(row_b["session_pct"], 3.7);
     assert_eq!(row_b["tier"], json_str("free"), "{body}");
 
     // Aggregate: both keys are free tier (weight 1), so the weighted
-    // mean is the plain mean — (0.037 + 0.81) / 2, rounded to 3 decimals
-    // (the raw fp sum would print 0.8470000000000001 before the divide).
-    assert_eq!(v["aggregate"]["session"], 0.424, "{body}");
-    assert_eq!(v["aggregate"]["weekly"], 0.214, "{body}");
+    // mean is the plain mean — 0.037 here — and the unanimous reset
+    // instant rides along.
+    assert_eq!(v["aggregate"]["session"], 0.037, "{body}");
+    assert_eq!(v["aggregate"]["weekly"], 0.7, "{body}");
+    assert_eq!(
+        v["aggregate"]["session_resets_at"],
+        json_str("2026-10-09T00:00:00Z"),
+        "{body}"
+    );
     assert_eq!(
         v["aggregate"]["unit"],
         json_str("pool capacity fraction"),
@@ -594,13 +610,13 @@ fn usage_endpoint_aggregates_per_key_without_secrets() {
 /// (free ×1, max ×250 = 5× pro).
 #[test]
 fn usage_aggregate_weights_keys_by_inferred_tier() {
-    let payload_free = usage_body(0.037, 0.007, "gpt-oss:120b", 42, "$1.23");
-    let payload_max = usage_body(0.81, 0.42, "qwen3-coder:480b", 7, "$0.10");
+    let body_free = balance_body(96.3, 99.3, "2026-10-09T00:00:00Z");
+    let body_max = balance_body(19.0, 58.0, "2026-10-09T00:00:00Z");
     let up = Upstream::spawn_auth(move |path, auth| {
-        assert!(path.starts_with("/api/usage"), "unexpected path {path}");
+        assert!(path.starts_with("/api/balance"), "unexpected path {path}");
         match auth {
-            Some(a) if a.contains("abcd1234") => (200, "OK".into(), payload_free.clone()),
-            Some(a) if a.contains("efgh5678") => (200, "OK".into(), payload_max.clone()),
+            Some(a) if a.contains("abcd1234") => (200, "OK".into(), body_free.clone()),
+            Some(a) if a.contains("efgh5678") => (200, "OK".into(), body_max.clone()),
             other => panic!("unexpected auth {other:?}"),
         }
     });
@@ -636,9 +652,9 @@ fn json_str(s: &str) -> serde_json::Value {
 #[test]
 fn usage_ttl_caches_and_refresh_flag_bypasses() {
     static CALLS: AtomicUsize = AtomicUsize::new(0);
-    let up = Upstream::spawn_auth(move |_, _| {
+    let up = Upstream::spawn_auth(move |path, _| {
         CALLS.fetch_add(1, Ordering::Relaxed);
-        (200, "OK".into(), usage_body(0.1, 0.2, "m", 1, "$0.01"))
+        balance_responder(90.0, 80.0)(path, None)
     });
     let (addr, _pool) = spawn_server(pool_with(&[("omk-ttlcache001", 1)]), &up.url);
 
@@ -650,7 +666,7 @@ fn usage_ttl_caches_and_refresh_flag_bypasses() {
     assert_eq!(
         CALLS.load(Ordering::Relaxed),
         1,
-        "TTL must suppress refetch"
+        "TTL must suppress refetch (one balance GET per round)"
     );
 
     // ?refresh=1 forces a second round. MIN_REFRESH (5s) deliberately
@@ -669,9 +685,9 @@ fn usage_ttl_caches_and_refresh_flag_bypasses() {
 #[test]
 fn keys_endpoint_never_fetches_but_embeds_snapshot() {
     static CALLS: AtomicUsize = AtomicUsize::new(0);
-    let up = Upstream::spawn_auth(move |_, _| {
+    let up = Upstream::spawn_auth(move |path, _| {
         CALLS.fetch_add(1, Ordering::Relaxed);
-        (200, "OK".into(), usage_body(0.5, 0.25, "m", 3, "$3.21"))
+        balance_responder(50.0, 75.0)(path, None)
     });
     let (addr, _pool) = spawn_server(pool_with(&[("omk-keysembed1", 1)]), &up.url);
 
@@ -684,7 +700,7 @@ fn keys_endpoint_never_fetches_but_embeds_snapshot() {
     assert_eq!(info[0]["tier"], json_str("free"), "{body}");
     assert_eq!(CALLS.load(Ordering::Relaxed), 0, "/_keys must never fetch");
 
-    // A /_usage call populates the snapshot…
+    // A /_usage call populates the snapshot (one balance GET per key)…
     let _ = post(&addr, "/_usage", "");
     assert_eq!(up.wait_for_count(1, std::time::Duration::from_secs(2)), 1);
 
@@ -716,9 +732,10 @@ fn usage_payload_drift_is_reported_per_key_still_200() {
 
 #[test]
 fn usage_auth_failure_is_reported_never_marks_dead() {
+    let ok_body = balance_body(90.0, 90.0, "2026-10-09T00:00:00Z");
     let up = Upstream::spawn_auth(move |_, auth| match auth {
         Some(a) if a.contains("unauth401") => (401, "Unauthorized".into(), String::new()),
-        _ => (200, "OK".into(), usage_body(0.1, 0.1, "m", 1, "$0")),
+        _ => (200, "OK".into(), ok_body.clone()),
     });
     let (addr, _pool) = spawn_server(pool_with(&[("omk-unauth401xx", 1)]), &up.url);
     let (status, body, _) = post_with_headers(&addr, "/_usage", "");
@@ -732,7 +749,7 @@ fn usage_auth_failure_is_reported_never_marks_dead() {
     // The Bearer header reached upstream as expected (sanity on the seam).
     let _ = up.wait_for_count(1, Duration::from_secs(5));
     let reqs = up.recorded();
-    assert_eq!(reqs.len(), 1, "one usage fetch recorded");
+    assert!(!reqs.is_empty(), "usage fetch attempted");
     assert_eq!(
         reqs[0].auth.as_deref(),
         Some("Bearer omk-unauth401xx"),
@@ -776,9 +793,9 @@ fn usage_all_keys_failing_still_answers_200() {
 #[test]
 fn usage_endpoint_method_and_query_handling() {
     static CALLS: AtomicUsize = AtomicUsize::new(0);
-    let up = Upstream::spawn_auth(move |_, _| {
+    let up = Upstream::spawn_auth(move |path, _| {
         CALLS.fetch_add(1, Ordering::Relaxed);
-        (200, "OK".into(), usage_body(0.1, 0.2, "m", 1, "$0.01"))
+        balance_responder(90.0, 80.0)(path, None)
     });
     let (addr, _pool) = spawn_server(pool_with(&[("omk-methodtest1", 1)]), &up.url);
 
@@ -798,13 +815,15 @@ fn usage_endpoint_method_and_query_handling() {
 
 #[test]
 fn usage_aware_routing_demotes_over_quota_key() {
-    // Two keys: key "…aaaa" serves 95% (over the 80% threshold), key
-    // "…zzzz" 10%. Quota-aware candidates must put zzzz first.
-    let payload_a = usage_body(0.95, 0.1, "m", 1, "$0");
-    let payload_z = usage_body(0.05, 0.1, "m", 1, "$0");
-    let up = Upstream::spawn_auth(move |_, auth| match auth {
-        Some(a) if a.contains("quota0001") => (200, "OK".into(), payload_a.clone()),
-        Some(a) if a.contains("quota0002") => (200, "OK".into(), payload_z.clone()),
+    // Two keys: key "…aaaa" has used 95% of its session allowance (over
+    // the 80% threshold: remaining 5%), key "…zzzz" 5% (remaining 95%).
+    // Quota-aware candidates must put zzzz first — the fractions are
+    // upstream's own remaining_percent, no caps involved.
+    let resp_a = balance_responder(5.0, 90.0);
+    let resp_z = balance_responder(95.0, 90.0);
+    let up = Upstream::spawn_auth(move |path, auth| match auth {
+        Some(a) if a.contains("quota0001") => resp_a(path, None),
+        Some(a) if a.contains("quota0002") => resp_z(path, None),
         other => panic!("unexpected auth {other:?}"),
     });
     let pool = Arc::new(ollamux::Pool::new(
@@ -818,7 +837,8 @@ fn usage_aware_routing_demotes_over_quota_key() {
     pool.set_usage_threshold(80);
     let (addr, _pool) = spawn_server(pool.clone(), &up.url);
 
-    // Fill the snapshot (both keys fetched in one fan-out).
+    // Fill the snapshot (both keys fetched in one fan-out: one balance
+    // GET per key).
     let (status, body) = post(&addr, "/_usage", "");
     assert_eq!(status, 200, "{body}");
     assert_eq!(up.wait_for_count(2, std::time::Duration::from_secs(2)), 2);

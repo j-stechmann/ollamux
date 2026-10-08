@@ -307,7 +307,14 @@ ENDPOINTS:
     /_usage         per-key Ollama Cloud usage JSON plus a pool-capacity
                     aggregate (?refresh=1 forces, at most one fetch
                     attempt per 5 s)
-    /_health        liveness JSON",
+    /_health        liveness JSON
+
+USAGE SOURCE:
+    /_usage reads the documented per-key balance endpoint
+    (docs.ollama.com/api/balance): legacy plans carry session/weekly
+    remaining percents + reset instants; credit plans carry USD amounts.
+    Polled at most once per 60 s (upstream allows 10 req/min per user,
+    shared across keys).",
         ollamux::VERSION
     );
 }

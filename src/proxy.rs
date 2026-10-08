@@ -142,6 +142,8 @@ impl Server {
     }
 
     /// Serve one request.
+    /// Set the usage tracker's per-tier caps (startup wiring). Consumes
+    /// and returns the server for chaining with `with_upstream`.
     pub fn handle(&self, req: tiny_http::Request) {
         let id = REQ_ID.fetch_add(1, Ordering::Relaxed);
         let started = Instant::now();
@@ -973,10 +975,12 @@ fn usage_json(snap: &crate::usage::UsageSnapshot, pool: &Pool) -> String {
         "updated": updated,
         "age_s": age_s,
         "stale": stale,
-        "session_window": "about 5 hours (rolling; no reset timestamps upstream)",
+        "session_window": "plan session window (reset timestamps upstream; poll courtesy 60 s)",
         "aggregate": {
             "session": agg.session,
             "weekly": agg.weekly,
+            "session_resets_at": agg.session_resets_at,
+            "weekly_resets_at": agg.weekly_resets_at,
             "unit": crate::usage::AGGREGATE_UNIT,
         },
         "keys": keys,

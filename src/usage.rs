@@ -1,22 +1,37 @@
-//! Usage introspection for the undocumented Ollama Cloud usage endpoint.
+//! Usage introspection for Ollama Cloud's **documented** balance endpoint.
 //!
-//! `GET https://ollama.com/api/usage` (undocumented; the same one the
-//! ollama.com settings page uses) answers, per API key, with a JSON body
-//! roughly shaped like:
+//! `GET https://ollama.com/api/balance` (docs.ollama.com/api/balance)
+//! answers, per API key, with the plan's remaining allowance. Two shapes
+//! exist, chosen by `included`'s members:
+//!
+//! - Legacy plans (session/weekly limits) — the common case:
 //!
 //! ```json
-//! {"limits":{"session":{"usage":0.037,"models":[…]},
-//!            "weekly": {"usage":0.007,"models":[…]}},
-//!  "activity":{"cost":"$1.23"}}
+//! {"included":{"session":{"remaining_percent":75,"resets_at":"2026-10-01T07:00:00Z"},
+//!              "weekly": {"remaining_percent":40,"resets_at":"2026-10-05T00:00:00Z"}},
+//!  "purchased":{"balance_usd":25}}
 //! ```
 //!
-//! `usage` is a *fraction of the plan cap* (0.0–1.0), not a token count,
-//! `models[].request_count` is a request count, and there are no reset
-//! timestamps (the session window rolls over roughly every 5 hours).
+//! - Credit plans (usage in USD):
 //!
-//! The endpoint is undocumented and may change or disappear at any time:
-//! decoding is therefore maximally tolerant — any shape drift becomes a
-//! per-key error string in `/_usage`, never a panic, never a 5xx.
+//! ```json
+//! {"included":{"balance_usd":72.5,"allowance_usd":100,
+//!              "period":{"from":"…","until":"…"}},
+//!  "purchased":{"balance_usd":25}}
+//! ```
+//!
+//! For legacy plans the usage fraction is the *real* plan limit straight
+//! from upstream: `1 - remaining_percent/100`, with the next reset time
+//! included — no configured caps, no invented denominators. For credit
+//! plans there is no percent-to-report (credits drain in USD); those rows
+//! surface the amounts and the panel decides what to show. ollamux
+//! supports both; the aggregate covers legacy rows only.
+//!
+//! The endpoint is rate-limited to 10 requests per minute per user
+//! (shared across keys) and the docs recommend polling once per minute —
+//! USAGE_TTL (60 s) matches exactly. Decoding is maximally tolerant: any
+//! shape drift becomes a per-key error string in `/_usage`, never a
+//! panic, never a 5xx.
 //!
 //! Introspection is strictly read-only: usage fetches consume no pool
 //! slots, and an auth failure here is *reported*, never `mark_dead` (only
@@ -25,9 +40,9 @@
 //! a pure in-memory read that merely renders the latest snapshot.
 //!
 //! The tracker also derives a pool-wide aggregate: every key's usage
-//! fraction (a fraction of *its own plan's cap*) is weighted by the plan
-//! tier implied by its concurrency (see `tier_for`) and averaged, so the
-//! total reads as the fraction of the pool's combined capacity in use —
+//! fraction (a fraction of *its own plan's allowance*) is weighted by the
+//! plan tier implied by its concurrency (see `tier_for`) and averaged, so
+//! the total reads as the fraction of the pool's combined capacity in use —
 //! a number in [0, 1] like the per-key values. Fetching is health-blind,
 //! so keys on cooldown contribute like any other; error rows (e.g. a
 //! dead key's own 401, its expected outcome) carry no numbers and cannot
@@ -38,7 +53,9 @@ use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Serve-at-most-this-age snapshot before a refresh is considered. The
-/// session window resets ~5h, so polling harder buys nothing.
+/// balance docs recommend polling once per minute (10 req/min limit
+/// shared across keys), so this doubles as the upstream rate-limit
+/// courtesy.
 pub const USAGE_TTL: Duration = Duration::from_secs(60);
 /// Minimum interval between upstream fetch attempts: gates forced
 /// refreshes (`?refresh=1` spam guard) and backs off revalidation after
@@ -96,113 +113,138 @@ fn lock_unpoisoned<'a, T>(
 }
 
 // ---------------------------------------------------------------------------
-// Wire model (tolerant decode of the undocumented payload)
+// Wire model (tolerant decode of the documented /api/balance payload)
 // ---------------------------------------------------------------------------
 
-/// One model's request tally inside a usage window.
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
-pub struct ModelUsage {
-    pub name: String,
-    pub request_count: u64,
+/// A legacy-plan limit window: percent of the plan's allowance *remaining*
+/// (0–100, upstream's own number) and the next reset instant (UTC, present
+/// whenever upstream knows one). `remaining` is None when the field is
+/// absent or non-finite — absence is "unknown", never 0%.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BalanceLimit {
+    /// Percent of the window's allowance remaining (0.0–100.0).
+    pub remaining_percent: Option<f64>,
+    /// Next reset instant (ISO-8601 UTC), when upstream publishes one.
+    pub resets_at: Option<String>,
 }
 
-impl<'de> serde::Deserialize<'de> for ModelUsage {
+impl<'de> serde::Deserialize<'de> for BalanceLimit {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         #[derive(serde::Deserialize)]
         struct Parts {
             #[serde(default)]
-            name: Option<String>,
-            #[serde(default, alias = "request_count", alias = "count")]
-            request_count: Option<u64>,
+            remaining_percent: Option<f64>,
+            #[serde(default)]
+            resets_at: Option<String>,
         }
         let p = Parts::deserialize(d)?;
-        Ok(ModelUsage {
-            name: p.name.unwrap_or_default(),
-            request_count: p.request_count.unwrap_or(0),
+        Ok(BalanceLimit {
+            remaining_percent: p.remaining_percent.filter(|v| v.is_finite()),
+            resets_at: p.resets_at,
         })
     }
 }
 
-/// One metered window (session or weekly). `usage` is a fraction 0.0–1.0
-/// of the plan's cap; absent → `None` (rendered as `null`, not 0.0).
-#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
-pub struct UsageWindow {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub usage: Option<f64>,
-    /// Top models of the window (upstream may omit them entirely).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub models: Vec<ModelUsage>,
+impl BalanceLimit {
+    /// The used fraction in [0, 1] (1 − remaining/100), clamped into range
+    /// against upstream rounding drift; None when the percent is absent.
+    fn used_fraction(&self) -> Option<f64> {
+        self.remaining_percent.map(|r| ((100.0 - r) / 100.0).clamp(0.0, 1.0))
+    }
 }
 
-impl<'de> serde::Deserialize<'de> for UsageWindow {
+/// A credit-plan `included` object: USD amounts for the current period.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct IncludedBalance {
+    pub balance_usd: Option<f64>,
+    pub allowance_usd: Option<f64>,
+}
+
+impl<'de> serde::Deserialize<'de> for IncludedBalance {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         #[derive(serde::Deserialize)]
-        struct Parts {
+        struct Wire {
             #[serde(default)]
-            usage: Option<f64>,
+            balance_usd: Option<f64>,
             #[serde(default)]
-            models: Option<Vec<ModelUsage>>,
+            allowance_usd: Option<f64>,
         }
-        let p = Parts::deserialize(d)?;
-        Ok(UsageWindow {
-            usage: p.usage.filter(|u| u.is_finite()),
-            models: p.models.unwrap_or_default(),
+        let w = Wire::deserialize(d)?;
+        Ok(IncludedBalance {
+            balance_usd: w.balance_usd.filter(|v| v.is_finite()),
+            allowance_usd: w.allowance_usd.filter(|v| v.is_finite()),
         })
     }
 }
 
-/// Decoded `/api/usage` payload. Every field is optional: shape drift on
-/// the undocumented endpoint degrades to a per-key error, never a panic.
-#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+/// Decoded `/api/balance` payload. Legacy and credit shapes share the
+/// envelope (`included` + `purchased`); which one arrived is decided by
+/// `included`'s members. Everything optional: shape drift degrades to a
+/// per-key error, never a panic.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct UsagePayload {
-    pub session: UsageWindow,
-    pub weekly: UsageWindow,
-    /// Reported 4-week rolling cost, passed through verbatim when present.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cost: Option<String>,
+    /// Legacy-plan windows (session/weekly remaining percents + resets).
+    pub session: Option<BalanceLimit>,
+    pub weekly: Option<BalanceLimit>,
+    /// Credit-plan included USD amounts (absent on legacy plans).
+    pub included_usd: Option<IncludedBalance>,
+    /// Remaining unexpired purchased credits, when the account has any.
+    pub purchased_usd: Option<f64>,
 }
 
 impl<'de> serde::Deserialize<'de> for UsagePayload {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         #[derive(serde::Deserialize, Default)]
-        struct Limits {
+        struct Included {
             #[serde(default)]
-            session: Option<UsageWindow>,
+            session: Option<BalanceLimit>,
             #[serde(default)]
-            weekly: Option<UsageWindow>,
+            weekly: Option<BalanceLimit>,
+            #[serde(default)]
+            balance_usd: Option<f64>,
+            #[serde(default)]
+            allowance_usd: Option<f64>,
         }
-        #[derive(serde::Deserialize)]
-        struct Activity {
+        #[derive(serde::Deserialize, Default)]
+        struct Purchased {
             #[serde(default)]
-            cost: Option<String>,
+            balance_usd: Option<f64>,
         }
         #[derive(serde::Deserialize)]
         struct Wire {
             #[serde(default)]
-            limits: Option<Limits>,
+            included: Option<Included>,
             #[serde(default)]
-            activity: Option<Activity>,
+            purchased: Option<Purchased>,
             // Absorb unknown top-level fields so additions upstream don't
             // turn into decode errors here.
             #[serde(flatten)]
             _rest: serde_json::Map<String, serde_json::Value>,
         }
         let w = Wire::deserialize(d)?;
-        let limits = w.limits.unwrap_or_default();
+        let included = w.included.unwrap_or_default();
         Ok(UsagePayload {
-            session: limits.session.unwrap_or_default(),
-            weekly: limits.weekly.unwrap_or_default(),
-            cost: w.activity.and_then(|a| a.cost),
+            session: included.session,
+            weekly: included.weekly,
+            included_usd: (included.balance_usd.is_some() || included.allowance_usd.is_some())
+                .then_some(IncludedBalance {
+                    balance_usd: included.balance_usd.filter(|v| v.is_finite()),
+                    allowance_usd: included.allowance_usd.filter(|v| v.is_finite()),
+                }),
+            purchased_usd: w.purchased.and_then(|p| p.balance_usd.filter(|v| v.is_finite())),
         })
     }
 }
 
 impl UsagePayload {
     /// True when the body carried at least one number we understand. A
-    /// payload without any session/weekly usage is shape drift (the real
-    /// endpoint always has both) and must surface as an error, not zeros.
+    /// payload with neither shape is drift (the documented endpoint always
+    /// reports one of them) and must surface as an error, not zeros.
     fn plausible(&self) -> bool {
-        self.session.usage.is_some() || self.weekly.usage.is_some()
+        self.session.as_ref().is_some_and(|s| s.remaining_percent.is_some())
+            || self.weekly.as_ref().is_some_and(|w| w.remaining_percent.is_some())
+            || self.included_usd.as_ref().is_some_and(|i| i.balance_usd.is_some() || i.allowance_usd.is_some())
+            || self.purchased_usd.is_some()
     }
 }
 
@@ -220,18 +262,29 @@ pub struct KeyUsage {
     pub ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<u16>,
+    /// Used fraction of the window's allowance (0.0–1.0), straight from
+    /// upstream's remaining_percent (legacy plans); None when unknown.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub weekly: Option<f64>,
+    /// One-decimal percent mirrors of the fractions.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_pct: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub weekly_pct: Option<f64>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub models: Vec<ModelUsage>,
+    /// Next window reset (ISO-8601 UTC) — countdown material for panels.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub cost: Option<String>,
+    pub session_resets_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub weekly_resets_at: Option<String>,
+    /// Credit-plan amounts (USD), present only on credit-shape bodies.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub included_usd: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowance_usd: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub purchased_usd: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -247,8 +300,11 @@ impl KeyUsage {
             weekly: None,
             session_pct: None,
             weekly_pct: None,
-            models: Vec::new(),
-            cost: None,
+            session_resets_at: None,
+            weekly_resets_at: None,
+            included_usd: None,
+            allowance_usd: None,
+            purchased_usd: None,
             error: Some(error),
         }
     }
@@ -265,8 +321,11 @@ impl KeyUsage {
             weekly: session,
             session_pct: session.map(pct),
             weekly_pct: session.map(pct),
-            models: Vec::new(),
-            cost: None,
+            session_resets_at: None,
+            weekly_resets_at: None,
+            included_usd: None,
+            allowance_usd: None,
+            purchased_usd: None,
             error: None,
         }
     }
@@ -309,11 +368,19 @@ impl UsageSnapshot {
 /// fraction, so consumers of per-key usage need no adjustment).
 /// Windows with no contributing key are `None` (rendered `null`, never
 /// fabricated as 0 or omitted — the envelope's schema has both fields
-/// required-nullable, so serialization must always emit them).
+/// required-nullable, so serialization must always emit them). The reset
+/// instant rides along only when every reporting key of that window
+/// agrees on one (upstream resets per account-period, so same-tier pools
+/// agree; mixed windows stay `None` rather than picking one account's
+/// clock).
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
 pub struct UsageAggregate {
     pub session: Option<f64>,
     pub weekly: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_resets_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub weekly_resets_at: Option<String>,
 }
 
 /// Unit label for the aggregate: a capacity-weighted mean of per-key
@@ -339,11 +406,12 @@ fn round3(v: f64) -> f64 {
 /// Every key participates regardless of pool health —
 /// cooldown/dead state never touches usage fetching, so cooling keys
 /// contribute like any other; error rows (`ok:false`, e.g. a dead key's
-/// own 401 on /api/usage, its expected outcome) carry no numbers and
+/// own 401 on /api/balance, its expected outcome) carry no numbers and
 /// cannot contribute. A window only some keys report is averaged over
 /// exactly those keys (their weights form the denominator, so dead
 /// keys never dilute the number); a window no ok row reports stays
-/// `None` (never fabricated as 0).
+/// `None` (never fabricated as 0). Reset instants are the unanimous
+/// value across the keys that reported the window, else `None`.
 pub fn aggregate(snap: &UsageSnapshot, concurrencies: &[u32]) -> UsageAggregate {
     let mut session = 0.0f64;
     let mut weekly = 0.0f64;
@@ -351,6 +419,8 @@ pub fn aggregate(snap: &UsageSnapshot, concurrencies: &[u32]) -> UsageAggregate 
     let mut weekly_w = 0.0f64;
     let mut session_seen = false;
     let mut weekly_seen = false;
+    let mut session_reset: Option<Option<String>> = None;
+    let mut weekly_reset: Option<Option<String>> = None;
     for k in &snap.keys {
         let conc = concurrencies.get(k.index).copied().unwrap_or(1);
         let (_, weight) = tier_for(conc);
@@ -359,17 +429,34 @@ pub fn aggregate(snap: &UsageSnapshot, concurrencies: &[u32]) -> UsageAggregate 
                 session += s * weight;
                 session_w += weight;
                 session_seen = true;
+                session_reset = unify_reset(session_reset, &k.session_resets_at);
             }
             if let Some(w) = k.weekly {
                 weekly += w * weight;
                 weekly_w += weight;
                 weekly_seen = true;
+                weekly_reset = unify_reset(weekly_reset, &k.weekly_resets_at);
             }
         }
     }
     UsageAggregate {
         session: session_seen.then(|| round3(session / session_w)),
         weekly: weekly_seen.then(|| round3(weekly / weekly_w)),
+        session_resets_at: session_seen.then(|| session_reset.flatten()).flatten(),
+        weekly_resets_at: weekly_seen.then(|| weekly_reset.flatten()).flatten(),
+    }
+}
+
+/// Unanimous-string unification: None (no value yet) absorbs anything;
+/// an existing value survives only when the new one is equal. The outer
+/// Option distinguishes "seen nothing" from "seen a missing value".
+fn unify_reset(seen: Option<Option<String>>, next: &Option<String>) -> Option<Option<String>> {
+    match seen {
+        None => Some(next.clone()),
+        Some(prev) => Some(match (prev, next) {
+            (Some(a), Some(b)) if a == b.as_str() => Some(a),
+            _ => None,
+        }),
     }
 }
 
@@ -440,7 +527,7 @@ impl UsageTracker {
             ttl: USAGE_TTL,
             fetch: Box::new(move |index, suffix_unused, secret| {
                 let _ = (index, suffix_unused);
-                fetch_usage_http(&agent, &base, secret)
+                fetch_balance_http(&agent, &base, secret)
             }),
             snapshot: Mutex::new(None),
             fetch_mu: Mutex::new(()),
@@ -592,7 +679,11 @@ impl UsageTracker {
             let suffix = self.pool.suffix_of(i);
             keys.push(match res {
                 Ok(p) => {
-                    let (session, weekly, models, cost) = p.into_parts();
+                    // Fractions are upstream's own numbers (1 − remaining),
+                    // not derived from any configured cap. round3 cuts the
+                    // fp noise of the ÷100 (0.037000000000000026 → 0.037).
+                    let session = p.session.as_ref().and_then(|s| s.used_fraction()).map(round3);
+                    let weekly = p.weekly.as_ref().and_then(|w| w.used_fraction()).map(round3);
                     KeyUsage {
                         index: i,
                         suffix,
@@ -600,10 +691,13 @@ impl UsageTracker {
                         status: Some(200),
                         session_pct: session.map(pct),
                         weekly_pct: weekly.map(pct),
+                        session_resets_at: p.session.as_ref().and_then(|s| s.resets_at.clone()),
+                        weekly_resets_at: p.weekly.as_ref().and_then(|w| w.resets_at.clone()),
                         session,
                         weekly,
-                        models,
-                        cost,
+                        included_usd: p.included_usd.as_ref().and_then(|i| i.balance_usd),
+                        allowance_usd: p.included_usd.as_ref().and_then(|i| i.allowance_usd),
+                        purchased_usd: p.purchased_usd,
                         error: None,
                     }
                 }
@@ -681,23 +775,16 @@ fn pct(f: f64) -> f64 {
     (f.clamp(0.0, 1.0) * 1000.0).round() / 10.0
 }
 
-impl UsagePayload {
-    fn into_parts(self) -> (Option<f64>, Option<f64>, Vec<ModelUsage>, Option<String>) {
-        (
-            self.session.usage,
-            self.weekly.usage,
-            self.session.models,
-            self.cost,
-        )
-    }
-}
-
-fn fetch_usage_http(
+/// One keyed HTTP GET of `/api/balance` decoded tolerantly. A single
+/// request per key per round: the docs rate-limit 10 req/min per user
+/// shared across all keys and devices, so the fan-out must stay at one
+/// request per key and the TTL at >= 6 s (it is 60 s).
+fn fetch_balance_http(
     agent: &ureq::Agent,
     upstream: &str,
     secret: &str,
 ) -> Result<UsagePayload, FetchError> {
-    let url = format!("{upstream}/api/usage");
+    let url = format!("{upstream}/api/balance");
     let resp = agent
         .get(&url)
         .set("Authorization", &format!("Bearer {secret}"))
@@ -727,42 +814,89 @@ mod tests {
             .with_fetch(|_, _, _| Err(FetchError::Status(401)))
     }
 
+    /// Legacy-plan /api/balance body (docs.ollama.com/api/balance).
+    fn legacy_body(session_rem: f64, weekly_rem: f64, resets: &str) -> String {
+        format!(
+            r#"{{"included":{{"session":{{"remaining_percent":{session_rem},"resets_at":"{resets}"}},
+                               "weekly":{{"remaining_percent":{weekly_rem},"resets_at":"{resets}"}}}},
+                "purchased":{{"balance_usd":0}}}}"#
+        )
+    }
+
     #[test]
-    fn decodes_full_payload() {
-        let body = r#"{
-            "limits": {
-                "session": {"usage": 0.037, "models": [
-                    {"name": "gpt-oss:120b", "request_count": 42},
-                    {"name": "qwen3-coder:480b", "request_count": 7}
-                ]},
-                "weekly": {"usage": 0.007}
-            },
-            "activity": {"cost": "$1.23"}
-        }"#;
-        let p: UsagePayload = serde_json::from_str(body).unwrap();
-        assert_eq!(p.session.usage, Some(0.037));
-        assert_eq!(p.weekly.usage, Some(0.007));
-        assert_eq!(p.session.models.len(), 2);
-        assert_eq!(p.cost.as_deref(), Some("$1.23"));
+    fn decodes_legacy_balance_payload() {
+        let body = legacy_body(95.56, 49.67, "2026-10-09T00:00:00Z");
+        let p: UsagePayload = serde_json::from_str(&body).unwrap();
+        let s = p.session.clone().expect("session window decoded");
+        let w = p.weekly.clone().expect("weekly window decoded");
+        assert_eq!(s.remaining_percent, Some(95.56));
+        assert_eq!(w.remaining_percent, Some(49.67));
+        assert_eq!(s.resets_at.as_deref(), Some("2026-10-09T00:00:00Z"));
+        assert_eq!(p.included_usd, None, "legacy body has no USD amounts");
+        assert_eq!(p.purchased_usd, Some(0.0));
         assert!(p.plausible());
+        // remaining → used fraction is the whole point.
+        assert!((s.used_fraction().unwrap() - 0.0444).abs() < 1e-9);
+        assert!((w.used_fraction().unwrap() - 0.5033).abs() < 1e-9);
+    }
+
+    #[test]
+    fn decodes_credit_balance_payload() {
+        // Credit-plan shape: USD amounts, no percents.
+        let body = r#"{"included":{"balance_usd":72.5,"allowance_usd":100,
+                                   "period":{"from":"2026-09-15T09:30:00Z","until":"2026-10-15T09:30:00Z"}},
+                       "purchased":{"balance_usd":25}}"#;
+        let p: UsagePayload = serde_json::from_str(body).unwrap();
+        assert_eq!(p.session, None);
+        assert_eq!(p.weekly, None);
+        let inc = p.included_usd.clone().expect("included USD decoded");
+        assert_eq!(inc.balance_usd, Some(72.5));
+        assert_eq!(inc.allowance_usd, Some(100.0));
+        assert_eq!(p.purchased_usd, Some(25.0));
+        assert!(p.plausible());
+    }
+
+    #[test]
+    fn zero_remaining_is_full_usage_not_drift() {
+        // remaining_percent 0 = window exhausted: honest data, not drift.
+        let p: UsagePayload =
+            serde_json::from_str(r#"{"included":{"session":{"remaining_percent":0}}}"#).unwrap();
+        assert_eq!(p.session.clone().unwrap().used_fraction(), Some(1.0));
+        assert!(p.plausible());
+    }
+
+    #[test]
+    fn used_fraction_clamps_rounding_drift() {
+        // 100.2% remaining (rounding drift upstream) must not go negative.
+        let p: UsagePayload = serde_json::from_str(
+            r#"{"included":{"session":{"remaining_percent":100.2}}}"#,
+        )
+        .unwrap();
+        assert_eq!(p.session.unwrap().used_fraction(), Some(0.0));
+        // -0.5% remaining likewise clamps to 1.0, never beyond.
+        let p: UsagePayload = serde_json::from_str(
+            r#"{"included":{"weekly":{"remaining_percent":-0.5}}}"#,
+        )
+        .unwrap();
+        assert_eq!(p.weekly.unwrap().used_fraction(), Some(1.0));
     }
 
     #[test]
     fn tolerates_missing_fields() {
         let p: UsagePayload = serde_json::from_str("{}").unwrap();
-        assert_eq!(p.session.usage, None);
-        assert_eq!(p.weekly.usage, None);
-        assert!(p.session.models.is_empty());
-        assert_eq!(p.cost, None);
+        assert_eq!(p.session, None);
+        assert_eq!(p.weekly, None);
+        assert_eq!(p.included_usd, None);
+        assert_eq!(p.purchased_usd, None);
         // Absence of all numbers is drift, not zeros.
         assert!(!p.plausible());
     }
 
     #[test]
     fn unknown_fields_are_ignored() {
-        let body = r#"{"limits":{"session":{"usage":0.5},"brand_new":{"x":1}},"future":42}"#;
+        let body = r#"{"included":{"session":{"remaining_percent":44.4},"brand_new":{"x":1}},"future":42}"#;
         let p: UsagePayload = serde_json::from_str(body).unwrap();
-        assert_eq!(p.session.usage, Some(0.5));
+        assert_eq!(p.session.clone().unwrap().remaining_percent, Some(44.4));
         assert!(p.plausible());
     }
 
@@ -791,7 +925,7 @@ mod tests {
         // A hostile upstream answering 200 with the Authorization secret
         // echoed into a wrong-typed field must not leak it into the error
         // string (serde's own message embeds offending values verbatim).
-        let body = r#"{"limits":{"session":{"usage":"Bearer omk-secret1234"}}}"#;
+        let body = r#"{"included":{"session":{"remaining_percent":"Bearer omk-secret1234"}}}"#;
         let err = parse_payload(body).unwrap_err();
         assert!(
             !err.contains("omk-secret1234"),
@@ -822,7 +956,7 @@ mod tests {
             .with_min_refresh(Duration::ZERO) // isolate TTL behavior
             .with_fetch(|_, _, _| {
                 CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                Ok(serde_json::from_str(r#"{"limits":{"session":{"usage":0.25}}}"#).unwrap())
+                Ok(serde_json::from_str(&legacy_body(75.0, 60.0, "2026-10-09T00:00:00Z")).unwrap())
             });
         let _ = t.get();
         let _ = t.get(); // fresh: no second fetch
@@ -842,7 +976,7 @@ mod tests {
                 CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 // Give the burst time to pile up behind the fetch mutex.
                 std::thread::sleep(Duration::from_millis(50));
-                Ok(serde_json::from_str(r#"{"limits":{"weekly":{"usage":0.1}}}"#).unwrap())
+                Ok(serde_json::from_str(r#"{"included":{"weekly":{"remaining_percent":90}}}"#).unwrap())
             }),
         );
         let barrier = Arc::new(Barrier::new(8));
@@ -876,7 +1010,7 @@ mod tests {
                 if FAIL.load(std::sync::atomic::Ordering::Relaxed) {
                     Err(FetchError::Network("boom".into()))
                 } else {
-                    Ok(serde_json::from_str(r#"{"limits":{"session":{"usage":0.5}}}"#).unwrap())
+                    Ok(serde_json::from_str(&legacy_body(50.0, 50.0, "2026-10-09T00:00:00Z")).unwrap())
                 }
             });
         let first = t.get();
@@ -927,7 +1061,7 @@ mod tests {
         let pool = Arc::new(Pool::new(vec![("omk-usage-pk01".into(), 1)], 4, false));
         let t = UsageTracker::new(pool, "https://ollama.com").with_fetch(|_, _, _| {
             CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Ok(serde_json::from_str(r#"{"limits":{"session":{"usage":0.1}}}"#).unwrap())
+            Ok(serde_json::from_str(&legacy_body(90.0, 90.0, "2026-10-09T00:00:00Z")).unwrap())
         });
         assert!(t.peek().is_none());
         assert_eq!(CALLS.load(std::sync::atomic::Ordering::Relaxed), 0);
@@ -963,7 +1097,7 @@ mod tests {
             .with_min_refresh(Duration::from_millis(120))
             .with_fetch(|_, _, _| {
                 CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                Ok(serde_json::from_str(r#"{"limits":{"session":{"usage":0.1}}}"#).unwrap())
+                Ok(serde_json::from_str(&legacy_body(90.0, 90.0, "2026-10-09T00:00:00Z")).unwrap())
             });
         let _ = t.refresh();
         let _ = t.refresh(); // inside min-interval: no second fetch
@@ -988,7 +1122,12 @@ mod tests {
         assert_eq!(tier_for(u32::MAX), ("max", MAX_WEIGHT));
     }
 
-    fn agg_row(index: usize, ok: bool, session: Option<f64>, weekly: Option<f64>) -> KeyUsage {
+    fn agg_row(
+        index: usize,
+        ok: bool,
+        session: Option<f64>,
+        weekly: Option<f64>,
+    ) -> KeyUsage {
         KeyUsage {
             index,
             suffix: format!("sfx{index}"),
@@ -998,8 +1137,11 @@ mod tests {
             weekly,
             session_pct: session.map(pct),
             weekly_pct: weekly.map(pct),
-            models: Vec::new(),
-            cost: None,
+            session_resets_at: None,
+            weekly_resets_at: None,
+            included_usd: None,
+            allowance_usd: None,
+            purchased_usd: None,
             error: (!ok).then(|| "test failure".to_string()),
         }
     }
@@ -1013,9 +1155,12 @@ mod tests {
 
     #[test]
     fn aggregate_weights_by_tier() {
-        // free(1) at 3.7% + max(250) at 81%: the weighted mean is
-        // (0.037*1 + 0.81*250) / 251 = 0.807 — the max key dominates,
-        // and the number stays in [0, 1].
+        // The tiers still weight by plan-cap multiples: legacy plans'
+        // remaining_percent is a fraction of the *account's own* plan cap,
+        // so a pro key at 81% has burned far more capacity than a free key
+        // at 81%. free(1) at 3.7% + max(250) at 81%:
+        // (0.037*1 + 0.81*250) / 251 = 0.807 — the max key dominates, and
+        // the number stays in [0, 1].
         let snap = agg_snap(vec![
             agg_row(0, true, Some(0.037), Some(0.007)),
             agg_row(1, true, Some(0.81), Some(0.42)),
@@ -1075,6 +1220,28 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_reset_is_unanimous_value() {
+        // Same reset on all reporting keys of a window → it surfaces.
+        let mut keys = vec![
+            agg_row(0, true, Some(0.4), Some(0.2)),
+            agg_row(1, true, Some(0.4), Some(0.2)),
+        ];
+        keys[0].session_resets_at = Some("2026-10-09T00:00:00Z".into());
+        keys[1].session_resets_at = Some("2026-10-09T00:00:00Z".into());
+        keys[0].weekly_resets_at = Some("2026-10-12T00:00:00Z".into());
+        // Key 1's weekly resets_at missing: weekly has no unanimous value.
+        let a = aggregate(&agg_snap(keys), &[1, 1]);
+        assert_eq!(a.session_resets_at.as_deref(), Some("2026-10-09T00:00:00Z"));
+        assert_eq!(a.weekly_resets_at, None);
+        // Split values likewise null the field.
+        let mut keys = vec![agg_row(0, true, Some(0.4), None), agg_row(1, true, Some(0.4), None)];
+        keys[0].session_resets_at = Some("2026-10-09T00:00:00Z".into());
+        keys[1].session_resets_at = Some("2026-10-10T00:00:00Z".into());
+        let a = aggregate(&agg_snap(keys), &[1, 1]);
+        assert_eq!(a.session_resets_at, None, "accounts reset on their own schedules");
+    }
+
+    #[test]
     fn aggregate_default_weight_is_free_for_short_slices() {
         // Defensive: a shorter concurrency slice must not panic; missing
         // entries fall back to free weight.
@@ -1097,16 +1264,61 @@ mod tests {
         pool.mark_cooldown(0, Duration::from_secs(60), "429 test");
         let t = UsageTracker::new(pool, "https://ollama.com").with_fetch(|i, _, _| {
             Ok(serde_json::from_str::<UsagePayload>(&if i == 0 {
-                r#"{"limits":{"session":{"usage":0.5},"weekly":{"usage":0.2}}}"#.to_string()
+                legacy_body(50.0, 80.0, "2026-10-09T00:00:00Z")
             } else {
-                r#"{"limits":{"session":{"usage":0.1},"weekly":{"usage":0.1}}}"#.to_string()
+                legacy_body(90.0, 90.0, "2026-10-09T00:00:00Z")
             })
             .unwrap())
         });
         let snap = t.get();
         assert!(snap.keys[0].ok, "cooldown key's usage fetch must succeed");
         let a = aggregate(&snap, &[3, 1]);
-        assert_eq!(a.session, Some(0.492), "(0.5*50 + 0.1*1) / 51");
-        assert_eq!(a.weekly, Some(0.198), "(0.2*50 + 0.1*1) / 51");
+        // 1-remaining: key0 0.5/0.2, key1 0.1/0.1 →
+        // (0.5*50 + 0.1*1) / 51 = 0.492; (0.2*50 + 0.1*1) / 51 = 0.198.
+        assert_eq!(a.session, Some(0.492));
+        assert_eq!(a.weekly, Some(0.198));
+        assert_eq!(a.session_resets_at.as_deref(), Some("2026-10-09T00:00:00Z"));
+    }
+
+    #[test]
+    fn tracker_maps_remaining_to_used_fraction() {
+        // End-to-end through the seam: remaining_percent 95.56 → used
+        // 0.044 → pct 4.4; resets_at rides into the row.
+        let pool = Arc::new(Pool::new(vec![("omk-usage-pct1".into(), 1)], 4, false));
+        let t = UsageTracker::new(pool, "https://ollama.com")
+            .with_fetch(|_, _, _| {
+                Ok(serde_json::from_str::<UsagePayload>(
+                    &legacy_body(95.56, 49.67, "2026-10-09T00:00:00Z"),
+                )
+                .unwrap())
+            });
+        let snap = t.get();
+        let row = &snap.keys[0];
+        assert!(row.ok);
+        assert_eq!(row.session.unwrap(), 0.044, "round3 precision cut");
+        assert_eq!(row.session_pct.unwrap(), 4.4);
+        assert!(row.weekly.is_some() && row.weekly_pct.unwrap() > 49.0);
+        assert_eq!(row.session_resets_at.as_deref(), Some("2026-10-09T00:00:00Z"));
+        assert_eq!(row.weekly_resets_at.as_deref(), Some("2026-10-09T00:00:00Z"));
+    }
+
+    #[test]
+    fn credit_plan_row_carries_usd_not_fractions() {
+        let pool = Arc::new(Pool::new(vec![("omk-credit001".into(), 1)], 4, false));
+        let t = UsageTracker::new(pool, "https://ollama.com")
+            .with_fetch(|_, _, _| {
+                Ok(serde_json::from_str::<UsagePayload>(
+                    r#"{"included":{"balance_usd":72.5,"allowance_usd":100},"purchased":{"balance_usd":25}}"#,
+                )
+                .unwrap())
+            });
+        let snap = t.get();
+        let row = &snap.keys[0];
+        assert!(row.ok);
+        assert_eq!(row.session, None, "credit plans have no percent windows");
+        assert_eq!(row.weekly, None);
+        assert_eq!(row.included_usd, Some(72.5));
+        assert_eq!(row.allowance_usd, Some(100.0));
+        assert_eq!(row.purchased_usd, Some(25.0));
     }
 }
