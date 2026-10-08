@@ -983,8 +983,11 @@ mod tests {
                     weekly: session,
                     session_pct: session.map(|s| (s * 1000.0).round() / 10.0),
                     weekly_pct: session.map(|s| (s * 1000.0).round() / 10.0),
-                    models: Vec::new(),
-                    cost: None,
+                    session_resets_at: None,
+                    weekly_resets_at: None,
+                    included_usd: None,
+                    allowance_usd: None,
+                    purchased_usd: None,
                     error: None,
                 })
                 .collect(),

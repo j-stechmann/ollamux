@@ -88,7 +88,7 @@ tags:
     description: >
       ollamux-local endpoints for per-key health, usage, and liveness. These
       are answered in-memory and never touch the upstream (/_usage may fetch
-      ollama.com/api/usage, but /_keys never does).
+      ollama.com/api/balance, but /_keys never does).
 paths:
   /_health:
     get:
@@ -134,17 +134,23 @@ paths:
       tags: [introspection]
       summary: Per-key Ollama Cloud usage
       description: >
-        Fans out to the undocumented `GET https://ollama.com/api/usage`
-        endpoint with every configured key in parallel and answers with one
-        row per key (suffixes only, never secrets). Usage is a *fraction of
-        the plan's cap* (0.0–1.0), not a token count; there are no reset
-        timestamps upstream (the session window rolls over roughly every
-        5 hours, the weekly one every 7 days). The envelope also carries an
+        Fans out to the documented `GET https://ollama.com/api/balance`
+        endpoint (one request per key) and answers with one row per key
+        (suffixes only, never secrets). Legacy plans report used
+        fractions of their session/weekly allowances (upstream's
+        remaining_percent inverted) with reset instants; credit plans
+        report USD amounts (`included_usd`, `allowance_usd`,
+        `purchased_usd`) with no percent windows. The envelope also
+        carries an
         `aggregate`: the capacity-weighted mean of the reporting rows'
         fractions, weighted by each key's plan tier (inferred from per-key
         concurrency, KEY:N: free=1, pro=3, max=10; weights ×1/×50/×250) —
         a number in 0.0–1.0 like the per-key rows, including keys
-        currently on cooldown (usage fetching is health-blind).
+        currently on cooldown (usage fetching is health-blind). Upstream
+        rate-limits the balance endpoint to 10 req/min per user shared
+        across keys: the passive 60 s poll respects that for pools up to
+        ~10 keys (larger pools burst one parallel GET per key and
+        affected keys report 429s and back off).
       operationId: getUsage
       parameters:
         - name: refresh
@@ -157,6 +163,9 @@ paths:
             window serves the cached snapshot. `stale` keeps reflecting the
             60 s TTL, not this guard; the guard counts attempts, not
             successes, so failed rounds back off instead of fanning out.
+            Note this guard is independent of the 60 s TTL and of the
+            upstream 10 req/min per-user limit: a forced-refresh loop can
+            exceed both.
           schema:
             type: string
             example: '1'
@@ -678,10 +687,10 @@ components:
       properties:
         session:
           type: number
-          description: Session usage as a fraction of the plan cap (0.0–1.0).
+          description: Used fraction of the session window's allowance (0.0–1.0); omitted when unknown.
         weekly:
           type: number
-          description: Weekly usage as a fraction of the plan cap (0.0–1.0).
+          description: Used fraction of the weekly window's allowance (0.0–1.0); omitted when unknown.
         session_pct: {type: number, description: One-decimal percent mirror of `session`.}
         weekly_pct: {type: number, description: One-decimal percent mirror of `weekly`.}
         over_quota:
@@ -729,12 +738,6 @@ components:
           description: Most recent failure reason (absent before the first failure).
         usage:
           $ref: '#/components/schemas/UsageBrief'
-    ModelUsage:
-      type: object
-      required: [name, request_count]
-      properties:
-        name: {type: string}
-        request_count: {type: integer, format: int64}
     UsageEnvelope:
       type: object
       required: [updated, age_s, stale, session_window, aggregate, keys]
@@ -753,7 +756,7 @@ components:
             served, but a newer one exists or will be fetched on demand.
         session_window:
           type: string
-          description: Human hint; the upstream publishes no reset timestamps.
+          description: Human hint; per-window reset timestamps are in the aggregate/rows.
         aggregate: {$ref: '#/components/schemas/UsageAggregate'}
         keys:
           type: array
@@ -782,19 +785,40 @@ components:
             in `error`.
         session:
           type: number
-          description: Session usage fraction (0.0–1.0); omitted means unknown, never 0.
+          description: >
+            Used fraction of the session window's allowance (0.0–1.0 =
+            1 − upstream remaining_percent/100, a legacy plan's real limit).
+            Omitted when unknown or on credit-plan rows — absent means
+            unknown, never 0.
         weekly:
           type: number
-          description: Weekly usage fraction (0.0–1.0); omitted means unknown, never 0.
-        session_pct: {type: number}
-        weekly_pct: {type: number}
-        models:
-          type: array
-          description: Top models of the session window (upstream may omit).
-          items: {$ref: '#/components/schemas/ModelUsage'}
-        cost:
+          description: >
+            Used fraction of the weekly window's allowance (0.0–1.0).
+            Omitted when unknown or on credit-plan rows.
+        session_pct: {type: number, description: One-decimal percent mirror of `session`.}
+        weekly_pct: {type: number, description: One-decimal percent mirror of `weekly`.}
+        session_resets_at:
           type: string
-          description: Reported 4-week rolling cost, passed through verbatim.
+          description: Next session-window reset in UTC, when upstream publishes one.
+        weekly_resets_at:
+          type: string
+          description: Next weekly-window reset in UTC, when upstream publishes one.
+        included_usd:
+          type: number
+          description: >
+            Credit plans only: remaining included credits in USD for the
+            current period (absent on legacy plans).
+        allowance_usd:
+          type: number
+          description: >-
+            Credit plans only: included credits available for the full
+            period in USD.
+        purchased_usd:
+          type: number
+          description: >-
+            Remaining unexpired purchased credits in USD; mirrors the
+            upstream balance (legacy bodies commonly report 0 when no
+            purchase exists).
         error:
           type: string
           description: >
@@ -805,17 +829,20 @@ components:
       type: object
       description: >
         Pool-wide usage as a capacity-weighted mean: every ok row's usage
-        fraction (a fraction of *its own plan's cap*) times its tier's
-        cap weight (free ×1, pro ×50, max ×250), summed and divided by
-        the summed weights of exactly the keys that reported the window
-        — so the result is a fraction in 0.0–1.0 like the per-key rows
-        (a single-key pool reproduces that key's own fraction, and dead
-        keys never dilute the number). Keys on cooldown contribute too —
-        usage fetching never consults pool health. A key marked dead
-        (401/403) is expected to fail its own usage fetch the same way
-        and therefore contributes nothing. Rounded to 3 decimals; a
-        window no ok row reports is `null`, never 0.
-      required: [session, weekly, unit]
+        fraction (a fraction of *its own plan's allowance* — upstream's
+        remaining_percent inverted) times its tier's cap weight (free ×1,
+        pro ×50, max ×250), summed and divided by the summed weights of
+        exactly the keys that reported the window — so the result is a
+        fraction in 0.0–1.0 like the per-key rows (a single-key pool
+        reproduces that key's own fraction, and dead keys never dilute
+        the number). Credit-plan rows have no window fractions and sit
+        out. Keys on cooldown contribute too — usage fetching never
+        consults pool health. A key marked dead (401/403) is expected to
+        fail its own usage fetch the same way and therefore contributes
+        nothing. Rounded to 3 decimals; a window no ok row reports is
+        `null`, never 0 (`resets_at` fields publish the window's reset
+        instant only when every reporting key agrees on one).
+      required: [session, weekly, unit, session_resets_at, weekly_resets_at]
       properties:
         session:
           type: number
@@ -829,6 +856,14 @@ components:
           description: >
             Weekly-window fraction of the reporting keys' combined
             capacity (0.0–1.0).
+        session_resets_at:
+          type: string
+          nullable: true
+          description: The window's reset instant in UTC, when all reporting keys agree.
+        weekly_resets_at:
+          type: string
+          nullable: true
+          description: The window's reset instant in UTC, when all reporting keys agree.
         unit:
           type: string
           description: >
