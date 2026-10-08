@@ -246,9 +246,13 @@ impl<'de> serde::Deserialize<'de> for UsagePayload {
 }
 
 impl UsagePayload {
-    /// True when the body carried at least one number we understand. A
-    /// payload with neither shape is drift (the documented endpoint always
-    /// reports one of them) and must surface as an error, not zeros.
+    /// True when the body carried at least one decodable `included` value
+    /// (either plan shape's windows/amounts). `included` is required on
+    /// every documented response, so a body whose `included` carried
+    /// nothing — even with `purchased` intact — is shape drift and must
+    /// surface as an error, not a silent all-null ok row. `purchased`
+    /// alone deliberately does not count: keeping a USD number plausible
+    /// on its own would mask upstream renames of the `included` members.
     fn plausible(&self) -> bool {
         self.session
             .as_ref()
@@ -261,7 +265,6 @@ impl UsagePayload {
                 .included_usd
                 .as_ref()
                 .is_some_and(|i| i.balance_usd.is_some() || i.allowance_usd.is_some())
-            || self.purchased_usd.is_some()
     }
 }
 
@@ -917,6 +920,24 @@ mod tests {
         assert_eq!(p.purchased_usd, None);
         // Absence of all numbers is drift, not zeros.
         assert!(!p.plausible());
+    }
+
+    #[test]
+    fn purchased_alone_is_not_plausible() {
+        // `included` is required on every documented response: a body that
+        // kept `purchased` but lost everything inside `included` (e.g.
+        // upstream renamed the members) is shape drift and must surface as
+        // a per-key error, never a silent all-null ok row.
+        let p: UsagePayload = serde_json::from_str(r#"{"purchased":{"balance_usd":25}}"#).unwrap();
+        assert_eq!(p.purchased_usd, Some(25.0));
+        assert!(!p.plausible());
+        let p: UsagePayload =
+            serde_json::from_str(r#"{"included":{},"purchased":{"balance_usd":25}}"#).unwrap();
+        assert!(!p.plausible());
+        // parse_payload — the gate fetch_balance_http applies to every
+        // body — must turn the drift into the documented error string.
+        let err = parse_payload(r#"{"purchased":{"balance_usd":25}}"#).unwrap_err();
+        assert_eq!(err, "endpoint changed (no usage data in payload)");
     }
 
     #[test]

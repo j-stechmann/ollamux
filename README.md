@@ -194,6 +194,14 @@ takes requests when no fresh key has a free slot. Failed usage fetches
 keep the previous snapshot; with the feature off, routing behaves exactly
 as before.
 
+Credit-plan keys are exempt from demotion: their balance responses carry
+USD amounts, not a session fraction, so there is no percent to compare
+against the threshold — under `--usage-aware` they are ordered like
+unmeasured keys (demote only ever applies to legacy-plan percent data).
+The demotion signal is the *session* window alone: a key whose weekly
+window is exhausted but whose session window is under the threshold is
+never demoted.
+
 ## Prompt-cache affinity (on by default)
 
 Ollama Cloud caches prompt prefixes server-side, per account (i.e. per
