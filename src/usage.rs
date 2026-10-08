@@ -29,7 +29,13 @@
 //!
 //! The endpoint is rate-limited to 10 requests per minute per user
 //! (shared across keys) and the docs recommend polling once per minute —
-//! USAGE_TTL (60 s) matches exactly. Decoding is maximally tolerant: any
+//! USAGE_TTL (60 s) stays within that for single-key and small pools on
+//! the passive path. Caveats: the multi-key fan-out fires its GETs in
+//! parallel, so pools larger than ~10 keys can burst over the shared
+//! per-user limit (affected keys report upstream 429s and back off), and
+//! forced refreshes are gated by MIN_REFRESH (5 s), not the TTL, so a
+//! `?refresh=1` loop can exceed 10 req/min per key. Decoding is
+//! maximally tolerant: any
 //! shape drift becomes a per-key error string in `/_usage`, never a
 //! panic, never a 5xx.
 //!
@@ -54,8 +60,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Serve-at-most-this-age snapshot before a refresh is considered. The
 /// balance docs recommend polling once per minute (10 req/min limit
-/// shared across keys), so this doubles as the upstream rate-limit
-/// courtesy.
+/// shared across keys) — within that courtesy for pools of up to ~10
+/// keys on the passive path (see the caveats at `fetch_balance_http`).
 pub const USAGE_TTL: Duration = Duration::from_secs(60);
 /// Minimum interval between upstream fetch attempts: gates forced
 /// refreshes (`?refresh=1` spam guard) and backs off revalidation after
@@ -796,8 +802,13 @@ fn pct(f: f64) -> f64 {
 
 /// One keyed HTTP GET of `/api/balance` decoded tolerantly. A single
 /// request per key per round: the docs rate-limit 10 req/min per user
-/// shared across all keys and devices, so the fan-out must stay at one
-/// request per key and the TTL at >= 6 s (it is 60 s).
+/// shared across all keys and devices, so the TTL stays at 60 s
+/// (>= 6 s is the floor for a single key). Caveats: the fan-out fires
+/// one GET per key in parallel, so pools with more than ~10 keys burst
+/// over the shared per-user limit (keys then report upstream 429s and
+/// back off via their own cooldown), and forced refreshes are gated by
+/// a 5 s minimum interval, not this TTL, so a refresh loop can exceed
+/// 10 req/min per key.
 fn fetch_balance_http(
     agent: &ureq::Agent,
     upstream: &str,

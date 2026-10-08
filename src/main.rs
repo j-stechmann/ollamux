@@ -314,7 +314,10 @@ USAGE SOURCE:
     (docs.ollama.com/api/balance): legacy plans carry session/weekly
     remaining percents + reset instants; credit plans carry USD amounts.
     Polled at most once per 60 s (upstream allows 10 req/min per user,
-    shared across keys).",
+    shared across keys; pools larger than ~10 keys fan out in parallel
+    and can burst over that shared limit — affected keys report 429 and
+    back off; forced refreshes bypass the TTL and are capped per key at
+    one attempt per 5 s).",
         ollamux::VERSION
     );
 }

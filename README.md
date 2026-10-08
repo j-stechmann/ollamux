@@ -106,11 +106,14 @@ request per key. Legacy plans (session/weekly limits) answer with what
 Credit plans answer with USD amounts instead (`included.balance_usd`,
 `included.allowance_usd`, `included.period`, `purchased.balance_usd`).
 Rate limit: 10 requests per minute per user, shared across API keys —
-the docs recommend polling once per minute, which is exactly ollamux's
-60 s TTL. `/_usage` treats any payload drift as a per-key error string,
-never a crash. (Proxied `/api/usage` requests are NOT special: they go
-through normal key rotation and reflect whichever key served them — use
-`/_usage` for the per-account picture.)
+the docs recommend polling once per minute, which ollamux's passive
+60 s TTL respects for pools of up to ~10 keys. Larger pools fan out
+one GET per key in parallel, so a single round can burst over the
+shared per-user limit; affected keys report `rate limited (upstream
+429)` and back off. `/_usage` treats any payload drift as a per-key
+error string, never a crash. (Proxied `/api/usage` requests are NOT
+special: they go through normal key rotation and reflect whichever key
+served them — use `/_usage` for the per-account picture.)
 
 ```sh
 curl -s localhost:11435/_usage | jq .
@@ -119,7 +122,10 @@ curl -s 'localhost:11435/_usage?refresh=1' | jq .   # force a refresh
 
 Forced refreshes are rate-limited to at most one upstream fetch attempt
 per 5 s (a `?refresh=1` inside that window serves the cached snapshot —
-`stale` keeps reflecting the 60 s TTL, not this guard). The guard counts
+`stale` keeps reflecting the 60 s TTL, not this guard). Note this guard
+is independent of the TTL: a forced-refresh loop fetches up to 12
+times/min per key, over the upstream rate limit even for a single key.
+The guard counts
 *attempts*, not successes: while the upstream is failing (failed rounds
 keep the last good snapshot), polling loops back off instead of fanning
 out on every request.

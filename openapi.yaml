@@ -146,7 +146,11 @@ paths:
         fractions, weighted by each key's plan tier (inferred from per-key
         concurrency, KEY:N: free=1, pro=3, max=10; weights ×1/×50/×250) —
         a number in 0.0–1.0 like the per-key rows, including keys
-        currently on cooldown (usage fetching is health-blind).
+        currently on cooldown (usage fetching is health-blind). Upstream
+        rate-limits the balance endpoint to 10 req/min per user shared
+        across keys: the passive 60 s poll respects that for pools up to
+        ~10 keys (larger pools burst one parallel GET per key and
+        affected keys report 429s and back off).
       operationId: getUsage
       parameters:
         - name: refresh
@@ -159,6 +163,9 @@ paths:
             window serves the cached snapshot. `stale` keeps reflecting the
             60 s TTL, not this guard; the guard counts attempts, not
             successes, so failed rounds back off instead of fanning out.
+            Note this guard is independent of the 60 s TTL and of the
+            upstream 10 req/min per-user limit: a forced-refresh loop can
+            exceed both.
           schema:
             type: string
             example: '1'
@@ -803,10 +810,15 @@ components:
             current period (absent on legacy plans).
         allowance_usd:
           type: number
-          description: Credit plans only: included credits available for the full period in USD.
+          description: >-
+            Credit plans only: included credits available for the full
+            period in USD.
         purchased_usd:
           type: number
-          description: Remaining unexpired purchased credits in USD, when the account has any.
+          description: >-
+            Remaining unexpired purchased credits in USD; mirrors the
+            upstream balance (legacy bodies commonly report 0 when no
+            purchase exists).
         error:
           type: string
           description: >
@@ -830,7 +842,7 @@ components:
         nothing. Rounded to 3 decimals; a window no ok row reports is
         `null`, never 0 (`resets_at` fields publish the window's reset
         instant only when every reporting key agrees on one).
-      required: [session, weekly, unit]
+      required: [session, weekly, unit, session_resets_at, weekly_resets_at]
       properties:
         session:
           type: number
