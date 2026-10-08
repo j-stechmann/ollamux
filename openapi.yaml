@@ -88,7 +88,7 @@ tags:
     description: >
       ollamux-local endpoints for per-key health, usage, and liveness. These
       are answered in-memory and never touch the upstream (/_usage may fetch
-      ollama.com/api/usage, but /_keys never does).
+      ollama.com/api/balance, but /_keys never does).
 paths:
   /_health:
     get:

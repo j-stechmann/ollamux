@@ -516,7 +516,7 @@ fn streaming_passes_through_chunked() {
 
 // ---------------------------------------------------------------------------
 // /_usage and usage-aware routing (hermetic): the local upstream scripts
-// GET /api/usage per Authorization header.
+// GET /api/balance per Authorization header.
 // ---------------------------------------------------------------------------
 
 /// Legacy-plan /api/balance body (docs.ollama.com/api/balance):
@@ -537,7 +537,11 @@ fn balance_responder(
 ) -> impl Fn(&str, Option<&str>) -> (u16, String, String) + Send + Sync + Clone + 'static {
     move |path, _| {
         assert!(path.starts_with("/api/balance"), "unexpected path {path}");
-        (200, "OK".into(), balance_body(session_rem, weekly_rem, "2026-10-09T00:00:00Z"))
+        (
+            200,
+            "OK".into(),
+            balance_body(session_rem, weekly_rem, "2026-10-09T00:00:00Z"),
+        )
     }
 }
 
@@ -576,8 +580,16 @@ fn usage_endpoint_aggregates_per_key_without_secrets() {
     assert_eq!(row_a["session_pct"], 3.7);
     assert_eq!(row_a["weekly"], 0.7);
     assert_eq!(row_a["weekly_pct"], 70.0);
-    assert_eq!(row_a["session_resets_at"], json_str("2026-10-09T00:00:00Z"), "{body}");
-    assert_eq!(row_a["weekly_resets_at"], json_str("2026-10-09T00:00:00Z"), "{body}");
+    assert_eq!(
+        row_a["session_resets_at"],
+        json_str("2026-10-09T00:00:00Z"),
+        "{body}"
+    );
+    assert_eq!(
+        row_a["weekly_resets_at"],
+        json_str("2026-10-09T00:00:00Z"),
+        "{body}"
+    );
     let row_b = rows.iter().find(|r| r["suffix"] == "5678").unwrap();
     assert_eq!(row_b["session"], 0.037);
     assert_eq!(row_b["session_pct"], 3.7);

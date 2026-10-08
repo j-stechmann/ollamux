@@ -149,7 +149,8 @@ impl BalanceLimit {
     /// The used fraction in [0, 1] (1 − remaining/100), clamped into range
     /// against upstream rounding drift; None when the percent is absent.
     fn used_fraction(&self) -> Option<f64> {
-        self.remaining_percent.map(|r| ((100.0 - r) / 100.0).clamp(0.0, 1.0))
+        self.remaining_percent
+            .map(|r| ((100.0 - r) / 100.0).clamp(0.0, 1.0))
     }
 }
 
@@ -231,7 +232,9 @@ impl<'de> serde::Deserialize<'de> for UsagePayload {
                     balance_usd: included.balance_usd.filter(|v| v.is_finite()),
                     allowance_usd: included.allowance_usd.filter(|v| v.is_finite()),
                 }),
-            purchased_usd: w.purchased.and_then(|p| p.balance_usd.filter(|v| v.is_finite())),
+            purchased_usd: w
+                .purchased
+                .and_then(|p| p.balance_usd.filter(|v| v.is_finite())),
         })
     }
 }
@@ -241,9 +244,17 @@ impl UsagePayload {
     /// payload with neither shape is drift (the documented endpoint always
     /// reports one of them) and must surface as an error, not zeros.
     fn plausible(&self) -> bool {
-        self.session.as_ref().is_some_and(|s| s.remaining_percent.is_some())
-            || self.weekly.as_ref().is_some_and(|w| w.remaining_percent.is_some())
-            || self.included_usd.as_ref().is_some_and(|i| i.balance_usd.is_some() || i.allowance_usd.is_some())
+        self.session
+            .as_ref()
+            .is_some_and(|s| s.remaining_percent.is_some())
+            || self
+                .weekly
+                .as_ref()
+                .is_some_and(|w| w.remaining_percent.is_some())
+            || self
+                .included_usd
+                .as_ref()
+                .is_some_and(|i| i.balance_usd.is_some() || i.allowance_usd.is_some())
             || self.purchased_usd.is_some()
     }
 }
@@ -682,8 +693,16 @@ impl UsageTracker {
                     // Fractions are upstream's own numbers (1 − remaining),
                     // not derived from any configured cap. round3 cuts the
                     // fp noise of the ÷100 (0.037000000000000026 → 0.037).
-                    let session = p.session.as_ref().and_then(|s| s.used_fraction()).map(round3);
-                    let weekly = p.weekly.as_ref().and_then(|w| w.used_fraction()).map(round3);
+                    let session = p
+                        .session
+                        .as_ref()
+                        .and_then(|s| s.used_fraction())
+                        .map(round3);
+                    let weekly = p
+                        .weekly
+                        .as_ref()
+                        .and_then(|w| w.used_fraction())
+                        .map(round3);
                     KeyUsage {
                         index: i,
                         suffix,
@@ -868,16 +887,13 @@ mod tests {
     #[test]
     fn used_fraction_clamps_rounding_drift() {
         // 100.2% remaining (rounding drift upstream) must not go negative.
-        let p: UsagePayload = serde_json::from_str(
-            r#"{"included":{"session":{"remaining_percent":100.2}}}"#,
-        )
-        .unwrap();
+        let p: UsagePayload =
+            serde_json::from_str(r#"{"included":{"session":{"remaining_percent":100.2}}}"#)
+                .unwrap();
         assert_eq!(p.session.unwrap().used_fraction(), Some(0.0));
         // -0.5% remaining likewise clamps to 1.0, never beyond.
-        let p: UsagePayload = serde_json::from_str(
-            r#"{"included":{"weekly":{"remaining_percent":-0.5}}}"#,
-        )
-        .unwrap();
+        let p: UsagePayload =
+            serde_json::from_str(r#"{"included":{"weekly":{"remaining_percent":-0.5}}}"#).unwrap();
         assert_eq!(p.weekly.unwrap().used_fraction(), Some(1.0));
     }
 
@@ -976,7 +992,10 @@ mod tests {
                 CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 // Give the burst time to pile up behind the fetch mutex.
                 std::thread::sleep(Duration::from_millis(50));
-                Ok(serde_json::from_str(r#"{"included":{"weekly":{"remaining_percent":90}}}"#).unwrap())
+                Ok(
+                    serde_json::from_str(r#"{"included":{"weekly":{"remaining_percent":90}}}"#)
+                        .unwrap(),
+                )
             }),
         );
         let barrier = Arc::new(Barrier::new(8));
@@ -1010,7 +1029,10 @@ mod tests {
                 if FAIL.load(std::sync::atomic::Ordering::Relaxed) {
                     Err(FetchError::Network("boom".into()))
                 } else {
-                    Ok(serde_json::from_str(&legacy_body(50.0, 50.0, "2026-10-09T00:00:00Z")).unwrap())
+                    Ok(
+                        serde_json::from_str(&legacy_body(50.0, 50.0, "2026-10-09T00:00:00Z"))
+                            .unwrap(),
+                    )
                 }
             });
         let first = t.get();
@@ -1122,12 +1144,7 @@ mod tests {
         assert_eq!(tier_for(u32::MAX), ("max", MAX_WEIGHT));
     }
 
-    fn agg_row(
-        index: usize,
-        ok: bool,
-        session: Option<f64>,
-        weekly: Option<f64>,
-    ) -> KeyUsage {
+    fn agg_row(index: usize, ok: bool, session: Option<f64>, weekly: Option<f64>) -> KeyUsage {
         KeyUsage {
             index,
             suffix: format!("sfx{index}"),
@@ -1234,11 +1251,17 @@ mod tests {
         assert_eq!(a.session_resets_at.as_deref(), Some("2026-10-09T00:00:00Z"));
         assert_eq!(a.weekly_resets_at, None);
         // Split values likewise null the field.
-        let mut keys = vec![agg_row(0, true, Some(0.4), None), agg_row(1, true, Some(0.4), None)];
+        let mut keys = vec![
+            agg_row(0, true, Some(0.4), None),
+            agg_row(1, true, Some(0.4), None),
+        ];
         keys[0].session_resets_at = Some("2026-10-09T00:00:00Z".into());
         keys[1].session_resets_at = Some("2026-10-10T00:00:00Z".into());
         let a = aggregate(&agg_snap(keys), &[1, 1]);
-        assert_eq!(a.session_resets_at, None, "accounts reset on their own schedules");
+        assert_eq!(
+            a.session_resets_at, None,
+            "accounts reset on their own schedules"
+        );
     }
 
     #[test]
@@ -1285,21 +1308,28 @@ mod tests {
         // End-to-end through the seam: remaining_percent 95.56 → used
         // 0.044 → pct 4.4; resets_at rides into the row.
         let pool = Arc::new(Pool::new(vec![("omk-usage-pct1".into(), 1)], 4, false));
-        let t = UsageTracker::new(pool, "https://ollama.com")
-            .with_fetch(|_, _, _| {
-                Ok(serde_json::from_str::<UsagePayload>(
-                    &legacy_body(95.56, 49.67, "2026-10-09T00:00:00Z"),
-                )
-                .unwrap())
-            });
+        let t = UsageTracker::new(pool, "https://ollama.com").with_fetch(|_, _, _| {
+            Ok(serde_json::from_str::<UsagePayload>(&legacy_body(
+                95.56,
+                49.67,
+                "2026-10-09T00:00:00Z",
+            ))
+            .unwrap())
+        });
         let snap = t.get();
         let row = &snap.keys[0];
         assert!(row.ok);
         assert_eq!(row.session.unwrap(), 0.044, "round3 precision cut");
         assert_eq!(row.session_pct.unwrap(), 4.4);
         assert!(row.weekly.is_some() && row.weekly_pct.unwrap() > 49.0);
-        assert_eq!(row.session_resets_at.as_deref(), Some("2026-10-09T00:00:00Z"));
-        assert_eq!(row.weekly_resets_at.as_deref(), Some("2026-10-09T00:00:00Z"));
+        assert_eq!(
+            row.session_resets_at.as_deref(),
+            Some("2026-10-09T00:00:00Z")
+        );
+        assert_eq!(
+            row.weekly_resets_at.as_deref(),
+            Some("2026-10-09T00:00:00Z")
+        );
     }
 
     #[test]

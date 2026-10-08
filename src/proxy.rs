@@ -141,9 +141,7 @@ impl Server {
         }
     }
 
-    /// Serve one request.
-    /// Set the usage tracker's per-tier caps (startup wiring). Consumes
-    /// and returns the server for chaining with `with_upstream`.
+    /// Handle a single incoming request: route, proxy, and record usage.
     pub fn handle(&self, req: tiny_http::Request) {
         let id = REQ_ID.fetch_add(1, Ordering::Relaxed);
         let started = Instant::now();
