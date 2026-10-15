@@ -5,6 +5,44 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] - 2026-10-15
+
+### Changed
+
+- Breaking: `/_usage` now reads the **documented**
+  `GET https://ollama.com/api/balance` upstream endpoint
+  (docs.ollama.com/api/balance) instead of the undocumented
+  `GET /api/usage`, which Ollama Cloud removed in early October 2026
+  (rows had been erroring "endpoint changed" since ~Oct 3). Legacy-plan
+  rows now report the *used* fraction of each window straight from
+  upstream's `remaining_percent` (inverted) with real reset instants:
+  `session`/`weekly` in 0.0–1.0, one-decimal `session_pct`/`weekly_pct`
+  mirrors, and `session_resets_at`/`weekly_resets_at` for countdowns —
+  the plan's own limit, no configured caps, nothing invented. The old
+  `models` and `cost` row fields are gone with the old payload.
+- Credit-plan keys answer with USD amounts instead of percent windows
+  (`included_usd`, `allowance_usd`, `purchased_usd`); their rows carry
+  no window fractions and sit out the `aggregate` (their unit is USD,
+  not a fraction of an allowance).
+- The upstream rate limit (10 requests per minute per user, shared
+  across keys — the docs recommend polling once per minute, which the
+  60 s cache respects for pools of up to ~10 keys) is now handled: a
+  429'd key carries its last good row, stamped `as_of` with its
+  original fetch time, and sits out the next round — or the server's
+  `Retry-After`, capped at 5 minutes — so larger pools rotate the
+  fetch budget across keys instead of losing data. Transient failures
+  (429, 5xx, network blips) carry the last good row; persistent ones
+  (unauthorized, endpoint gone, payload drift) surface as per-key
+  error strings, never a crash.
+- The `aggregate` publishes `session_resets_at`/`weekly_resets_at`
+  when every reporting key of a window carries the same reset instant
+  (envelope and openapi schema updated); windows nobody reported stay
+  `null`.
+- `--usage-aware` demotion works again on genuine fractions and now
+  applies to legacy-plan percent data only: credit-plan keys are
+  exempt (no session percent to compare against the threshold) and
+  are ordered like unmeasured keys.
+
 ## [0.7.0] - 2026-09-09
 
 ### Changed
@@ -140,7 +178,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Audit findings: SIGINT masking during shutdown, no-auth request
   paths, request body truncation, and health reset semantics.
 
-[Unreleased]: https://github.com/j-stechmann/ollamux/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/j-stechmann/ollamux/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/j-stechmann/ollamux/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/j-stechmann/ollamux/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/j-stechmann/ollamux/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/j-stechmann/ollamux/compare/v0.4.0...v0.5.0

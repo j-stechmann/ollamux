@@ -1,3 +1,15 @@
+ollamux (0.8.0-1) unstable; urgency=medium
+
+  * Changed (breaking): /_usage reads the documented GET /api/balance
+    endpoint (the old undocumented /api/usage is gone upstream);
+    legacy-plan rows report the used fraction of each window with real
+    reset instants and the models/cost fields are gone. Credit-plan
+    rows report USD amounts instead of percent windows.
+  * 429'd keys carry their last good row (stamped as_of) and sit out
+    the next round or the server's Retry-After, capped at 5 minutes.
+
+ -- Jonathan Stechmann <69059260+j-stechmann@users.noreply.github.com>  Thu, 15 Oct 2026 12:00:00 +0000
+
 ollamux (0.7.0-1) unstable; urgency=medium
 
   * Changed (breaking): /_usage `aggregate` is now the capacity-weighted
