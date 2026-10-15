@@ -1,6 +1,6 @@
 .\" ollamux(1) manual page
 .\" License: GPL-2.0-or-later
-.TH OLLAMUX 1 "2026-09-09" "ollamux 0.7.0" "User Commands"
+.TH OLLAMUX 1 "2026-10-15" "ollamux 0.8.0" "User Commands"
 .SH NAME
 ollamux \- key-rotating reverse proxy for the Ollama Cloud API
 .SH SYNOPSIS
@@ -97,38 +97,66 @@ l l.
 /api/*|Proxied to https://ollama.com with key rotation
 /v1/*|Proxied (OpenAI-compatible surface) with rotation
 /_keys|Per-key health JSON (key suffixes only, no secrets; tier + embeds latest known usage when a usage snapshot exists)
-/_usage|Per-key usage JSON from the (undocumented) GET /api/usage upstream endpoint, fan-out across all keys, 60s cache, plus a pool-capacity aggregate; ?refresh=1 forces a refresh (rate-limited to one fetch attempt per 5s)
+/_usage|Per-key usage JSON from the documented GET /api/balance upstream endpoint, fan-out across all keys, 60s cache, plus a pool-capacity aggregate; ?refresh=1 forces a refresh (rate-limited to one fetch attempt per 5s)
 /_health|Liveness JSON: {"ok":...,"keys":...,"total_slots":...}
 .TE
 .PP
 Any other path answers 404 with a hint.
 .SH USAGE INTROSPECTION
-The usage endpoint of Ollama Cloud is undocumented and may change or
-disappear without warning. ollamux decodes it tolerantly: payload drift
-is reported as a per-key error in
+Ollama Cloud publishes plan usage on the documented
+.B GET /api/balance
+upstream endpoint (docs.ollama.com/api/balance), one request per key,
+rate-limited to 10 requests per minute per user, shared across keys.
+ollamux decodes it tolerantly: payload drift is reported as a per-key
+error in
 .BR /_usage ,
-never a crash. Usage is a fraction of the plan's cap (0.0\(en1.0), not a
-token count; the session window rolls over roughly every 5 hours and
-there are no reset timestamps upstream. Usage checks never touch key
+never a crash. Legacy plans (session/weekly windows) report what
+remains of each window's allowance, reset instants included; ollamux
+inverts that to the used fraction of the plan's cap (0.0\(en1.0), not a
+token count, with one-decimal percent mirrors (session_pct,
+weekly_pct) and session_resets_at/weekly_resets_at for countdowns.
+Credit plans answer with USD amounts instead (included_usd,
+allowance_usd, purchased_usd) and carry no window fractions.
+Transient failures (429, 5xx, network blips) carry the key's last
+good row, stamped
+.I as_of
+with its original fetch time; persistent ones (unauthorized, endpoint
+gone, payload drift) surface as per-key error strings. A 429'd key
+also sits out the next round \(em or the server's
+.B Retry-After
+capped at 5 minutes \(em so large pools rotate the fetch budget
+across keys instead of losing data. Proxied
+.B /api/usage
+requests are not special: they go through normal key rotation and
+reflect whichever key served them. Usage checks never touch key
 health: a 401 there is reported in /_usage but does not mark the key
-dead. /_keys is a pure in-memory read and never triggers upstream usage
-calls. Each key's plan tier is inferred from its per-key concurrency
-(free=1, pro=3, max=10; more concurrency than normal is the next tier
-up), and /_usage also reports the pool-wide capacity-weighted mean of
-every reporting key's fraction weighted by its tier's cap (free
-\(mu1, pro \(mu50, max \(mu250) \(em a fraction in 0.0\(en1.0 like the
-per-key numbers, so a single-key pool reproduces that key's own
-fraction \(em including keys on cooldown; a dead key is expected to
-fail its own usage fetch the same way and contributes nothing (its
-weight is excluded from the denominator).
+dead. /_keys is a pure in-memory read and never triggers upstream
+usage calls. Each key's plan tier is inferred from its per-key
+concurrency (free=1, pro=3, max=10; more concurrency than normal is
+the next tier up), and /_usage also reports the pool-wide
+capacity-weighted mean of every reporting key's fraction weighted by
+its tier's cap (free \(mu1, pro \(mu50, max \(mu250) \(em a fraction in
+0.0\(en1.0 like the per-key numbers, so a single-key pool reproduces
+that key's own fraction \(em including keys on cooldown and keys
+whose latest fetch failed transiently (carried rows keep
+contributing their last known good fraction); a dead key is expected
+to fail its own usage fetch the same way and contributes nothing
+(its weight is excluded from the denominator). Windows nobody
+reported are null, never 0, and when every reporting key of a window
+carries the same resets_at the aggregate publishes that instant
+(session_resets_at, weekly_resets_at) so consumers get one honest
+reset instant for the pool. Credit-plan rows sit out the aggregate
+(their unit is USD, not a fraction of an allowance).
 .SH QUOTA-AWARE KEY SELECTION
 With
 .B \-\-usage-aware[= \fIPCT \fR]
-(see OPTIONS), ollamux polls the usage endpoint every 60 seconds and
+(see OPTIONS), ollamux polls the balance endpoint every 60 seconds and
 demotes keys whose session usage is at/over the threshold behind fresher
 keys during candidate selection \(em demoted, never excluded: an
-over-quota key still serves when no fresh key has a free slot. Failed
-refreshes keep the previous snapshot.
+over-quota key still serves when no fresh key has a free slot. The
+session window alone drives demotion; credit-plan keys are exempt
+(USD amounts carry no session percent to compare) and are ordered
+like unmeasured keys. Failed refreshes keep the previous snapshot.
 .SH FAILOVER BEHAVIOR
 Rate-limited keys (429) cool down for 60 seconds, or the server's
 .B Retry-After
