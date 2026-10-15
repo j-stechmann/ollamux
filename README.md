@@ -109,9 +109,14 @@ Rate limit: 10 requests per minute per user, shared across API keys —
 the docs recommend polling once per minute, which ollamux's passive
 60 s TTL respects for pools of up to ~10 keys. Larger pools fan out
 one GET per key in parallel, so a single round can burst over the
-shared per-user limit; affected keys report `rate limited (upstream
-429)` and back off. `/_usage` treats any payload drift as a per-key
-error string, never a crash. (Proxied `/api/usage` requests are NOT
+shared per-user limit; a 429'd key keeps its last good row (an `as_of`
+timestamp marks when that data was fetched) and sits out the next
+round — or the server's `Retry-After`, capped at 5 min — so large
+pools rotate the fetch budget across keys instead of losing data.
+Transient failures (429, 5xx, network blips) carry the last good row;
+persistent ones (unauthorized, endpoint gone, payload drift) surface
+as per-key error strings, never a crash. (Proxied `/api/usage`
+requests are NOT
 special: they go through normal key rotation and reflect whichever key
 served them — use `/_usage` for the per-account picture.)
 
@@ -130,14 +135,18 @@ The guard counts
 keep the last good snapshot), polling loops back off instead of fanning
 out on every request.
 
-`/_usage` fans out to the balance endpoint with every configured key in
-parallel (one GET per key) and answers with one row per key (suffixes
+`/_usage` fans out to the balance endpoint with every configured key
+(one GET per key, in parallel; keys in 429 backoff sit the round out)
+and answers with one row per key (suffixes
 only, never secrets): on legacy plans the used fraction of each window —
 `session`/`weekly` in 0.0–1.0 (upstream's remaining percent, inverted),
 one-decimal `*_pct` mirrors, and `session_resets_at`/`weekly_resets_at`
 for countdowns — or, on credit-plan keys, `included_usd`/`allowance_usd`
 and `purchased_usd` with no percent windows, or a per-key error
-otherwise. Each row also carries the key's plan `tier`, inferred from
+otherwise. Rows carried forward from a previous round (the key's latest
+fetch failed transiently or was skipped in 429 backoff) carry `as_of`,
+the unix time of their original fetch — absent means fresh this round.
+Each row also carries the key's plan `tier`, inferred from
 its per-key concurrency (`KEY:N` — free=1, pro=3, max=10; more
 concurrency than normal is the next tier up). Responses are cached for
 60 s (`updated`/`age_s`/`stale` fields tell you the age); `/_keys` embeds
@@ -152,7 +161,9 @@ so it reads as *the fraction of the pool's combined capacity in use* and
 stays in 0.0–1.0 like the per-key numbers: a single-key pool reproduces
 that key's own fraction, and applications built for the per-key range
 need no adjustment. All keys contribute, including ones currently on
-cooldown (usage fetching is health-blind); a dead key (401/403) is
+cooldown (usage fetching is health-blind) and ones whose latest fetch
+failed transiently (carried rows keep contributing their last known good
+fraction); a dead key (401/403) is
 expected to fail its own usage fetch the same way and contributes
 nothing (its weight is excluded from the denominator, so it never
 dilutes the number). Windows nobody reported are `null`, never 0; when
@@ -176,8 +187,13 @@ not a fraction of an allowance).
    {"index":1,"suffix":"5678","ok":true,"tier":"max",
     "session":0.81,"weekly":0.42,"session_pct":81.0,"weekly_pct":42.0,
     "session_resets_at":"2026-10-09T00:00:00Z",
-    "weekly_resets_at":"2026-10-12T00:00:00Z"}]}
+    "weekly_resets_at":"2026-10-12T00:00:00Z",
+    "as_of":1756619955}]}
 ```
+
+(In the example, key `5678`'s latest fetch failed transiently — its data
+was fetched 45 s before the snapshot completed, hence `as_of`; key
+`1234` is fresh and carries no `as_of`.)
 
 ## Quota-aware key selection
 

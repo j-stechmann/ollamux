@@ -30,14 +30,18 @@
 //! The endpoint is rate-limited to 10 requests per minute per user
 //! (shared across keys) and the docs recommend polling once per minute —
 //! USAGE_TTL (60 s) stays within that for single-key and small pools on
-//! the passive path. Caveats: the multi-key fan-out fires its GETs in
-//! parallel, so pools larger than ~10 keys can burst over the shared
-//! per-user limit (affected keys report upstream 429s and back off), and
-//! forced refreshes are gated by MIN_REFRESH (5 s), not the TTL, so a
-//! `?refresh=1` loop can exceed 10 req/min per key. Decoding is
-//! maximally tolerant: any
-//! shape drift becomes a per-key error string in `/_usage`, never a
-//! panic, never a 5xx.
+//! the passive path. Pools larger than ~10 keys can still burst over
+//! the shared per-user limit, so a round may 429 some keys; those keys
+//! carry their last good row (marked `as_of`) instead of degrading to
+//! errors, and sit out later rounds per upstream's `Retry-After`
+//! (capped at 5 min, defaulting to one round), rotating the fetch
+//! budget across the pool instead of 429ing the same keys every round.
+//! Transient failures (429, 5xx, network blips) carry the previous good
+//! row; persistent ones (401/403, 404, shape drift) surface their error
+//! rows. Forced refreshes are gated by MIN_REFRESH (5 s), not the TTL,
+//! so a `?refresh=1` loop can exceed 10 req/min per key. Decoding is
+//! maximally tolerant: any shape drift becomes a per-key error string
+//! in `/_usage`, never a panic, never a 5xx.
 //!
 //! Introspection is strictly read-only: usage fetches consume no pool
 //! slots, and an auth failure here is *reported*, never `mark_dead` (only
@@ -51,8 +55,11 @@
 //! the total reads as the fraction of the pool's combined capacity in use —
 //! a number in [0, 1] like the per-key values. Fetching is health-blind,
 //! so keys on cooldown contribute like any other; error rows (e.g. a
-//! dead key's own 401, its expected outcome) carry no numbers and cannot
-//! contribute.
+//! dead key's own 401, its expected outcome) carry no numbers and
+//! cannot contribute — but carried rows do: a transiently failing key
+//! keeps contributing its last known good fraction (and its quota-mask
+//! bit), so a blip or a rate-limit backoff never wipes data (see
+//! `UsageTracker::carried_or_failed`).
 
 use crate::pool::Pool;
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
@@ -69,6 +76,16 @@ pub const USAGE_TTL: Duration = Duration::from_secs(60);
 /// age (see `do_fetch_inner`). Overridable via `with_min_refresh` for
 /// tests.
 const MIN_REFRESH: Duration = Duration::from_secs(5);
+/// Backoff applied after a 429 whose `Retry-After` is absent or
+/// unparseable: one round — the shared limit is per-minute, so sitting
+/// out the next round rotates the fetch budget across large pools
+/// instead of 429ing the same keys every round. Overridable via
+/// `with_default_backoff` for tests.
+const DEFAULT_BACKOFF: Duration = Duration::from_secs(60);
+/// Cap on a 429 backoff — mirrors the proxy path's cooldown cap for
+/// client-traffic 429s, so a hostile `Retry-After` can't shelve a key
+/// indefinitely.
+const MAX_BACKOFF: Duration = Duration::from_secs(5 * 60);
 /// Upstream timeouts for usage fetches (bounded; never a whole-request
 /// timeout beyond these).
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -305,6 +322,15 @@ pub struct KeyUsage {
     pub allowance_usd: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub purchased_usd: Option<f64>,
+    /// Unix seconds when this row's data was fetched. Present only on
+    /// rows carried forward from a previous round — the key's latest
+    /// fetch failed transiently (429/5xx/network) or was skipped in 429
+    /// backoff (see `UsageTracker::carried_or_failed`) — and then it is
+    /// the *original* fetch time, however many rounds carried it.
+    /// Absent means the row is fresh this round (the envelope's `age_s`
+    /// then covers it).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub as_of: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -325,6 +351,7 @@ impl KeyUsage {
             included_usd: None,
             allowance_usd: None,
             purchased_usd: None,
+            as_of: None,
             error: Some(error),
         }
     }
@@ -346,6 +373,7 @@ impl KeyUsage {
             included_usd: None,
             allowance_usd: None,
             purchased_usd: None,
+            as_of: None,
             error: None,
         }
     }
@@ -397,9 +425,11 @@ impl UsageSnapshot {
 pub struct UsageAggregate {
     pub session: Option<f64>,
     pub weekly: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    // No skip_serializing_if on these: the envelope's schema has every
+    // aggregate field required-nullable, so direct serde serialization
+    // must emit `null` for None just like the field-by-field json! render
+    // in proxy.rs does.
     pub session_resets_at: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub weekly_resets_at: Option<String>,
 }
 
@@ -503,16 +533,35 @@ pub struct UsageTracker {
     last_attempt: Mutex<Option<Instant>>,
     /// Minimum interval between fetch attempts (tests may shorten it).
     min_refresh: Duration,
+    /// Per-key "not before" instants after a 429 (index-aligned; `None`
+    /// or past = eligible). Seeded from upstream's `Retry-After` where
+    /// parseable, capped at MAX_BACKOFF, else the one-round default —
+    /// a rate-limited key sits out whole rounds instead of hammering
+    /// the shared 10 req/min budget, which rotates the fetch budget
+    /// across large pools.
+    backoff_until: Mutex<Vec<Option<Instant>>>,
+    /// Backoff applied after a 429 without a usable `Retry-After`
+    /// (tests may shorten it via `with_default_backoff`).
+    default_backoff: Duration,
 }
 
-/// Per-key fetch failure. upstream HTTP error bodies are withheld: they
+/// Per-key fetch failure. Upstream HTTP error bodies are withheld: they
 /// may reflect the key and must never be relayed into /_usage.
 #[derive(Debug)]
 pub enum FetchError {
-    /// Upstream answered with an HTTP error status.
+    /// Upstream answered with an HTTP error status. 5xx are transient
+    /// (carried forward, see `UsageTracker::carried_or_failed`); 401/403
+    /// and 404 are persistent (error rows).
     Status(u16),
-    /// Transport-level failure (DNS, TLS, timeout…).
+    /// Transport-level failure (DNS, TLS, timeout…) — transient.
     Network(String),
+    /// Upstream 429 with its published `Retry-After`, when parseable as
+    /// integer seconds (HTTP-dates and junk are `None`) — transient, and
+    /// the seed of the per-key backoff in `do_fetch_inner`.
+    RateLimited(Option<Duration>),
+    /// The body decoded but is not a documented balance shape (the
+    /// `parse_payload` gate) — persistent, never carried forward.
+    Drift(String),
 }
 
 fn parse_payload(body: &str) -> Result<UsagePayload, String> {
@@ -542,6 +591,7 @@ impl UsageTracker {
         let upstream = upstream.trim_end_matches('/').to_string();
         let base = upstream.clone();
         let agent = Arc::new(agent);
+        let backoff = vec![None; pool.len()];
         UsageTracker {
             pool,
             ttl: USAGE_TTL,
@@ -553,6 +603,8 @@ impl UsageTracker {
             fetch_mu: Mutex::new(()),
             last_attempt: Mutex::new(None),
             min_refresh: MIN_REFRESH,
+            backoff_until: Mutex::new(backoff),
+            default_backoff: DEFAULT_BACKOFF,
         }
     }
 
@@ -565,6 +617,14 @@ impl UsageTracker {
     #[doc(hidden)]
     pub fn with_min_refresh(mut self, d: Duration) -> UsageTracker {
         self.min_refresh = d;
+        self
+    }
+
+    /// Override the post-429 default backoff, applied when upstream's
+    /// `Retry-After` is absent or unparseable (tests).
+    #[doc(hidden)]
+    pub fn with_default_backoff(mut self, d: Duration) -> UsageTracker {
+        self.default_backoff = d;
         self
     }
 
@@ -686,19 +746,44 @@ impl UsageTracker {
     }
 
     /// The one fetch routine (callers must hold the fetch guard). On
-    /// failure the existing snapshot is kept untouched; on success a new
-    /// snapshot replaces it and the pool is notified (quota-aware routing).
-    /// `last_attempt` is stamped on every round — success or failure — so
-    /// the min-interval guard keeps rate-limiting retries while a failed
-    /// round leaves the snapshot (and its age) frozen.
+    /// success a new snapshot replaces the old one and the pool is
+    /// notified (quota-aware routing); `last_attempt` is stamped on every
+    /// round — success or failure — so the min-interval guard keeps
+    /// rate-limiting retries while a failed round leaves the snapshot
+    /// (and its age) frozen.
+    ///
+    /// Transient per-key failures (429, 5xx, network blips) carry the
+    /// key's previous good row forward — marked `as_of` — instead of
+    /// wiping it (without the carry, a partial failure round would drop
+    /// the key's row, its aggregate weight and its quota-mask bit, and
+    /// large pools would lose data to rate limits every round);
+    /// persistent ones (401/403, 404, drift) surface their error row. A
+    /// 429 also sets a per-key backoff (`Retry-After`, capped at
+    /// MAX_BACKOFF, defaulting to one round): backed-off keys are
+    /// skipped entirely by later rounds. A round with zero *fresh*
+    /// successes keeps the previous snapshot — carried rows alone must
+    /// not advance the snapshot's age, or an outage would masquerade as
+    /// fresh data — and first-ever failures still land so `/_usage` can
+    /// surface them.
     fn do_fetch_inner(&self, _guard: &MutexGuard<'_, ()>) -> Arc<UsageSnapshot> {
-        let results = self.fetch_all();
+        let eligible = self.eligible_keys();
+        let results = self.fetch_all(&eligible);
         *lock(&self.last_attempt) = Some(Instant::now());
+        let prev = self.peek();
         let mut keys = Vec::with_capacity(self.pool.len());
+        let mut fresh_ok = 0usize;
         for (i, res) in results.into_iter().enumerate() {
             let suffix = self.pool.suffix_of(i);
+            // The bare seam variant behaves like the real one so every
+            // 429 backs off identically (the HTTP path only produces
+            // RateLimited; Status(429) exists for the test seam).
+            let res = match res {
+                Some(Err(FetchError::Status(429))) => Some(Err(FetchError::RateLimited(None))),
+                other => other,
+            };
             keys.push(match res {
-                Ok(p) => {
+                Some(Ok(p)) => {
+                    fresh_ok += 1;
                     // Fractions are upstream's own numbers (1 − remaining),
                     // not derived from any configured cap. round3 cuts the
                     // fp noise of the ÷100 (0.037000000000000026 → 0.037).
@@ -726,31 +811,73 @@ impl UsageTracker {
                         included_usd: p.included_usd.as_ref().and_then(|i| i.balance_usd),
                         allowance_usd: p.included_usd.as_ref().and_then(|i| i.allowance_usd),
                         purchased_usd: p.purchased_usd,
+                        as_of: None,
                         error: None,
                     }
                 }
-                Err(FetchError::Status(code)) => KeyUsage::failed(
-                    i,
-                    suffix,
-                    match code {
+                Some(Err(FetchError::RateLimited(ra))) => {
+                    // One shared 10 req/min budget: a 429'd key sits out
+                    // the next round — or its Retry-After, capped.
+                    let backoff = clamp_backoff(ra, self.default_backoff);
+                    lock(&self.backoff_until)[i] = Some(Instant::now() + backoff);
+                    self.carried_or_failed(
+                        i,
+                        suffix,
+                        "rate limited (upstream 429)",
+                        true,
+                        prev.as_deref(),
+                    )
+                }
+                Some(Err(FetchError::Status(code))) => {
+                    // 5xx is a server-side blip (carry); 401/403 (dead
+                    // key), 404 and odd 4xx are persistent (error row).
+                    let transient = (500..=599).contains(&code);
+                    let reason = match code {
                         401 | 403 => "unauthorized".to_string(),
                         404 => "endpoint gone (upstream 404)".to_string(),
-                        429 => "rate limited (upstream 429)".to_string(),
                         other => format!("upstream HTTP {other}"),
-                    },
+                    };
+                    self.carried_or_failed(i, suffix, &reason, transient, prev.as_deref())
+                }
+                Some(Err(FetchError::Network(e))) => self.carried_or_failed(
+                    i,
+                    suffix,
+                    &format!("network: {e}"),
+                    true,
+                    prev.as_deref(),
                 ),
-                Err(FetchError::Network(e)) => KeyUsage::failed(i, suffix, format!("network: {e}")),
+                // Shape drift is persistent (the row must say so, not
+                // replay stale data while upstream changed the payload).
+                Some(Err(FetchError::Drift(msg))) => KeyUsage::failed(i, suffix, msg),
+                None if !eligible.get(i).copied().unwrap_or(true) => {
+                    // Skipped in 429 backoff: the previous 429 is still
+                    // in effect, so that is what the row carries (or
+                    // says) until the backoff elapses.
+                    self.carried_or_failed(
+                        i,
+                        suffix,
+                        "rate limited (upstream 429)",
+                        true,
+                        prev.as_deref(),
+                    )
+                }
+                None => {
+                    // Defensive: an eligible key's thread produced
+                    // nothing (panic mid-fetch). Transient like network.
+                    self.carried_or_failed(i, suffix, "network: no result", true, prev.as_deref())
+                }
             });
         }
-        // If every key failed, don't overwrite good data with nothing: a
-        // transient failure (network blip, one 429) would otherwise wipe the
-        // usage mask and re-admit over-quota keys for a full TTL. Keep the
-        // previous snapshot (its usage is already published to the pool);
-        // retries are rate-limited by last_attempt via MIN_REFRESH, since
-        // this path freezes the snapshot's own age. First-ever failures
-        // must still land so /_usage can surface them.
-        if keys.iter().all(|k| !k.ok) {
-            if let Some(prev) = self.peek() {
+        // Zero fresh successes: don't overwrite good data with nothing —
+        // fetch failures and backoff skips alike. Keeping the previous
+        // snapshot freezes its age, so the passive path keeps demanding
+        // retries, and a transient failure (network blip, one 429) can't
+        // wipe the usage mask and re-admit over-quota keys for a full
+        // TTL. Retries are rate-limited by last_attempt via MIN_REFRESH.
+        // First-ever failures must still land so /_usage can surface
+        // them.
+        if fresh_ok == 0 {
+            if let Some(prev) = prev {
                 return prev;
             }
         }
@@ -763,14 +890,62 @@ impl UsageTracker {
         snap
     }
 
-    /// Parallel fan-out: one thread per key, index-aligned results. Never
-    /// touches pool state (no admits, no health marks).
-    fn fetch_all(&self) -> Vec<Result<UsagePayload, FetchError>> {
+    /// The row for a fetch failure or backoff skip: the key's previous
+    /// good row carried forward and marked `as_of` — chain-preserving, a
+    /// carried row keeps its *original* fetch time — when the failure is
+    /// transient and good data exists; the error row otherwise. Carried
+    /// rows keep the quota mask, the aggregate denominator and `/_keys`
+    /// briefs stable across transient failures.
+    fn carried_or_failed(
+        &self,
+        i: usize,
+        suffix: String,
+        reason: &str,
+        transient: bool,
+        prev: Option<&UsageSnapshot>,
+    ) -> KeyUsage {
+        if transient {
+            if let Some(p) = prev {
+                if let Some(row) = p.keys.get(i).filter(|k| k.ok) {
+                    let mut carried = row.clone();
+                    carried.as_of = Some(row.as_of.unwrap_or_else(|| p.updated_unix()));
+                    return carried;
+                }
+            }
+        }
+        KeyUsage::failed(i, suffix, reason.to_string())
+    }
+
+    /// Which keys may be fetched this round: a key is ineligible only
+    /// while its 429 backoff (see `do_fetch_inner`) is still in effect.
+    fn eligible_keys(&self) -> Vec<bool> {
+        let backoff = lock(&self.backoff_until);
+        let now = Instant::now();
+        (0..self.pool.len())
+            .map(|i| {
+                backoff
+                    .get(i)
+                    .copied()
+                    .flatten()
+                    .is_none_or(|until| until <= now)
+            })
+            .collect()
+    }
+
+    /// Parallel fan-out: one thread per *eligible* key, index-aligned
+    /// results (`None` = skipped by backoff, or — defensively — a
+    /// thread that produced nothing; the caller tells them apart via
+    /// `eligible`). Never touches pool state (no admits, no health
+    /// marks).
+    fn fetch_all(&self, eligible: &[bool]) -> Vec<Option<Result<UsagePayload, FetchError>>> {
         let n = self.pool.len();
         let mut results: Vec<Option<Result<UsagePayload, FetchError>>> =
             (0..n).map(|_| None).collect();
         std::thread::scope(|s| {
             for (i, slot) in results.iter_mut().enumerate() {
+                if !eligible.get(i).copied().unwrap_or(true) {
+                    continue;
+                }
                 let fetch = &self.fetch;
                 let secret = self.pool.secret_of(i).to_string();
                 s.spawn(move || {
@@ -779,9 +954,6 @@ impl UsageTracker {
             }
         });
         results
-            .into_iter()
-            .map(|slot| slot.unwrap_or_else(|| Err(FetchError::Network("no result".into()))))
-            .collect()
     }
 
     /// Block until any snapshot exists (first-request-with-contended-fetch
@@ -803,15 +975,34 @@ fn pct(f: f64) -> f64 {
     (f.clamp(0.0, 1.0) * 1000.0).round() / 10.0
 }
 
+/// Backoff to apply after a 429: upstream's `Retry-After` when it sent
+/// a usable one, else the default; capped at MAX_BACKOFF. A Retry-After
+/// of zero is honored literally (the key is eligible again next round).
+fn clamp_backoff(retry_after: Option<Duration>, default: Duration) -> Duration {
+    retry_after.unwrap_or(default).min(MAX_BACKOFF)
+}
+
+/// Upstream's `Retry-After` as a delay, when parseable as integer
+/// seconds (the documented rate limiter's format). HTTP-dates and junk
+/// read as absent — the caller then applies its default backoff.
+fn retry_after_seconds(resp: &ureq::Response) -> Option<Duration> {
+    let v = resp.header("Retry-After")?;
+    let secs: u64 = v.trim().parse().ok()?;
+    Some(Duration::from_secs(secs))
+}
+
 /// One keyed HTTP GET of `/api/balance` decoded tolerantly. A single
 /// request per key per round: the docs rate-limit 10 req/min per user
 /// shared across all keys and devices, so the TTL stays at 60 s
 /// (>= 6 s is the floor for a single key). Caveats: the fan-out fires
-/// one GET per key in parallel, so pools with more than ~10 keys burst
-/// over the shared per-user limit (keys then report upstream 429s and
-/// back off via their own cooldown), and forced refreshes are gated by
-/// a 5 s minimum interval, not this TTL, so a refresh loop can exceed
-/// 10 req/min per key.
+/// one GET per eligible key in parallel, so pools with more than ~10
+/// keys burst over the shared per-user limit — 429'd keys then carry
+/// their last good row and sit out later rounds per their Retry-After
+/// (see `do_fetch_inner`) — and forced refreshes are gated by a 5 s
+/// minimum interval, not this TTL, so a refresh loop can exceed
+/// 10 req/min per key. A 429 surfaces as `RateLimited` (with the
+/// `Retry-After` it published); a body that is not a documented
+/// balance shape surfaces as `Drift` — persistent, never carried.
 fn fetch_balance_http(
     agent: &ureq::Agent,
     upstream: &str,
@@ -824,6 +1015,7 @@ fn fetch_balance_http(
         .set("Accept", "application/json")
         .call()
         .map_err(|e| match e {
+            ureq::Error::Status(429, resp) => FetchError::RateLimited(retry_after_seconds(&resp)),
             ureq::Error::Status(code, _) => FetchError::Status(code),
             other => FetchError::Network(other.to_string()),
         })?;
@@ -834,7 +1026,7 @@ fn fetch_balance_http(
     let body = resp
         .into_string()
         .map_err(|e| FetchError::Network(e.to_string()))?;
-    parse_payload(&body).map_err(FetchError::Network)
+    parse_payload(&body).map_err(FetchError::Drift)
 }
 
 #[cfg(test)]
@@ -953,7 +1145,7 @@ mod tests {
         // Garbage body → decode error from the seam, surfaced as failure.
         let pool = Arc::new(Pool::new(vec![("omk-usage-drift".into(), 1)], 4, false));
         let t = UsageTracker::new(pool, "https://ollama.com").with_fetch(|_, _, _| {
-            Err(FetchError::Network(
+            Err(FetchError::Drift(
                 "endpoint changed (unexpected payload): eof".into(),
             ))
         });
@@ -1083,14 +1275,16 @@ mod tests {
         // The bug this pins: failed rounds keep the previous snapshot, so
         // snapshot age freezes and a snapshot-age-based guard would let a
         // ?refresh=1 (or stale get()) loop fan out on every call. The
-        // attempt-based guard must rate-limit those rounds too.
+        // attempt-based guard must rate-limit those rounds too. (503, not
+        // 429: a 429 additionally backs the key off per round, which
+        // would skip fetches for its own reason — pinned separately.)
         static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let pool = Arc::new(Pool::new(vec![("omk-usage-bo01".into(), 1)], 4, false));
         let t = UsageTracker::new(pool, "https://ollama.com")
             .with_min_refresh(Duration::from_millis(100))
             .with_fetch(|_, _, _| {
                 CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                Err(FetchError::Status(429))
+                Err(FetchError::Status(503))
             });
         let first = t.get(); // first-ever failure lands (no snapshot yet)
         assert!(!first.keys[0].ok);
@@ -1191,6 +1385,7 @@ mod tests {
             included_usd: None,
             allowance_usd: None,
             purchased_usd: None,
+            as_of: None,
             error: (!ok).then(|| "test failure".to_string()),
         }
     }
@@ -1382,5 +1577,283 @@ mod tests {
         assert_eq!(row.included_usd, Some(72.5));
         assert_eq!(row.allowance_usd, Some(100.0));
         assert_eq!(row.purchased_usd, Some(25.0));
+    }
+
+    // ----- transient-failure carry and 429 backoff -----
+
+    #[test]
+    fn partial_transient_failure_carries_last_good_row() {
+        // The steady-state pin for large pools: one key's 429 must not
+        // wipe its row. It carries the last good data — marked as_of —
+        // while the healthy key stays fresh (as_of absent), and it keeps
+        // contributing to the aggregate.
+        static FAIL0: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let pool = Arc::new(Pool::new(
+            vec![("omk-usage-cv01".into(), 1), ("omk-usage-cv02".into(), 1)],
+            4,
+            false,
+        ));
+        let t = UsageTracker::new(pool, "https://ollama.com")
+            .with_ttl(Duration::ZERO)
+            .with_min_refresh(Duration::ZERO)
+            .with_fetch(|i, _, _| {
+                if i == 0 && FAIL0.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Err(FetchError::RateLimited(None));
+                }
+                Ok(serde_json::from_str(&legacy_body(90.0, 80.0, "2026-10-09T00:00:00Z")).unwrap())
+            });
+        let first = t.get();
+        assert!(first.keys[0].ok && first.keys[1].ok);
+        assert_eq!(first.keys[0].as_of, None, "fresh rows carry no as_of");
+        let fetched_at = first.updated_unix();
+        FAIL0.store(true, std::sync::atomic::Ordering::Relaxed);
+        let second = t.get();
+        assert!(second.keys[0].ok, "429'd key must keep its good row");
+        assert_eq!(second.keys[0].session, Some(0.1), "carried data survives");
+        assert_eq!(second.keys[0].error, None);
+        let as_of = second.keys[0].as_of.expect("carried row is marked as_of");
+        assert!(
+            (as_of as i64 - fetched_at as i64).abs() <= 1,
+            "as_of is the first round's fetch time (±1 s wall-clock granularity): {as_of} vs {fetched_at}"
+        );
+        assert!(second.keys[1].ok);
+        assert_eq!(second.keys[1].as_of, None, "healthy key stays fresh");
+        // Carried rows are ok rows: the aggregate still covers key 0.
+        let agg = aggregate(&second, &[1, 1]);
+        assert_eq!(agg.session, Some(0.1), "(0.1 + 0.1) / 2");
+    }
+
+    #[test]
+    fn carried_as_of_chains_and_backoff_skips_next_round() {
+        // Round 2's 429 carries the row; round 3 (inside the Retry-After
+        // window) must not even fetch the key — and the carried row keeps
+        // its *original* as_of, not the round-2 time. After the backoff
+        // elapses the key is fetched again and the fresh row clears as_of.
+        static CALLS: [std::sync::atomic::AtomicUsize; 2] = [
+            std::sync::atomic::AtomicUsize::new(0),
+            std::sync::atomic::AtomicUsize::new(0),
+        ];
+        static FAIL0: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        fn calls(i: usize) -> usize {
+            CALLS[i].load(std::sync::atomic::Ordering::Relaxed)
+        }
+        let pool = Arc::new(Pool::new(
+            vec![("omk-usage-bk01".into(), 1), ("omk-usage-bk02".into(), 1)],
+            4,
+            false,
+        ));
+        let t = UsageTracker::new(pool, "https://ollama.com")
+            .with_ttl(Duration::ZERO)
+            .with_min_refresh(Duration::ZERO)
+            .with_fetch(|i, _, _| {
+                CALLS[i].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if i == 0 && FAIL0.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Err(FetchError::RateLimited(Some(Duration::from_millis(80))));
+                }
+                Ok(serde_json::from_str(&legacy_body(75.0, 70.0, "2026-10-09T00:00:00Z")).unwrap())
+            });
+        let _ = t.get();
+        assert_eq!((calls(0), calls(1)), (1, 1));
+
+        FAIL0.store(true, std::sync::atomic::Ordering::Relaxed);
+        let second = t.get(); // key0 fetches and 429s (Retry-After 80 ms)
+        assert_eq!((calls(0), calls(1)), (2, 2));
+        assert!(second.keys[0].ok, "429'd key carries its good row");
+        assert_eq!(second.keys[0].session, Some(0.25));
+        let as_of = second.keys[0].as_of.expect("carried row is marked as_of");
+
+        let third = t.get(); // key0 is inside its 80 ms backoff → skipped
+        assert_eq!(calls(0), 2, "backed-off key must not be fetched");
+        assert_eq!(calls(1), 3);
+        assert!(third.keys[0].ok, "skipped key carries its good row");
+        assert_eq!(
+            third.keys[0].as_of,
+            Some(as_of),
+            "as_of chains the original fetch time"
+        );
+        assert_eq!(third.keys[0].session, Some(0.25));
+
+        std::thread::sleep(Duration::from_millis(120));
+        FAIL0.store(false, std::sync::atomic::Ordering::Relaxed);
+        let fourth = t.get(); // Retry-After elapsed → fetched again
+        assert_eq!(calls(0), 3, "eligible again after Retry-After elapsed");
+        assert!(fourth.keys[0].ok);
+        assert_eq!(fourth.keys[0].as_of, None, "recovery clears as_of");
+    }
+
+    #[test]
+    fn persistent_failures_surface_errors_transient_ones_carry() {
+        // Transient failures (5xx, network blips) carry the last good row;
+        // persistent ones (401 — a dead key's expected outcome —, drift,
+        // 404) surface their error rows, and once they did there is no
+        // good row left for a later transient failure to carry. Recovery
+        // clears as_of. (Key 1 stays healthy so partial rounds publish —
+        // the all-fail guard would otherwise keep the previous snapshot
+        // wholesale.)
+        static STEP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let pool = Arc::new(Pool::new(
+            vec![("omk-usage-sl01".into(), 1), ("omk-usage-sl02".into(), 1)],
+            4,
+            false,
+        ));
+        let t = UsageTracker::new(pool, "https://ollama.com")
+            .with_ttl(Duration::ZERO)
+            .with_min_refresh(Duration::ZERO)
+            .with_fetch(|i, _, _| {
+                if i == 1 {
+                    return Ok(serde_json::from_str(&legacy_body(
+                        90.0,
+                        90.0,
+                        "2026-10-09T00:00:00Z",
+                    ))
+                    .unwrap());
+                }
+                let s = STEP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                match s {
+                    0 => Ok(
+                        serde_json::from_str(&legacy_body(80.0, 60.0, "2026-10-09T00:00:00Z"))
+                            .unwrap(),
+                    ),
+                    1 => Err(FetchError::Status(500)),
+                    2 => Err(FetchError::Network("connection reset".into())),
+                    3 => Ok(
+                        serde_json::from_str(&legacy_body(30.0, 20.0, "2026-10-09T00:00:00Z"))
+                            .unwrap(),
+                    ),
+                    4 => Err(FetchError::Status(401)),
+                    5 => Err(FetchError::Status(500)),
+                    6 => Err(FetchError::Drift(
+                        "endpoint changed (unexpected payload)".into(),
+                    )),
+                    7 => Err(FetchError::Status(404)),
+                    _ => Ok(
+                        serde_json::from_str(&legacy_body(30.0, 20.0, "2026-10-09T00:00:00Z"))
+                            .unwrap(),
+                    ),
+                }
+            });
+        let first = t.get();
+        assert!(first.keys[0].ok);
+        assert_eq!(first.keys[0].session, Some(0.2));
+        assert_eq!(first.keys[0].as_of, None);
+
+        let second = t.get(); // 500 → carry
+        assert!(second.keys[0].ok, "5xx is transient: last good row carries");
+        assert_eq!(second.keys[0].session, Some(0.2));
+        let as_of = second.keys[0].as_of.expect("carried row is marked as_of");
+
+        let third = t.get(); // network blip → carry, same original as_of
+        assert!(third.keys[0].ok, "network blips carry");
+        assert_eq!(third.keys[0].session, Some(0.2));
+        assert_eq!(
+            third.keys[0].as_of,
+            Some(as_of),
+            "as_of chains the original fetch"
+        );
+        assert_eq!(
+            third.keys[0].error, None,
+            "carried rows are ok rows, not error rows"
+        );
+
+        let fourth = t.get(); // recovery → fresh
+        assert!(fourth.keys[0].ok);
+        assert_eq!(fourth.keys[0].session, Some(0.7));
+        assert_eq!(fourth.keys[0].as_of, None, "recovery clears as_of");
+
+        let fifth = t.get(); // 401: the dead key's expected outcome
+        assert!(!fifth.keys[0].ok, "401 must surface its error");
+        assert_eq!(fifth.keys[0].error.as_deref(), Some("unauthorized"));
+        assert_eq!(fifth.keys[0].as_of, None);
+        assert_eq!(
+            fifth.keys[0].session, None,
+            "no carry on persistent failure"
+        );
+
+        let sixth = t.get(); // 500 with no good row left → honest error
+        assert!(!sixth.keys[0].ok, "carry needs prior good data");
+        assert_eq!(sixth.keys[0].error.as_deref(), Some("upstream HTTP 500"));
+
+        let seventh = t.get(); // drift
+        assert!(!seventh.keys[0].ok, "drift must surface its error");
+        assert!(
+            seventh.keys[0]
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("endpoint changed"),
+            "no network: prefix on drift errors either"
+        );
+
+        let eighth = t.get(); // 404: endpoint gone is persistent
+        assert!(!eighth.keys[0].ok, "404 must surface its error");
+        assert_eq!(
+            eighth.keys[0].error.as_deref(),
+            Some("endpoint gone (upstream 404)")
+        );
+
+        let ninth = t.get(); // recovery → fresh
+        assert!(ninth.keys[0].ok);
+        assert_eq!(ninth.keys[0].session, Some(0.7));
+        assert_eq!(ninth.keys[0].as_of, None);
+    }
+
+    #[test]
+    fn partial_failure_keeps_over_quota_mask() {
+        // The routing pin: without the carry, a 429'd over-quota key
+        // loses its mask bit every partial-failure round and gets
+        // re-admitted by quota-aware routing; the carried row keeps it.
+        static FAIL0: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let pool = Arc::new(Pool::new(
+            vec![("omk-usage-mk01".into(), 1), ("omk-usage-mk02".into(), 1)],
+            4,
+            false,
+        ));
+        pool.set_usage_threshold(80);
+        let t = UsageTracker::new(pool.clone(), "https://ollama.com")
+            .with_ttl(Duration::ZERO)
+            .with_min_refresh(Duration::ZERO)
+            .with_fetch(|i, _, _| {
+                if i == 0 && FAIL0.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Err(FetchError::RateLimited(None));
+                }
+                // key0: 5% remaining → 95% used (over the 80% threshold).
+                Ok(serde_json::from_str(&if i == 0 {
+                    legacy_body(5.0, 5.0, "2026-10-09T00:00:00Z")
+                } else {
+                    legacy_body(90.0, 90.0, "2026-10-09T00:00:00Z")
+                })
+                .unwrap())
+            });
+        let _ = t.get();
+        assert!(pool.is_over_quota(0), "95% used must demote key 0");
+        assert!(!pool.is_over_quota(1));
+        FAIL0.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = t.get(); // key0 429s, key1 fresh
+        assert!(
+            pool.is_over_quota(0),
+            "carried row keeps the over-quota mask bit"
+        );
+        assert!(!pool.is_over_quota(1));
+    }
+
+    #[test]
+    fn backoff_honors_retry_after_capped() {
+        let d = Duration::from_secs(60);
+        assert_eq!(clamp_backoff(None, d), d, "absent Retry-After → default");
+        assert_eq!(
+            clamp_backoff(Some(Duration::from_secs(30)), d),
+            Duration::from_secs(30),
+            "usable Retry-After wins"
+        );
+        assert_eq!(
+            clamp_backoff(Some(Duration::from_secs(6000)), d),
+            MAX_BACKOFF,
+            "hostile Retry-After is capped"
+        );
+        assert_eq!(
+            clamp_backoff(Some(Duration::ZERO), d),
+            Duration::ZERO,
+            "Retry-After: 0 is honored literally"
+        );
     }
 }

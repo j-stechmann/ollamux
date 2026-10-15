@@ -111,6 +111,21 @@ impl Upstream {
     pub fn spawn_auth(
         resp_for: impl Fn(&str, Option<&str>) -> (u16, String, String) + Send + Sync + 'static,
     ) -> Upstream {
+        Self::spawn_auth_headers(move |path, auth| {
+            let (status, reason, body) = resp_for(path, auth);
+            (status, reason, body, Vec::new())
+        })
+    }
+
+    /// Like spawn_auth, but the responder also sets response headers —
+    /// needed to script `Retry-After` on 429s. resp_for: given
+    /// (path-with-query, auth), return (status, reason, body, headers).
+    pub fn spawn_auth_headers(
+        resp_for: impl Fn(&str, Option<&str>) -> (u16, String, String, Vec<(String, String)>)
+        + Send
+        + Sync
+        + 'static,
+    ) -> Upstream {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -140,11 +155,13 @@ impl Upstream {
                         cv.notify_all();
                     }
                     let auth_snap = auth_for_resp.lock().unwrap().clone();
-                    let (status, reason, body) = resp_for(&path, auth_snap.as_deref());
-                    let payload = format!(
-                        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
-                        body.len()
-                    );
+                    let (status, reason, body, headers) = resp_for(&path, auth_snap.as_deref());
+                    let mut head =
+                        format!("HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\n");
+                    for (name, value) in &headers {
+                        head.push_str(&format!("{name}: {value}\r\n"));
+                    }
+                    let payload = format!("{head}Content-Length: {}\r\n\r\n{body}", body.len());
                     let _ = stream.write_all(payload.as_bytes());
                 });
             }
@@ -725,6 +742,75 @@ fn keys_endpoint_never_fetches_but_embeds_snapshot() {
     assert_eq!(info2[0]["tier"], json_str("free"), "{body2}");
     assert_eq!(CALLS.load(Ordering::Relaxed), 1);
     assert_eq!(info2[0]["state"], "up", "usage must not touch key health");
+}
+
+/// Wire-path pin for the transient-failure carry: a key that starts
+/// 429ing (with Retry-After) keeps its last good row — marked `as_of` —
+/// instead of degrading to an error row, and the real ureq 429 + the
+/// `Retry-After` header are what drive the carry and the backoff. The
+/// skip-next-round behavior itself is unit-tested (no 5 s waits there).
+#[test]
+fn usage_429_carries_last_good_row() {
+    static VICTIM_CALLS: AtomicUsize = AtomicUsize::new(0);
+    let ok_body = balance_body(90.0, 80.0, "2026-10-09T00:00:00Z");
+    let up = Upstream::spawn_auth_headers(move |_, auth| match auth {
+        Some(a) if a.contains("rlimit0001") => {
+            if VICTIM_CALLS.fetch_add(1, Ordering::Relaxed) == 0 {
+                (200, "OK".into(), ok_body.clone(), Vec::new())
+            } else {
+                // Second fetch onward: rate limited, with the header.
+                (
+                    429,
+                    "Too Many Requests".into(),
+                    String::new(),
+                    vec![("Retry-After".into(), "60".into())],
+                )
+            }
+        }
+        Some(_) => (200, "OK".into(), ok_body.clone(), Vec::new()),
+        other => panic!("unexpected auth {other:?}"),
+    });
+    let (addr, _pool) = spawn_server(
+        pool_with(&[("omk-rlimit0001", 1), ("omk-okkey0002", 1)]),
+        &up.url,
+    );
+
+    // Round 1: both keys fresh, no as_of anywhere.
+    let (status, body, _) = post_with_headers(&addr, "/_usage", "");
+    assert_eq!(status, 200, "body: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let rows = v["keys"].as_array().unwrap();
+    let victim = rows.iter().find(|r| r["suffix"] == "0001").unwrap();
+    assert_eq!(victim["ok"], true, "{body}");
+    assert_eq!(victim["session"], 0.1, "{body}");
+    assert!(
+        victim.get("as_of").is_none(),
+        "fresh row has no as_of: {body}"
+    );
+
+    // Round 2 (past MIN_REFRESH): the victim 429s and carries.
+    std::thread::sleep(Duration::from_millis(5200));
+    let (status, body, _) = post_with_headers(&addr, "/_usage?refresh=1", "");
+    assert_eq!(status, 200, "body: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let rows = v["keys"].as_array().unwrap();
+    let victim = rows.iter().find(|r| r["suffix"] == "0001").unwrap();
+    assert_eq!(
+        victim["ok"], true,
+        "429'd key carries its last good row: {body}"
+    );
+    assert_eq!(victim["session"], 0.1, "carried data survives: {body}");
+    assert!(
+        victim["as_of"].is_u64(),
+        "carried row is marked as_of: {body}"
+    );
+    let ok_row = rows.iter().find(|r| r["suffix"] == "0002").unwrap();
+    assert_eq!(ok_row["ok"], true, "{body}");
+    assert!(
+        ok_row.get("as_of").is_none(),
+        "healthy key stays fresh: {body}"
+    );
+    assert!(!body.contains("omk-rlimit0001"), "secret leaked: {body}");
 }
 
 #[test]

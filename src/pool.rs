@@ -988,6 +988,7 @@ mod tests {
                     included_usd: None,
                     allowance_usd: None,
                     purchased_usd: None,
+                    as_of: None,
                     error: None,
                 })
                 .collect(),
