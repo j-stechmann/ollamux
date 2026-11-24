@@ -5,6 +5,41 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] - 2026-11-24
+
+### Changed
+
+- Breaking: the keys file now requires an account label,
+  `KEY[:N]@ACCOUNT` (1–64 chars of `A-Z a-z 0-9 . _ -`). An unlabelled
+  line is a startup error with a migration hint, and `OLLAMUX_KEYS` uses
+  the same encoding. Keys sharing a label are treated as one ollama.com
+  account. Reason: balance and usage are account-scoped upstream, and
+  pooling keys from several accounts (e.g. a group of friends) needs a
+  stable label to attribute the numbers.
+- Balance fetches are now grouped **per account**: one
+  `GET /api/balance` per distinct `@ACCOUNT` (healthy key first, rotating
+  on 401/403), fanned out to each of the account's key rows. This halves
+  upstream calls for multi-key accounts and keeps the 10 req/min-per-user
+  budget correct.
+- The pool `aggregate` now weights each **account** once instead of each
+  key, so duplicate keys under one label cannot double-count capacity.
+- `/_usage` gains a top-level `accounts` array (account, key count, tier,
+  balance figures) alongside the existing per-key `keys` rows; key rows
+  and `/_keys` now carry the `account` label.
+
+### Added
+
+- `GET /_usage?range=24h|7d|30d` (with optional `group_by=model`) reads
+  the documented cloud usage endpoint
+  (`GET https://ollama.com/api/usage`) once per account and adds a
+  `models` section: per-account request counts, tokens and USD cost in
+  hourly/daily UTC buckets, broken down by model, plus a per-account
+  summed `pool.totals`. Uses the same 60 s TTL, 5 s forced-refresh guard,
+  `Retry-After` backoff and carried-row (`as_of`) semantics as balance.
+  Invalid ranges/groupings return 400 before any upstream call.
+- Startup warning when several keys share one account: slots are still
+  per key while Ollama Cloud's concurrency limit is per account.
+
 ## [0.8.0] - 2026-10-15
 
 ### Changed
@@ -178,7 +213,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Audit findings: SIGINT masking during shutdown, no-auth request
   paths, request body truncation, and health reset semantics.
 
-[Unreleased]: https://github.com/j-stechmann/ollamux/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/j-stechmann/ollamux/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/j-stechmann/ollamux/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/j-stechmann/ollamux/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/j-stechmann/ollamux/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/j-stechmann/ollamux/compare/v0.5.0...v0.6.0

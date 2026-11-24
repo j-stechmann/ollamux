@@ -1,3 +1,17 @@
+ollamux (0.9.0-1) unstable; urgency=medium
+
+  * Breaking: the keys file now requires an account label,
+    KEY[:N]@ACCOUNT. Balance and usage are account-scoped upstream, so
+    ollamux fetches once per distinct account; duplicate keys under one
+    label are no longer double-counted in the pool aggregate.
+  * New: GET /_usage?range=24h|7d|30d adds per-account model/time
+    statistics (request counts, tokens, USD, per-model hourly/daily
+    buckets) from the documented GET /api/usage endpoint. group_by=model
+    is optional; anything else is a 400.
+  * /_usage gains an accounts array and /_keys gains account labels.
+
+ -- Jonathan Stechmann <69059260+j-stechmann@users.noreply.github.com>  Tue, 24 Nov 2026 12:00:00 +0000
+
 ollamux (0.8.0-1) unstable; urgency=medium
 
   * Changed (breaking): /_usage reads the documented GET /api/balance

@@ -9,7 +9,7 @@
 openapi: 3.0.3
 info:
   title: ollamux
-  version: 0.8.0
+  version: 0.9.0
   license:
     name: GPL-2.0-or-later
     url: https://github.com/j-stechmann/ollamux/blob/master/LICENSE
@@ -112,12 +112,12 @@ paths:
       summary: Per-key pool state
       description: >
         Pure in-memory read: never triggers an upstream fetch (incident
-        readers rely on it being instant). Each row carries the key's plan
-        `tier` (inferred from per-key concurrency, KEY:N: free=1, pro=3,
-        max=10). When a usage snapshot exists (from /_usage or
-        --usage-aware), each row embeds the latest known usage under
-        `usage`; otherwise the field is absent. Secrets are never exposed —
-        only key suffixes.
+        readers rely on it being instant). Each row carries the key's
+        `account` label and plan `tier` (inferred from per-key concurrency,
+        KEY:N: free=1, pro=3, max=10). When a usage snapshot exists (from
+        /_usage or --usage-aware), each row embeds the latest known usage
+        under `usage`; otherwise the field is absent. Secrets are never
+        exposed — only key suffixes and account labels.
       operationId: getKeys
       responses:
         '200':
@@ -132,27 +132,52 @@ paths:
   /_usage:
     get:
       tags: [introspection]
-      summary: Per-key Ollama Cloud usage
+      summary: Per-account and per-key Ollama Cloud usage
       description: >
         Fans out to the documented `GET https://ollama.com/api/balance`
-        endpoint (one request per key) and answers with one row per key
-        (suffixes only, never secrets). Legacy plans report used
-        fractions of their session/weekly allowances (upstream's
-        remaining_percent inverted) with reset instants; credit plans
-        report USD amounts (`included_usd`, `allowance_usd`,
+        endpoint **once per distinct `@ACCOUNT`** (balance is
+        account-scoped) and answers with an `accounts` array plus one row
+        per key (suffixes and account labels only, never secrets). Legacy
+        plans report used fractions of their session/weekly allowances
+        (upstream's remaining_percent inverted) with reset instants;
+        credit plans report USD amounts (`included_usd`, `allowance_usd`,
         `purchased_usd`) with no percent windows. The envelope also
-        carries an
-        `aggregate`: the capacity-weighted mean of the reporting rows'
-        fractions, weighted by each key's plan tier (inferred from per-key
-        concurrency, KEY:N: free=1, pro=3, max=10; weights ×1/×50/×250) —
-        a number in 0.0–1.0 like the per-key rows, including keys
-        currently on cooldown (usage fetching is health-blind). Upstream
-        rate-limits the balance endpoint to 10 req/min per user shared
-        across keys: the passive 60 s poll respects that for pools up to
-        ~10 keys (larger pools burst one parallel GET per key and
-        affected keys report 429s and back off).
+        carries an `aggregate`: the capacity-weighted mean of the
+        reporting accounts' fractions, weighted by each account's plan
+        tier (inferred from concurrency, `:N`: free=1, pro=3, max=10;
+        weights ×1/×50/×250) — a number in 0.0–1.0, including accounts
+        currently on cooldown (usage fetching is health-blind). Keys
+        sharing one account contribute once, never double-counted.
+        Upstream rate-limits balance to 10 req/min per user shared across
+        that user's keys: the passive 60 s poll respects that for pools
+        up to ~10 accounts (larger pools burst one parallel GET per
+        account and affected accounts report 429s and back off).
+
+        With `range`, also calls the documented
+        `GET https://ollama.com/api/usage?range=…&group_by=model` once per
+        account and adds a `models` section with per-account totals and
+        UTC buckets (request count, tokens, USD) broken down by model.
       operationId: getUsage
       parameters:
+        - name: range
+          in: query
+          required: false
+          description: >
+            Enables the `models` section. `24h` uses hourly buckets,
+            `7d` and `30d` daily buckets; the current bucket is marked
+            `partial`.
+          schema:
+            type: string
+            enum: [24h, 7d, 30d]
+        - name: group_by
+          in: query
+          required: false
+          description: >
+            Only valid together with `range`; `model` is the only
+            supported value and is the default. Anything else is a 400.
+          schema:
+            type: string
+            enum: [model]
         - name: refresh
           in: query
           required: false
@@ -174,16 +199,22 @@ paths:
           description: >
             Envelope with freshness metadata, a capacity-weighted
             pool-wide `aggregate` (a 0.0–1.0 fraction like the per-key
-            rows), and one row per key (each carrying its inferred
-            `tier`). Failed per-key fetches carry `error` instead of
-            numbers; upstream error bodies are never relayed (they could
-            echo the key). A fetch that fails entirely keeps the previous
-            good snapshot.
+            rows), one row per account, and one row per key (each carrying
+            its inferred `tier` and `account`). Failed fetches carry
+            `error` instead of numbers; upstream error bodies are never
+            relayed (they could echo the key). A fetch that fails entirely
+            keeps the previous good snapshot. When `range` was given,
+            `models` carries the per-account model/time breakdown.
           headers:
             X-Ollamux: {$ref: '#/components/headers/X-Ollamux'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/UsageEnvelope'}
+        '400':
+          description: Invalid or unsupported `range`/`group_by` (returned before any upstream call).
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/OllamaError'}
   /:
     get:
       tags: [introspection]
@@ -630,7 +661,7 @@ components:
         Present on every response, including relayed upstream errors:
         `ollamux/<version>` — lets a client tell ollamux apart from a real
         Ollama server or a CDN error page.
-      schema: {type: string, example: 'ollamux/0.8.0'}
+      schema: {type: string, example: 'ollamux/0.9.0'}
     X-Ollamux-Key:
       description: >
         Suffix of the pool key that served the request. Present only when a
@@ -703,6 +734,7 @@ components:
       required:
         - index
         - suffix
+        - account
         - state
         - concurrency
         - tier
@@ -714,6 +746,12 @@ components:
       properties:
         index: {type: integer, description: Zero-based position in the keys file.}
         suffix: {type: string, description: Last characters of the key — never the secret.}
+        account:
+          type: string
+          description: >
+            Account label from the key's `@ACCOUNT` suffix (never a
+            secret). Keys sharing a label belong to one ollama.com
+            account, and usage/balance are fetched once per account.
         state: {$ref: '#/components/schemas/KeyState'}
         concurrency: {type: integer, description: 'Max in-flight requests for this key (KEY:N, default 3).'}
         tier:
@@ -738,9 +776,96 @@ components:
           description: Most recent failure reason (absent before the first failure).
         usage:
           $ref: '#/components/schemas/UsageBrief'
+    UsageMetrics:
+      type: object
+      required: [request_count]
+      properties:
+        request_count: {type: integer}
+        usage_usd:
+          type: number
+          description: Total value of the requests in USD, including plan-covered usage.
+        input_tokens: {type: integer, description: Input tokens, including cached input.}
+        cached_input_tokens: {type: integer, description: Input tokens read from cache (included in input_tokens).}
+        output_tokens: {type: integer}
+    UsageGroup:
+      allOf:
+        - $ref: '#/components/schemas/UsageMetrics'
+        - type: object
+          required: [model]
+          properties:
+            model: {type: string}
+    UsageSummary:
+      allOf:
+        - $ref: '#/components/schemas/UsageMetrics'
+        - type: object
+          properties:
+            groups:
+              type: array
+              description: >
+                Present with `group_by=model`: up to 10 models, ranked by
+                cost (or request count on legacy plans), same order in
+                every bucket. Models without requests in a bucket are
+                omitted.
+              items: {$ref: '#/components/schemas/UsageGroup'}
+            remainder:
+              $ref: '#/components/schemas/UsageMetrics'
+    UsageBucket:
+      allOf:
+        - $ref: '#/components/schemas/UsageSummary'
+        - type: object
+          required: [from, until]
+          properties:
+            from: {type: string, format: date-time, description: Inclusive UTC start.}
+            until: {type: string, format: date-time, description: Exclusive UTC end.}
+            partial:
+              type: boolean
+              description: True for the current, still-in-progress hour or day.
+    AccountStats:
+      type: object
+      required: [account, keys, ok]
+      properties:
+        account: {type: string}
+        keys: {type: integer, description: Member keys in the pool.}
+        ok: {type: boolean}
+        as_of:
+          type: integer
+          format: int64
+          description: >
+            Unix seconds of the original fetch when this row was carried
+            through a transient failure or 429 backoff; absent when fresh.
+        error: {type: string}
+        totals: {$ref: '#/components/schemas/UsageSummary'}
+        buckets:
+          type: array
+          items: {$ref: '#/components/schemas/UsageBucket'}
+    ModelsSection:
+      type: object
+      required: [range, group_by, updated, age_s, stale, accounts, pool]
+      properties:
+        range: {type: string, enum: [24h, 7d, 30d]}
+        granularity:
+          type: string
+          enum: [hour, day]
+          nullable: true
+          description: Hourly for 24h, daily for 7d/30d. Null when every account failed.
+        group_by: {type: string, enum: [model]}
+        from: {type: string, format: date-time, nullable: true}
+        until: {type: string, format: date-time, nullable: true}
+        updated: {type: integer, format: int64}
+        age_s: {type: integer}
+        stale: {type: boolean}
+        accounts:
+          type: array
+          items: {$ref: '#/components/schemas/AccountStats'}
+        pool:
+          type: object
+          required: [totals]
+          description: Summed per account (never per key), model groups merged by name.
+          properties:
+            totals: {$ref: '#/components/schemas/UsageSummary'}
     UsageEnvelope:
       type: object
-      required: [updated, age_s, stale, session_window, aggregate, keys]
+      required: [updated, age_s, stale, session_window, aggregate, accounts, keys]
       properties:
         updated:
           type: integer
@@ -758,12 +883,43 @@ components:
           type: string
           description: Human hint; per-window reset timestamps are in the aggregate/rows.
         aggregate: {$ref: '#/components/schemas/UsageAggregate'}
+        accounts:
+          type: array
+          description: >
+            One row per distinct `@ACCOUNT`, in keys-file order. Balance
+            is account-scoped: keys sharing a label fan out to the same
+            numbers, and the aggregate weights the account once.
+          items: {$ref: '#/components/schemas/AccountUsageInfo'}
         keys:
           type: array
           items: {$ref: '#/components/schemas/KeyUsage'}
+        models:
+          $ref: '#/components/schemas/ModelsSection'
+    AccountUsageInfo:
+      type: object
+      required: [account, keys, ok, tier]
+      description: Account-level mirror of a balance row (no key-specific fields).
+      properties:
+        account: {type: string}
+        keys:
+          type: integer
+          description: Number of pool keys labelled with this account.
+        ok: {type: boolean}
+        tier: {type: string}
+        session: {type: number, nullable: true}
+        weekly: {type: number, nullable: true}
+        session_pct: {type: number, nullable: true}
+        weekly_pct: {type: number, nullable: true}
+        session_resets_at: {type: string, nullable: true}
+        weekly_resets_at: {type: string, nullable: true}
+        included_usd: {type: number, nullable: true}
+        allowance_usd: {type: number, nullable: true}
+        purchased_usd: {type: number, nullable: true}
+        as_of: {type: integer, format: int64, nullable: true}
+        error: {type: string, nullable: true}
     KeyUsage:
       type: object
-      required: [index, suffix, ok, tier]
+      required: [index, suffix, account, ok, tier]
       description: >
         One per-key usage row. `ok:false` rows carry `error` only.
         Transient failures (429, 5xx, network blips) and 429-backoff
@@ -772,6 +928,7 @@ components:
       properties:
         index: {type: integer}
         suffix: {type: string}
+        account: {type: string, description: Account label this key belongs to.}
         ok: {type: boolean}
         tier:
           type: string
@@ -845,22 +1002,23 @@ components:
     UsageAggregate:
       type: object
       description: >
-        Pool-wide usage as a capacity-weighted mean: every ok row's usage
-        fraction (a fraction of *its own plan's allowance* — upstream's
-        remaining_percent inverted) times its tier's cap weight (free ×1,
-        pro ×50, max ×250), summed and divided by the summed weights of
-        exactly the keys that reported the window — so the result is a
-        fraction in 0.0–1.0 like the per-key rows (a single-key pool
-        reproduces that key's own fraction, and dead keys never dilute
-        the number). Credit-plan rows have no window fractions and sit
-        out. Keys on cooldown contribute too — usage fetching never
-        consults pool health — and so do rows carried from a previous
-        round (their last known good fraction). A key marked dead (401/403)
-        is expected to fail its own usage fetch the same way and therefore
-        contributes nothing. Rounded to 3 decimals; a window no ok row
-        reports is `null`, never 0 (`resets_at` fields publish the
-        window's reset instant only when every reporting key agrees on
-        one).
+        Pool-wide usage as a capacity-weighted mean: every ok account's
+        usage fraction (a fraction of *its own plan's allowance* —
+        upstream's remaining_percent inverted) times its tier's cap weight
+        (free ×1, pro ×50, max ×250), summed and divided by the summed
+        weights of exactly the accounts that reported the window — so the
+        result is a fraction in 0.0–1.0 like the per-key rows (a
+        single-account pool reproduces that account's own fraction, and
+        dead accounts never dilute the number). Keys sharing one account
+        are grouped and contribute once, never double-counted. Credit-plan
+        rows have no window fractions and sit out. Accounts on cooldown
+        contribute too — usage fetching never consults pool health — and so
+        do rows carried from a previous round (their last known good
+        fraction). An account marked dead (401/403) is expected to fail its
+        own usage fetch the same way and therefore contributes nothing.
+        Rounded to 3 decimals; a window no ok row reports is `null`, never
+        0 (`resets_at` fields publish the window's reset instant only when
+        every reporting account agrees on one).
       required: [session, weekly, unit, session_resets_at, weekly_resets_at]
       properties:
         session:
@@ -887,8 +1045,9 @@ components:
           type: string
           description: >
             Always `pool capacity fraction`: the aggregate is a
-            capacity-weighted mean of the per-key fractions, weighted by
-            the free plan's cap multiples (pro = 50× free, max = 5× pro).
+            capacity-weighted mean of the per-account fractions, weighted
+            by the free plan's cap multiples (pro = 50× free, max = 5×
+            pro). Keys sharing one account contribute once.
     UnknownPathHint:
       type: object
       required: [error]

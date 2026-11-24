@@ -18,6 +18,17 @@ fn pool_with(keys: &[(&str, u32)]) -> Arc<ollamux::Pool> {
     ))
 }
 
+/// Pool with real `@account` grouping.
+fn pool_from(keys: &[(&str, u32, &str)]) -> Arc<ollamux::Pool> {
+    Arc::new(ollamux::Pool::from_entries(
+        keys.iter()
+            .map(|(k, c, a)| ollamux::KeyEntry::new(*k, *c, *a))
+            .collect(),
+        32,
+        false,
+    ))
+}
+
 /// Spawn the real Server proxying to `upstream`; returns (base URL, pool).
 fn spawn_server(pool: Arc<ollamux::Pool>, upstream: &str) -> (String, Arc<ollamux::Pool>) {
     let server = Server::with_upstream(pool.clone(), upstream);
@@ -89,7 +100,7 @@ pub struct Upstream {
     done: Arc<(std::sync::Condvar, std::sync::Mutex<usize>)>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct RecordedRequest {
     pub method: String,
     pub path_with_query: String,
@@ -546,6 +557,26 @@ fn balance_body(session_rem: f64, weekly_rem: f64, reset: &str) -> String {
     )
 }
 
+/// Documented `GET /api/usage?range=…&group_by=model` payload with one
+/// model group in totals and in a single bucket.
+fn usage_body(model: &str, requests: u64, usd: f64) -> String {
+    format!(
+        r#"{{"range":"7d","scope":"self","granularity":"day",
+             "from":"2026-09-24T00:00:00Z","until":"2026-10-01T02:30:00Z",
+             "totals":{{"request_count":{requests},"usage_usd":{usd},
+                        "input_tokens":24000,"cached_input_tokens":0,"output_tokens":3200,
+                        "groups":[{{"model":"{model}","request_count":{requests},
+                                    "usage_usd":{usd},"input_tokens":24000,
+                                    "cached_input_tokens":0,"output_tokens":3200}}]}},
+             "buckets":[{{"from":"2026-09-30T00:00:00Z","until":"2026-10-01T00:00:00Z",
+                          "request_count":{requests},"usage_usd":{usd},
+                          "input_tokens":24000,"cached_input_tokens":0,"output_tokens":3200,
+                          "groups":[{{"model":"{model}","request_count":{requests},
+                                      "usage_usd":{usd},"input_tokens":24000,
+                                      "cached_input_tokens":0,"output_tokens":3200}}]}}]}}"#
+    )
+}
+
 /// Responder scripting the documented endpoint: `GET /api/balance` per
 /// auth header; anything else is a test bug.
 fn balance_responder(
@@ -631,6 +662,124 @@ fn usage_endpoint_aggregates_per_key_without_secrets() {
     // No secret ever.
     assert!(!body.contains("omk-abcd1234"), "secret leaked: {body}");
     assert!(!body.contains("omk-efgh5678"), "secret leaked: {body}");
+}
+
+#[test]
+fn usage_models_breakdown_is_per_account_and_deduped() {
+    // Two alice keys and one bob key: balance and /api/usage must each be
+    // fetched once per *account* (2 total), never per key, and the keys
+    // must still appear individually with their account label.
+    let up = Upstream::spawn_auth(move |path, auth| {
+        if path.starts_with("/api/balance") {
+            return (
+                200,
+                "OK".into(),
+                balance_body(90.0, 80.0, "2026-10-09T00:00:00Z"),
+            );
+        }
+        assert!(path.starts_with("/api/usage?range=7d"), "path: {path}");
+        assert!(path.contains("group_by=model"), "path: {path}");
+        let model = if auth.unwrap_or("").contains("alice") {
+            "alice-model"
+        } else {
+            "bob-model"
+        };
+        (200, "OK".into(), usage_body(model, 4, 0.0052))
+    });
+    let pool = pool_from(&[
+        ("omk-alice001", 1, "alice"),
+        ("omk-alice002", 1, "alice"),
+        ("omk-bob0001", 1, "bob"),
+    ]);
+    let (addr, _pool) = spawn_server(pool, &up.url);
+
+    let (status, body) = post(&addr, "/_usage?range=7d", "");
+    assert_eq!(status, 200, "body: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+    // Per-key rows survive, now labelled with their account.
+    let keys = v["keys"].as_array().unwrap();
+    assert_eq!(keys.len(), 3, "{body}");
+    assert_eq!(
+        keys.iter().filter(|k| k["account"] == "alice").count(),
+        2,
+        "{body}"
+    );
+    assert_eq!(
+        keys.iter().filter(|k| k["account"] == "bob").count(),
+        1,
+        "{body}"
+    );
+
+    // Account view: alice has 2 keys but one row; bob has 1.
+    let accounts = v["accounts"].as_array().unwrap();
+    assert_eq!(accounts.len(), 2, "{body}");
+    let alice = accounts.iter().find(|a| a["account"] == "alice").unwrap();
+    assert_eq!(alice["keys"], 2);
+    assert_eq!(alice["ok"], true);
+
+    // Model breakdown: one entry per account, each with its own model.
+    let models = &v["models"];
+    assert_eq!(models["range"], "7d", "{body}");
+    assert_eq!(models["granularity"], "day", "{body}");
+    assert_eq!(models["group_by"], "model", "{body}");
+    let m_accounts = models["accounts"].as_array().unwrap();
+    assert_eq!(m_accounts.len(), 2, "{body}");
+    let m_alice = m_accounts.iter().find(|a| a["account"] == "alice").unwrap();
+    assert_eq!(m_alice["keys"], 2, "{body}");
+    assert_eq!(m_alice["totals"]["groups"][0]["model"], "alice-model");
+    assert_eq!(m_alice["buckets"][0]["groups"][0]["model"], "alice-model");
+
+    // Pool total sums accounts (4 + 4), not keys (would be 12), and
+    // merges model groups by name.
+    assert_eq!(
+        models["pool"]["totals"]["request_count"], 8,
+        "per-account sum, no duplicate-key double count: {body}"
+    );
+    assert_eq!(
+        models["pool"]["totals"]["groups"].as_array().unwrap().len(),
+        2,
+        "{body}"
+    );
+
+    // Upstream call counts: exactly one balance and one usage per account.
+    let reqs = up.recorded();
+    assert_eq!(
+        reqs.iter()
+            .filter(|r| r.path_with_query.starts_with("/api/balance"))
+            .count(),
+        2,
+        "one balance fetch per account: {reqs:?}"
+    );
+    assert_eq!(
+        reqs.iter()
+            .filter(|r| r.path_with_query.contains("group_by=model"))
+            .count(),
+        2,
+        "one usage fetch per account: {reqs:?}"
+    );
+    assert!(!body.contains("omk-alice001"), "secret leaked: {body}");
+    assert!(!body.contains("omk-alice002"), "secret leaked: {body}");
+    assert!(!body.contains("omk-bob0001"), "secret leaked: {body}");
+}
+
+#[test]
+fn usage_models_rejects_bad_range_and_group_by() {
+    // Validation happens before any upstream call, so an unreachable
+    // upstream is fine: these must be 400s, not 502s.
+    let (addr, _pool) = spawn_server(pool_with(&[("omk-params001", 1)]), "http://127.0.0.1:1");
+
+    let (status, body) = post(&addr, "/_usage?range=1d", "");
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("invalid range"), "{body}");
+
+    let (status, body) = post(&addr, "/_usage?group_by=model", "");
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("requires a range"), "{body}");
+
+    let (status, body) = post(&addr, "/_usage?range=7d&group_by=key", "");
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("invalid group_by"), "{body}");
 }
 
 /// Mixed-tier pool: tier is inferred from per-key concurrency (KEY:N →

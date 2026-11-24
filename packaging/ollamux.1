@@ -1,6 +1,6 @@
 .\" ollamux(1) manual page
 .\" License: GPL-2.0-or-later
-.TH OLLAMUX 1 "2026-10-15" "ollamux 0.8.0" "User Commands"
+.TH OLLAMUX 1 "2026-11-24" "ollamux 0.9.0" "User Commands"
 .SH NAME
 ollamux \- key-rotating reverse proxy for the Ollama Cloud API
 .SH SYNOPSIS
@@ -67,28 +67,40 @@ Print usage and exit.
 .BR \-V ", " \-\-version
 Print version and exit.
 .SH KEYS FILE
-One API key per line (get keys at
+One API key per line, in the form
+.BR KEY[:N]@ACCOUNT
+(get keys at
 .IR https://ollama.com/settings/keys ).
+The
+.B @ACCOUNT
+label is required: balance and usage are account-scoped upstream, and
+keys sharing a label are treated as one ollama.com account (for example
+a group of friends pooling separate accounts). Labels are 1\(en64
+characters of
+.BR A-Z a-z 0-9 " . _ -" .
 Blank lines and lines starting with
 .B #
 are ignored. Optionally append
 .B :N
-to a key to set that account's per-key concurrency limit \- the number
-of cloud models the account may run at once (free tier 1, pro 3, max
-10; the default when no suffix is given is 3):
+to a key to set that key's concurrency limit \- the number of cloud
+models the account may run at once (free tier 1, pro 3, max 10; the
+default when no suffix is given is 3):
 .PP
 .RS
 .nf
-your-free-key...:1
-your-pro-key...:3
-your-max-key...:10
+your-free-key...:1@free-acct
+your-pro-key...:3@pro-acct
+your-max-key...:10@max-acct
 .fi
 .RE
 .PP
 Requests beyond a key's concurrency limit queue briefly rather than
 hammering upstream; waiters beyond that get an honest 429. Duplicate
-key entries and invalid concurrency counts are startup errors, not
-warnings. The file should be readable only by the user running ollamux:
+key entries, missing or invalid account labels, and invalid concurrency
+counts are startup errors, not warnings. Slots are counted per key while
+the upstream plan limit is per account, so several keys under one label
+multiply the in-flight bound (ollamux warns at startup). The file should
+be readable only by the user running ollamux:
 .B chmod 600 ~/.config/ollamux/keys\fR.
 .SH ENDPOINTS
 .TS
@@ -96,8 +108,8 @@ tab(|);
 l l.
 /api/*|Proxied to https://ollama.com with key rotation
 /v1/*|Proxied (OpenAI-compatible surface) with rotation
-/_keys|Per-key health JSON (key suffixes only, no secrets; tier + embeds latest known usage when a usage snapshot exists)
-/_usage|Per-key usage JSON from the documented GET /api/balance upstream endpoint, fan-out across all keys, 60s cache, plus a pool-capacity aggregate; ?refresh=1 forces a refresh (rate-limited to one fetch attempt per 5s)
+/_keys|Per-key health JSON (key suffixes and account labels only, no secrets; tier + embeds latest known usage when a usage snapshot exists)
+/_usage|Per-account and per-key usage JSON + pool aggregate (balance, one fetch per account, 60s cache); ?range=24h,7d,30d adds per-account model/time stats; ?refresh=1 forces (one attempt per 5s)
 /_health|Liveness JSON: {"ok":...,"keys":...,"total_slots":...}
 .TE
 .PP
@@ -105,8 +117,12 @@ Any other path answers 404 with a hint.
 .SH USAGE INTROSPECTION
 Ollama Cloud publishes plan usage on the documented
 .B GET /api/balance
-upstream endpoint (docs.ollama.com/api/balance), one request per key,
-rate-limited to 10 requests per minute per user, shared across keys.
+upstream endpoint (docs.ollama.com/api/balance), one request per
+.I account
+(keys sharing an
+.B @ACCOUNT
+label), rate-limited to 10 requests per minute per user, shared across
+that account's keys.
 ollamux decodes it tolerantly: payload drift is reported as a per-key
 error in
 .BR /_usage ,
@@ -134,19 +150,42 @@ dead. /_keys is a pure in-memory read and never triggers upstream
 usage calls. Each key's plan tier is inferred from its per-key
 concurrency (free=1, pro=3, max=10; more concurrency than normal is
 the next tier up), and /_usage also reports the pool-wide
-capacity-weighted mean of every reporting key's fraction weighted by
-its tier's cap (free \(mu1, pro \(mu50, max \(mu250) \(em a fraction in
-0.0\(en1.0 like the per-key numbers, so a single-key pool reproduces
-that key's own fraction \(em including keys on cooldown and keys
-whose latest fetch failed transiently (carried rows keep
-contributing their last known good fraction); a dead key is expected
-to fail its own usage fetch the same way and contributes nothing
-(its weight is excluded from the denominator). Windows nobody
-reported are null, never 0, and when every reporting key of a window
-carries the same resets_at the aggregate publishes that instant
-(session_resets_at, weekly_resets_at) so consumers get one honest
-reset instant for the pool. Credit-plan rows sit out the aggregate
-(their unit is USD, not a fraction of an allowance).
+capacity-weighted mean of every reporting
+.I account's
+fraction weighted by its tier's cap (free \(mu1, pro \(mu50, max
+\(mu250) \(em a fraction in 0.0\(en1.0 like the per-key numbers, so a
+single-account pool reproduces that account's own fraction \(em keys
+sharing one account contribute once, never double-counted. Accounts on
+cooldown and accounts whose latest fetch failed transiently still
+contribute (carried rows keep their last known good fraction); an
+unauthorized account is expected to fail its own usage fetch the same
+way and contributes nothing (its weight is excluded from the
+denominator). Windows nobody reported are null, never 0, and when every
+reporting account of a window carries the same resets_at the aggregate
+publishes that instant (session_resets_at, weekly_resets_at) so
+consumers get one honest reset instant for the pool. Credit-plan rows
+sit out the aggregate (their unit is USD, not a fraction of an
+allowance).
+.PP
+With
+.B ?range=24h
+,
+.B ?range=7d
+or
+.BR ?range=30d ,
+/_usage additionally reads the documented
+.B GET /api/usage
+endpoint once per account and adds a
+.B models
+section: per-account request counts, tokens and USD cost in hourly
+(24h) or daily (7d, 30d) UTC buckets, broken down by model, plus a
+pool total summed per account. Up to 10 models appear per
+.B groups
+array; the rest are combined under
+.BR remainder .
+The endpoint has no per-request log, and custom ranges plus per-API-key
+or per-member breakdowns are not yet published upstream. Members of one
+Ollama team share an account and cannot be separated.
 .SH QUOTA-AWARE KEY SELECTION
 With
 .B \-\-usage-aware[= \fIPCT \fR]
