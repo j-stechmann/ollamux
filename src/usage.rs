@@ -1,8 +1,11 @@
 //! Usage introspection for Ollama Cloud's **documented** balance endpoint.
 //!
 //! `GET https://ollama.com/api/balance` (docs.ollama.com/api/balance)
-//! answers, per API key, with the plan's remaining allowance. Two shapes
-//! exist, chosen by `included`'s members:
+//! answers, per **account**, with the plan's remaining allowance (any
+//! key of the account returns the same body). ollamux fetches once per
+//! distinct `@ACCOUNT` label from the keys file and fans the row out to
+//! every key of that account. Two shapes exist, chosen by `included`'s
+//! members:
 //!
 //! - Legacy plans (session/weekly limits) — the common case:
 //!
@@ -28,14 +31,15 @@
 //! supports both; the aggregate covers legacy rows only.
 //!
 //! The endpoint is rate-limited to 10 requests per minute per user
-//! (shared across keys) and the docs recommend polling once per minute —
-//! USAGE_TTL (60 s) stays within that for single-key and small pools on
-//! the passive path. Pools larger than ~10 keys can still burst over
-//! the shared per-user limit, so a round may 429 some keys; those keys
-//! carry their last good row (marked `as_of`) instead of degrading to
-//! errors, and sit out later rounds per upstream's `Retry-After`
-//! (capped at 5 min, defaulting to one round), rotating the fetch
-//! budget across the pool instead of 429ing the same keys every round.
+//! (shared across that user's keys and devices) and the docs recommend
+//! polling once per minute — USAGE_TTL (60 s) stays within that for
+//! single-account and small pools on the passive path. Pools with more
+//! than ~10 accounts can still burst over each account's shared limit, so
+//! a round may 429 some accounts; those accounts carry their last good
+//! rows (marked `as_of`) instead of degrading to errors, and sit out
+//! later rounds per upstream's `Retry-After` (capped at 5 min, defaulting
+//! to one round), rotating the fetch budget across the pool instead of
+//! 429ing the same accounts every round.
 //! Transient failures (429, 5xx, network blips) carry the previous good
 //! row; persistent ones (401/403, 404, shape drift) surface their error
 //! rows. Forced refreshes are gated by MIN_REFRESH (5 s), not the TTL,
@@ -49,26 +53,28 @@
 //! real request). /_keys embedding never fetches upstream either: it is
 //! a pure in-memory read that merely renders the latest snapshot.
 //!
-//! The tracker also derives a pool-wide aggregate: every key's usage
-//! fraction (a fraction of *its own plan's allowance*) is weighted by the
-//! plan tier implied by its concurrency (see `tier_for`) and averaged, so
-//! the total reads as the fraction of the pool's combined capacity in use —
-//! a number in [0, 1] like the per-key values. Fetching is health-blind,
-//! so keys on cooldown contribute like any other; error rows (e.g. a
-//! dead key's own 401, its expected outcome) carry no numbers and
-//! cannot contribute — but carried rows do: a transiently failing key
-//! keeps contributing its last known good fraction (and its quota-mask
-//! bit), so a blip or a rate-limit backoff never wipes data (see
-//! `UsageTracker::carried_or_failed`).
+//! The tracker also derives a pool-wide aggregate: every **account's**
+//! usage fraction (a fraction of *its own plan's allowance*) is weighted
+//! by the plan tier implied by its concurrency (see `tier_for`) and
+//! averaged, so the total reads as the fraction of the pool's combined
+//! capacity in use — a number in [0, 1] like the per-key values. Keys
+//! sharing one account contribute once, never double-counted. Fetching is
+//! health-blind, so accounts on cooldown contribute like any other; error
+//! rows (e.g. a dead account's own 401, its expected outcome) carry no
+//! numbers and cannot contribute — but carried rows do: a transiently
+//! failing account keeps contributing its last known good fraction (and
+//! its quota-mask bit), so a blip or a rate-limit backoff never wipes
+//! data (see `UsageTracker::carried_or_failed`).
 
-use crate::pool::Pool;
+use crate::pool::{Pool, State};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Serve-at-most-this-age snapshot before a refresh is considered. The
 /// balance docs recommend polling once per minute (10 req/min limit
-/// shared across keys) — within that courtesy for pools of up to ~10
-/// keys on the passive path (see the caveats at `fetch_balance_http`).
+/// shared across an account's keys) — within that courtesy for pools of
+/// up to ~10 accounts on the passive path (see the caveats at
+/// `fetch_balance_http`).
 pub const USAGE_TTL: Duration = Duration::from_secs(60);
 /// Minimum interval between upstream fetch attempts: gates forced
 /// refreshes (`?refresh=1` spam guard) and backs off revalidation after
@@ -296,6 +302,8 @@ impl UsagePayload {
 pub struct KeyUsage {
     pub index: usize,
     pub suffix: String,
+    /// Account label the key belongs to (from the keys file).
+    pub account: String,
     pub ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<u16>,
@@ -336,10 +344,11 @@ pub struct KeyUsage {
 }
 
 impl KeyUsage {
-    fn failed(index: usize, suffix: String, error: String) -> KeyUsage {
+    fn failed(index: usize, suffix: String, account: String, error: String) -> KeyUsage {
         KeyUsage {
             index,
             suffix,
+            account,
             ok: false,
             status: None,
             session: None,
@@ -362,6 +371,7 @@ impl KeyUsage {
         KeyUsage {
             index,
             suffix: format!("sfx{index}"),
+            account: format!("acct{index}"),
             ok: session.is_some(),
             status: session.map(|_| 200),
             session,
@@ -409,15 +419,16 @@ impl UsageSnapshot {
 }
 
 /// Pool-wide usage aggregate: the capacity-weighted mean of every
-/// contributing key's usage fraction, weighted by plan tier (see
-/// `tier_for`). Like the per-key fractions it stays in [0, 1] and reads
-/// as "the fraction of the pool's combined plan capacity that has been
-/// used" (a single-key pool therefore reproduces that key's own
-/// fraction, so consumers of per-key usage need no adjustment).
-/// Windows with no contributing key are `None` (rendered `null`, never
+/// contributing **account's** usage fraction, weighted by plan tier (see
+/// `tier_for`). Keys sharing one account are grouped and contribute once.
+/// Like the per-key fractions it stays in [0, 1] and reads as "the
+/// fraction of the pool's combined plan capacity that has been used" (a
+/// single-account pool therefore reproduces that account's own fraction,
+/// so consumers of per-key usage need no adjustment).
+/// Windows with no contributing account are `None` (rendered `null`, never
 /// fabricated as 0 or omitted — the envelope's schema has both fields
 /// required-nullable, so serialization must always emit them). The reset
-/// instant rides along only when every reporting key of that window
+/// instant rides along only when every reporting account of that window
 /// agrees on one (upstream resets per account-period, so same-tier pools
 /// agree; mixed windows stay `None` rather than picking one account's
 /// clock).
@@ -433,7 +444,7 @@ pub struct UsageAggregate {
     pub weekly_resets_at: Option<String>,
 }
 
-/// Unit label for the aggregate: a capacity-weighted mean of per-key
+/// Unit label for the aggregate: a capacity-weighted mean of per-account
 /// fractions, so it reads as the fraction of the pool's combined plan
 /// capacity that has been used.
 pub const AGGREGATE_UNIT: &str = "pool capacity fraction";
@@ -448,18 +459,19 @@ fn round3(v: f64) -> f64 {
 }
 
 /// Aggregate a snapshot across all ok rows as the capacity-weighted mean
-/// over the tier weights implied by each key's concurrency
-/// (`concurrencies` is index-aligned with `snap.keys`): each window's
-/// weighted sum is divided by the summed weights of exactly the keys
+/// over the tier weights implied by each account's concurrency
+/// (`concurrencies` is index-aligned with `snap.keys`; rows are grouped
+/// by `account`, so duplicate keys contribute once): each window's
+/// weighted sum is divided by the summed weights of exactly the accounts
 /// that reported it, so the result is a fraction in [0, 1] like the
 /// per-key values (weights are all >= 1, so the divisor never vanishes).
-/// Every key participates regardless of pool health —
-/// cooldown/dead state never touches usage fetching, so cooling keys
+/// Every account participates regardless of pool health —
+/// cooldown/dead state never touches usage fetching, so cooling accounts
 /// contribute like any other; error rows (`ok:false`, e.g. a dead key's
 /// own 401 on /api/balance, its expected outcome) carry no numbers and
-/// cannot contribute. A window only some keys report is averaged over
-/// exactly those keys (their weights form the denominator, so dead
-/// keys never dilute the number); a window no ok row reports stays
+/// cannot contribute. A window only some accounts report is averaged over
+/// exactly those accounts (their weights form the denominator, so dead
+/// accounts never dilute the number); a window no ok row reports stays
 /// `None` (never fabricated as 0). Reset instants are the unanimous
 /// value across the keys that reported the window, else `None`.
 pub fn aggregate(snap: &UsageSnapshot, concurrencies: &[u32]) -> UsageAggregate {
@@ -471,16 +483,41 @@ pub fn aggregate(snap: &UsageSnapshot, concurrencies: &[u32]) -> UsageAggregate 
     let mut weekly_seen = false;
     let mut session_reset: Option<Option<String>> = None;
     let mut weekly_reset: Option<Option<String>> = None;
-    for k in &snap.keys {
-        let conc = concurrencies.get(k.index).copied().unwrap_or(1);
+    // Group key rows by account: balance is account-scoped, so two keys
+    // of one account must contribute once, not twice. The account's plan
+    // tier comes from the largest concurrency among its keys.
+    let mut groups: Vec<(&str, Vec<usize>)> = Vec::new();
+    for (pos, k) in snap.keys.iter().enumerate() {
+        if let Some(g) = groups.iter_mut().find(|(a, _)| *a == k.account.as_str()) {
+            g.1.push(pos);
+        } else {
+            groups.push((k.account.as_str(), vec![pos]));
+        }
+    }
+    for (_, positions) in groups {
+        let conc = positions
+            .iter()
+            .map(|&p| concurrencies.get(snap.keys[p].index).copied().unwrap_or(1))
+            .max()
+            .unwrap_or(1);
         let (_, weight) = tier_for(conc);
-        if k.ok {
+        let session_row = positions
+            .iter()
+            .map(|&p| &snap.keys[p])
+            .find(|k| k.ok && k.session.is_some());
+        let weekly_row = positions
+            .iter()
+            .map(|&p| &snap.keys[p])
+            .find(|k| k.ok && k.weekly.is_some());
+        if let Some(k) = session_row {
             if let Some(s) = k.session {
                 session += s * weight;
                 session_w += weight;
                 session_seen = true;
                 session_reset = unify_reset(session_reset, &k.session_resets_at);
             }
+        }
+        if let Some(k) = weekly_row {
             if let Some(w) = k.weekly {
                 weekly += w * weight;
                 weekly_w += weight;
@@ -520,6 +557,9 @@ type SnapshotCell = Mutex<Option<Arc<UsageSnapshot>>>;
 
 pub struct UsageTracker {
     pool: Arc<Pool>,
+    /// Key indices grouped by account, first-seen order. One upstream
+    /// fetch serves the whole group: balance is account-scoped.
+    groups: Vec<Vec<usize>>,
     ttl: Duration,
     /// HTTP layer (seam: injected closures in unit tests skip ureq).
     fetch: Box<FetchFn>,
@@ -533,12 +573,12 @@ pub struct UsageTracker {
     last_attempt: Mutex<Option<Instant>>,
     /// Minimum interval between fetch attempts (tests may shorten it).
     min_refresh: Duration,
-    /// Per-key "not before" instants after a 429 (index-aligned; `None`
-    /// or past = eligible). Seeded from upstream's `Retry-After` where
-    /// parseable, capped at MAX_BACKOFF, else the one-round default —
-    /// a rate-limited key sits out whole rounds instead of hammering
-    /// the shared 10 req/min budget, which rotates the fetch budget
-    /// across large pools.
+    /// Per-account "not before" instants after a 429 (index-aligned with
+    /// `groups`; `None` or past = eligible). Seeded from upstream's
+    /// `Retry-After` where parseable, capped at MAX_BACKOFF, else the
+    /// one-round default — a rate-limited account sits out whole rounds
+    /// instead of hammering the shared 10 req/min budget, which rotates
+    /// the fetch budget across large pools.
     backoff_until: Mutex<Vec<Option<Instant>>>,
     /// Backoff applied after a 429 without a usable `Retry-After`
     /// (tests may shorten it via `with_default_backoff`).
@@ -591,9 +631,11 @@ impl UsageTracker {
         let upstream = upstream.trim_end_matches('/').to_string();
         let base = upstream.clone();
         let agent = Arc::new(agent);
-        let backoff = vec![None; pool.len()];
+        let groups: Vec<Vec<usize>> = pool.accounts().into_iter().map(|a| a.key_indices).collect();
+        let backoff = vec![None; groups.len()];
         UsageTracker {
             pool,
+            groups,
             ttl: USAGE_TTL,
             fetch: Box::new(move |index, suffix_unused, secret| {
                 let _ = (index, suffix_unused);
@@ -766,14 +808,15 @@ impl UsageTracker {
     /// fresh data — and first-ever failures still land so `/_usage` can
     /// surface them.
     fn do_fetch_inner(&self, _guard: &MutexGuard<'_, ()>) -> Arc<UsageSnapshot> {
-        let eligible = self.eligible_keys();
+        let eligible = self.eligible_accounts();
         let results = self.fetch_all(&eligible);
         *lock(&self.last_attempt) = Some(Instant::now());
         let prev = self.peek();
-        let mut keys = Vec::with_capacity(self.pool.len());
+        let mut slots: Vec<Option<KeyUsage>> = (0..self.pool.len()).map(|_| None).collect();
         let mut fresh_ok = 0usize;
-        for (i, res) in results.into_iter().enumerate() {
-            let suffix = self.pool.suffix_of(i);
+        for (g, res) in results.into_iter().enumerate() {
+            let group = &self.groups[g];
+            let account = self.pool.account_of(group[0]).to_string();
             // The bare seam variant behaves like the real one so every
             // 429 backs off identically (the HTTP path only produces
             // RateLimited; Status(429) exists for the test seam).
@@ -781,7 +824,7 @@ impl UsageTracker {
                 Some(Err(FetchError::Status(429))) => Some(Err(FetchError::RateLimited(None))),
                 other => other,
             };
-            keys.push(match res {
+            match res {
                 Some(Ok(p)) => {
                     fresh_ok += 1;
                     // Fractions are upstream's own numbers (1 − remaining),
@@ -797,9 +840,10 @@ impl UsageTracker {
                         .as_ref()
                         .and_then(|w| w.used_fraction())
                         .map(round3);
-                    KeyUsage {
-                        index: i,
-                        suffix,
+                    let row = KeyUsage {
+                        index: 0,
+                        suffix: String::new(),
+                        account: account.clone(),
                         ok: true,
                         status: Some(200),
                         session_pct: session.map(pct),
@@ -813,20 +857,29 @@ impl UsageTracker {
                         purchased_usd: p.purchased_usd,
                         as_of: None,
                         error: None,
+                    };
+                    // Fan the account's row out to every key of the
+                    // account, so /_keys and /_usage keep a per-key view.
+                    for &i in group {
+                        let mut key_row = row.clone();
+                        key_row.index = i;
+                        key_row.suffix = self.pool.suffix_of(i);
+                        slots[i] = Some(key_row);
                     }
                 }
                 Some(Err(FetchError::RateLimited(ra))) => {
-                    // One shared 10 req/min budget: a 429'd key sits out
-                    // the next round — or its Retry-After, capped.
+                    // One shared 10 req/min budget per account: a 429'd
+                    // account sits out the next round — or its
+                    // Retry-After, capped.
                     let backoff = clamp_backoff(ra, self.default_backoff);
-                    lock(&self.backoff_until)[i] = Some(Instant::now() + backoff);
-                    self.carried_or_failed(
-                        i,
-                        suffix,
+                    lock(&self.backoff_until)[g] = Some(Instant::now() + backoff);
+                    self.fill_carried(
+                        &mut slots,
+                        group,
                         "rate limited (upstream 429)",
                         true,
                         prev.as_deref(),
-                    )
+                    );
                 }
                 Some(Err(FetchError::Status(code))) => {
                     // 5xx is a server-side blip (carry); 401/403 (dead
@@ -837,36 +890,51 @@ impl UsageTracker {
                         404 => "endpoint gone (upstream 404)".to_string(),
                         other => format!("upstream HTTP {other}"),
                     };
-                    self.carried_or_failed(i, suffix, &reason, transient, prev.as_deref())
+                    self.fill_carried(&mut slots, group, &reason, transient, prev.as_deref());
                 }
-                Some(Err(FetchError::Network(e))) => self.carried_or_failed(
-                    i,
-                    suffix,
+                Some(Err(FetchError::Network(e))) => self.fill_carried(
+                    &mut slots,
+                    group,
                     &format!("network: {e}"),
                     true,
                     prev.as_deref(),
                 ),
                 // Shape drift is persistent (the row must say so, not
                 // replay stale data while upstream changed the payload).
-                Some(Err(FetchError::Drift(msg))) => KeyUsage::failed(i, suffix, msg),
-                None if !eligible.get(i).copied().unwrap_or(true) => {
+                Some(Err(FetchError::Drift(msg))) => {
+                    for &i in group {
+                        slots[i] = Some(KeyUsage::failed(
+                            i,
+                            self.pool.suffix_of(i),
+                            account.clone(),
+                            msg.clone(),
+                        ));
+                    }
+                }
+                None if !eligible.get(g).copied().unwrap_or(true) => {
                     // Skipped in 429 backoff: the previous 429 is still
                     // in effect, so that is what the row carries (or
                     // says) until the backoff elapses.
-                    self.carried_or_failed(
-                        i,
-                        suffix,
+                    self.fill_carried(
+                        &mut slots,
+                        group,
                         "rate limited (upstream 429)",
                         true,
                         prev.as_deref(),
-                    )
+                    );
                 }
                 None => {
-                    // Defensive: an eligible key's thread produced
+                    // Defensive: an eligible account's thread produced
                     // nothing (panic mid-fetch). Transient like network.
-                    self.carried_or_failed(i, suffix, "network: no result", true, prev.as_deref())
+                    self.fill_carried(
+                        &mut slots,
+                        group,
+                        "network: no result",
+                        true,
+                        prev.as_deref(),
+                    );
                 }
-            });
+            }
         }
         // Zero fresh successes: don't overwrite good data with nothing —
         // fetch failures and backoff skips alike. Keeping the previous
@@ -881,6 +949,20 @@ impl UsageTracker {
                 return prev;
             }
         }
+        let keys: Vec<KeyUsage> = slots
+            .into_iter()
+            .enumerate()
+            .map(|(i, slot)| {
+                slot.unwrap_or_else(|| {
+                    KeyUsage::failed(
+                        i,
+                        self.pool.suffix_of(i),
+                        self.pool.account_of(i).to_string(),
+                        "no usage data".to_string(),
+                    )
+                })
+            })
+            .collect();
         let snap = Arc::new(UsageSnapshot {
             fetched_at: Instant::now(),
             keys,
@@ -913,18 +995,38 @@ impl UsageTracker {
                 }
             }
         }
-        KeyUsage::failed(i, suffix, reason.to_string())
+        KeyUsage::failed(
+            i,
+            suffix,
+            self.pool.account_of(i).to_string(),
+            reason.to_string(),
+        )
     }
 
-    /// Which keys may be fetched this round: a key is ineligible only
-    /// while its 429 backoff (see `do_fetch_inner`) is still in effect.
-    fn eligible_keys(&self) -> Vec<bool> {
+    /// Fill every key of `group` from the carry/error path.
+    fn fill_carried(
+        &self,
+        slots: &mut [Option<KeyUsage>],
+        group: &[usize],
+        reason: &str,
+        transient: bool,
+        prev: Option<&UsageSnapshot>,
+    ) {
+        for &i in group {
+            slots[i] =
+                Some(self.carried_or_failed(i, self.pool.suffix_of(i), reason, transient, prev));
+        }
+    }
+
+    /// Which accounts may be fetched this round: an account is ineligible
+    /// only while its 429 backoff (see `do_fetch_inner`) is still in effect.
+    fn eligible_accounts(&self) -> Vec<bool> {
         let backoff = lock(&self.backoff_until);
         let now = Instant::now();
-        (0..self.pool.len())
-            .map(|i| {
+        (0..self.groups.len())
+            .map(|g| {
                 backoff
-                    .get(i)
+                    .get(g)
                     .copied()
                     .flatten()
                     .is_none_or(|until| until <= now)
@@ -932,24 +1034,51 @@ impl UsageTracker {
             .collect()
     }
 
-    /// Parallel fan-out: one thread per *eligible* key, index-aligned
-    /// results (`None` = skipped by backoff, or — defensively — a
-    /// thread that produced nothing; the caller tells them apart via
+    /// Try the account's keys, healthy ones first. An auth rejection
+    /// (401/403) rotates to the next key — one revoked key must not blank
+    /// the account — while 429/5xx/network stop the attempt (the limit
+    /// and the upstream are shared by the account).
+    fn key_order(&self, group: &[usize]) -> Vec<usize> {
+        let mut order = group.to_vec();
+        order.sort_by_key(|&i| (self.pool.state_of(i) != State::Up, i));
+        order
+    }
+
+    /// Parallel fan-out: one thread per *eligible* account, index-aligned
+    /// results (`None` = skipped by backoff, or — defensively — a thread
+    /// that produced nothing; the caller tells them apart via
     /// `eligible`). Never touches pool state (no admits, no health
     /// marks).
     fn fetch_all(&self, eligible: &[bool]) -> Vec<Option<Result<UsagePayload, FetchError>>> {
-        let n = self.pool.len();
+        let n = self.groups.len();
         let mut results: Vec<Option<Result<UsagePayload, FetchError>>> =
             (0..n).map(|_| None).collect();
         std::thread::scope(|s| {
-            for (i, slot) in results.iter_mut().enumerate() {
-                if !eligible.get(i).copied().unwrap_or(true) {
+            for (g, slot) in results.iter_mut().enumerate() {
+                if !eligible.get(g).copied().unwrap_or(true) {
                     continue;
                 }
                 let fetch = &self.fetch;
-                let secret = self.pool.secret_of(i).to_string();
+                let order = self.key_order(&self.groups[g]);
                 s.spawn(move || {
-                    *slot = Some(fetch(i, &self.pool.suffix_of(i), &secret));
+                    let mut last_auth: Option<FetchError> = None;
+                    for &i in &order {
+                        match fetch(i, &self.pool.suffix_of(i), self.pool.secret_of(i)) {
+                            Ok(p) => {
+                                *slot = Some(Ok(p));
+                                return;
+                            }
+                            Err(FetchError::Status(401 | 403)) => {
+                                last_auth = Some(FetchError::Status(401));
+                            }
+                            Err(other) => {
+                                *slot = Some(Err(other));
+                                return;
+                            }
+                        }
+                    }
+                    *slot = Some(Err(last_auth
+                        .unwrap_or_else(|| FetchError::Network("no key for account".into()))));
                 });
             }
         });
@@ -992,15 +1121,15 @@ fn retry_after_seconds(resp: &ureq::Response) -> Option<Duration> {
 }
 
 /// One keyed HTTP GET of `/api/balance` decoded tolerantly. A single
-/// request per key per round: the docs rate-limit 10 req/min per user
-/// shared across all keys and devices, so the TTL stays at 60 s
-/// (>= 6 s is the floor for a single key). Caveats: the fan-out fires
-/// one GET per eligible key in parallel, so pools with more than ~10
-/// keys burst over the shared per-user limit — 429'd keys then carry
-/// their last good row and sit out later rounds per their Retry-After
-/// (see `do_fetch_inner`) — and forced refreshes are gated by a 5 s
-/// minimum interval, not this TTL, so a refresh loop can exceed
-/// 10 req/min per key. A 429 surfaces as `RateLimited` (with the
+/// request per account per round: the docs rate-limit 10 req/min per user
+/// shared across that user's keys and devices, so the TTL stays at 60 s
+/// (>= 6 s is the floor for a single account). Caveats: the fan-out fires
+/// one GET per eligible account in parallel, so pools with more than ~10
+/// accounts burst over the shared per-user limit — 429'd accounts then
+/// carry their last good rows and sit out later rounds per their
+/// Retry-After (see `do_fetch_inner`) — and forced refreshes are gated by
+/// a 5 s minimum interval, not this TTL, so a refresh loop can exceed
+/// 10 req/min per account. A 429 surfaces as `RateLimited` (with the
 /// `Retry-After` it published); a body that is not a documented
 /// balance shape surfaces as `Drift` — persistent, never carried.
 fn fetch_balance_http(
@@ -1032,6 +1161,7 @@ fn fetch_balance_http(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::KeyEntry;
 
     fn failing_tracker() -> UsageTracker {
         let pool = Arc::new(Pool::new(vec![("omk-usage-dead1".into(), 1)], 4, false));
@@ -1374,6 +1504,7 @@ mod tests {
         KeyUsage {
             index,
             suffix: format!("sfx{index}"),
+            account: format!("acct{index}"),
             ok,
             status: ok.then_some(200),
             session,
@@ -1528,6 +1659,76 @@ mod tests {
         assert_eq!(a.session, Some(0.492));
         assert_eq!(a.weekly, Some(0.198));
         assert_eq!(a.session_resets_at.as_deref(), Some("2026-10-09T00:00:00Z"));
+    }
+
+    #[test]
+    fn one_fetch_per_account_and_aggregate_not_doubled() {
+        // Two alice keys, one bob key. Balance is account-scoped: two
+        // upstream fetches total, and alice contributes once to the
+        // aggregate (not once per key).
+        static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let pool = Arc::new(Pool::from_entries(
+            vec![
+                KeyEntry::new("omk-acct-a1", 1, "alice"),
+                KeyEntry::new("omk-acct-a2", 1, "alice"),
+                KeyEntry::new("omk-acct-b1", 1, "bob"),
+            ],
+            4,
+            false,
+        ));
+        let t = UsageTracker::new(pool.clone(), "https://ollama.com").with_fetch(|i, _, _| {
+            CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let body = if i == 0 {
+                legacy_body(90.0, 80.0, "2026-10-09T00:00:00Z")
+            } else {
+                legacy_body(50.0, 50.0, "2026-10-09T00:00:00Z")
+            };
+            Ok(serde_json::from_str(&body).unwrap())
+        });
+        let snap = t.get();
+        assert_eq!(
+            CALLS.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "one fetch per account"
+        );
+        assert_eq!(snap.keys.len(), 3, "every key still has a row");
+        assert_eq!(snap.keys[0].account, "alice");
+        assert_eq!(snap.keys[1].account, "alice");
+        assert_eq!(snap.keys[2].account, "bob");
+        assert_eq!(
+            snap.keys[0].session, snap.keys[1].session,
+            "same account fans the same numbers to each key"
+        );
+        let a = aggregate(&snap, &pool.concurrencies());
+        // alice 0.1 (weight 1) + bob 0.5 (weight 1) = 0.3. Per-key
+        // weighting would wrongly give (0.1 + 0.1 + 0.5) / 3 = 0.233.
+        assert_eq!(a.session, Some(0.3));
+    }
+
+    #[test]
+    fn account_auth_failure_rotates_to_next_key() {
+        let pool = Arc::new(Pool::from_entries(
+            vec![
+                KeyEntry::new("omk-revoked1", 1, "alice"),
+                KeyEntry::new("omk-live0002", 1, "alice"),
+            ],
+            4,
+            false,
+        ));
+        let t = UsageTracker::new(pool, "https://ollama.com").with_fetch(|i, _, _| {
+            if i == 0 {
+                Err(FetchError::Status(401))
+            } else {
+                Ok(serde_json::from_str(&legacy_body(80.0, 70.0, "2026-10-09T00:00:00Z")).unwrap())
+            }
+        });
+        let snap = t.get();
+        assert!(
+            snap.keys.iter().all(|k| k.ok),
+            "a revoked key must not blank its account"
+        );
+        assert_eq!(snap.keys[0].session, Some(0.2));
+        assert_eq!(snap.keys[1].session, Some(0.2));
     }
 
     #[test]

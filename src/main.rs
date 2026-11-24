@@ -25,6 +25,35 @@ struct Config {
     affinity: bool,
 }
 
+/// Slots are per key today, while Ollama Cloud's concurrency limit is
+/// per account. Grouping several keys under one `@account` therefore
+/// multiplies the in-flight bound; say so once at startup rather than
+/// letting the plan limit surprise the user as upstream 429s.
+fn warn_multi_key_accounts(keys: &ollamux::Keys) {
+    let mut accounts: Vec<(&str, usize)> = Vec::new();
+    for e in &keys.entries {
+        match accounts.iter_mut().find(|(a, _)| *a == e.account) {
+            Some(entry) => entry.1 += 1,
+            None => accounts.push((&e.account, 1)),
+        }
+    }
+    for (account, count) in accounts {
+        if count > 1 {
+            let slots: u32 = keys
+                .entries
+                .iter()
+                .filter(|e| e.account == account)
+                .map(|e| e.concurrency)
+                .sum();
+            eprintln!(
+                "ollamux: warning: account {account:?} has {count} keys ({slots} slots); \
+                 Ollama Cloud's concurrency limit is per account — use one key per account \
+                 for a strict cap"
+            );
+        }
+    }
+}
+
 fn main() {
     // FIRST THING, before any thread can exist (theirs or ours): block
     // SIGINT. POSIX threads inherit the caller's mask, so every thread
@@ -55,8 +84,9 @@ fn main() {
         eprintln!("ollamux: no keys configured; refusing to start");
         std::process::exit(1);
     }
+    warn_multi_key_accounts(&keys);
 
-    let pool = Arc::new(ollamux::Pool::new(
+    let pool = Arc::new(ollamux::Pool::from_entries(
         keys.entries.clone(),
         WAITER_CAP,
         cfg.verbose,
@@ -295,7 +325,9 @@ POINT CLIENTS AT IT:
     base_url = \"http://localhost:11435/v1\"       # OpenAI-compatible SDKs
 
 KEYS:
-    one key per line, `#` comments allowed; `KEY:N` sets per-key
+    one key per line, `#` comments allowed; format `KEY[:N]@ACCOUNT`.
+    ACCOUNT is required (1-64 chars of A-Z a-z 0-9 . _ -): keys sharing
+    a label belong to one ollama.com account. `:N` sets per-key
     concurrency (default 3; free=1 pro=3 max=10).
     Get keys: https://ollama.com/settings/keys
 
@@ -303,21 +335,25 @@ ENDPOINTS:
     /api/*, /v1/*   proxied to https://ollama.com with key rotation
                     (prompt-cache affinity by default; X-Ollamux-Affinity
                     response header: hit/miss/off)
-    /_keys          per-key health JSON (tier + embeds usage when known)
-    /_usage         per-key Ollama Cloud usage JSON plus a pool-capacity
-                    aggregate (?refresh=1 forces, at most one fetch
-                    attempt per 5 s)
+    /_keys          per-key health JSON (account, tier, embedded usage)
+    /_usage         per-account + per-key Ollama Cloud usage JSON plus a
+                    pool-capacity aggregate. ?range=24h|7d|30d adds
+                    per-account model/time statistics (group_by=model
+                    optional); ?refresh=1 forces, at most one attempt
+                    per 5 s
     /_health        liveness JSON
 
 USAGE SOURCE:
-    /_usage reads the documented per-key balance endpoint
-    (docs.ollama.com/api/balance): legacy plans carry session/weekly
-    remaining percents + reset instants; credit plans carry USD amounts.
-    Polled at most once per 60 s (upstream allows 10 req/min per user,
-    shared across keys; pools larger than ~10 keys fan out in parallel
-    and can burst over that shared limit — affected keys report 429 and
-    back off; forced refreshes bypass the TTL and are capped per key at
-    one attempt per 5 s).",
+    /_usage reads the documented balance endpoint
+    (docs.ollama.com/api/balance), once per @account: legacy plans carry
+    session/weekly remaining percents + reset instants; credit plans
+    carry USD amounts. ?range=... also reads the documented cloud usage
+    endpoint (docs.ollama.com/api/cloud-usage) for request counts,
+    tokens, cost and per-model buckets. Both are polled at most once per
+    60 s (upstream allows 10 req/min per user, shared across that
+    account's keys; pools larger than ~10 accounts can burst over that
+    limit — affected accounts report 429 and back off; forced refreshes
+    bypass the TTL and are capped per account at one attempt per 5 s).",
         ollamux::VERSION
     );
 }

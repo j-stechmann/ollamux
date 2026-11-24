@@ -10,6 +10,7 @@
 //!   both written by the usage tracker and read on the request hot path.
 
 use crate::affinity::AffinityMap;
+use crate::config::KeyEntry;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -106,8 +107,31 @@ impl KeyState {
     }
 }
 
+/// One distinct upstream account (from the keys file's `@label`), with
+/// its member keys. Usage and balance are account-scoped, so this is the
+/// unit fetched and reported by `/_usage`.
+#[derive(Debug, Clone)]
+pub struct AccountInfo {
+    pub name: String,
+    /// Indices into the pool, in file order.
+    pub key_indices: Vec<usize>,
+    /// Highest per-key concurrency among the account's keys — the plan
+    /// tier is an account property, so differing suffixes resolve to the
+    /// largest one.
+    pub concurrency: u32,
+    pub tier: &'static str,
+}
+
+impl AccountInfo {
+    pub fn key_count(&self) -> usize {
+        self.key_indices.len()
+    }
+}
+
 pub struct Pool {
     keys: Vec<String>,
+    /// Account label per key, index-aligned with `keys`/`states`.
+    accounts: Vec<String>,
     states: Vec<KeyState>,
     /// Round-robin tie-breaker: last successful key.
     rr: AtomicUsize,
@@ -168,6 +192,8 @@ pub enum WaitRejected {
 pub struct KeyInfo {
     pub index: usize,
     pub suffix: String,
+    /// Account label from the keys file (never a secret).
+    pub account: String,
     pub state: State,
     pub concurrency: u32,
     /// Plan tier inferred from `concurrency` (free=1, pro=3, max=10; more
@@ -214,17 +240,30 @@ fn pct(f: f64) -> f64 {
 }
 
 impl Pool {
+    /// Convenience constructor for tests/embeddable use: every key gets
+    /// its own synthetic account (`key-0`, `key-1`, …), which reproduces
+    /// the historical one-fetch-per-key behavior. Production code goes
+    /// through `from_entries` with the keys file's real account labels.
     pub fn new(keys_with_concurrency: Vec<(String, u32)>, waiter_cap: u32, verbose: bool) -> Pool {
-        let keys = keys_with_concurrency
-            .iter()
-            .map(|(k, _)| k.clone())
+        let entries = keys_with_concurrency
+            .into_iter()
+            .enumerate()
+            .map(|(i, (secret, conc))| KeyEntry::new(secret, conc, format!("key-{i}")))
             .collect();
-        let states = keys_with_concurrency
+        Pool::from_entries(entries, waiter_cap, verbose)
+    }
+
+    /// Build the pool from parsed keys, preserving `@account` grouping.
+    pub fn from_entries(entries: Vec<KeyEntry>, waiter_cap: u32, verbose: bool) -> Pool {
+        let keys = entries.iter().map(|e| e.secret.clone()).collect();
+        let accounts = entries.iter().map(|e| e.account.clone()).collect();
+        let states = entries
             .iter()
-            .map(|(_, c)| KeyState::new(*c, waiter_cap))
+            .map(|e| KeyState::new(e.concurrency, waiter_cap))
             .collect();
         Pool {
             keys,
+            accounts,
             states,
             rr: AtomicUsize::new(0),
             verbose,
@@ -259,6 +298,34 @@ impl Pool {
 
     pub fn suffix_of(&self, key: usize) -> String {
         crate::config::suffix(&self.keys[key])
+    }
+
+    /// Account label for a pool key.
+    pub fn account_of(&self, key: usize) -> &str {
+        &self.accounts[key]
+    }
+
+    /// Distinct accounts in first-seen order, each with its member keys.
+    /// This is the unit usage/balance fetches and reports.
+    pub fn accounts(&self) -> Vec<AccountInfo> {
+        let mut out: Vec<AccountInfo> = Vec::new();
+        for (i, name) in self.accounts.iter().enumerate() {
+            if let Some(a) = out.iter_mut().find(|a| a.name == *name) {
+                a.key_indices.push(i);
+                a.concurrency = a.concurrency.max(self.states[i].concurrency);
+            } else {
+                out.push(AccountInfo {
+                    name: name.clone(),
+                    key_indices: vec![i],
+                    concurrency: self.states[i].concurrency,
+                    tier: "free",
+                });
+            }
+        }
+        for a in &mut out {
+            a.tier = crate::usage::tier_for(a.concurrency).0;
+        }
+        out
     }
 
     /// Per-key concurrency limits, index-aligned with snapshot keys (the
@@ -520,6 +587,7 @@ impl Pool {
                 KeyInfo {
                     index: i,
                     suffix: self.suffix_of(i),
+                    account: self.account_of(i).to_string(),
                     state,
                     concurrency: st.concurrency,
                     tier: crate::usage::tier_for(st.concurrency).0,
@@ -977,6 +1045,7 @@ mod tests {
                 .map(|&(i, session)| crate::usage::KeyUsage {
                     index: i,
                     suffix: format!("sfx{i}"),
+                    account: format!("acct{i}"),
                     ok: session.is_some(),
                     status: session.map(|_| 200),
                     session,

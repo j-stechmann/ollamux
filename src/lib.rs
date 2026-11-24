@@ -2,11 +2,13 @@ mod affinity;
 mod config;
 mod pool;
 pub mod proxy;
+mod stats;
 mod usage;
 
-pub use config::{Keys, ParseError};
-pub use pool::Pool;
+pub use config::{KeyEntry, Keys, ParseError};
+pub use pool::{AccountInfo, Pool};
 pub use proxy::Server;
+pub use stats::{Range as StatsRange, STATS_TTL, StatsSnapshot, StatsTracker};
 pub use usage::{KeyUsage, USAGE_TTL, UsageSnapshot, UsageTracker};
 
 /// Version from Cargo.toml, for --version.

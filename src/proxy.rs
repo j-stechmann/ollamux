@@ -7,6 +7,7 @@
 //! sent. Until then it can be reused across failover attempts.
 
 use crate::pool::{Pool, Reject};
+use crate::stats::{Range as StatsRange, STATS_TTL, StatsSnapshot, StatsTracker};
 use crate::usage::UsageTracker;
 use std::io::{Read, Write};
 use std::sync::Arc;
@@ -76,9 +77,11 @@ static REQ_ID: AtomicUsize = AtomicUsize::new(1);
 
 pub struct Server {
     pub pool: Arc<Pool>,
-    /// Usage introspection (/_usage). Always present; fetches only when
+    /// Balance introspection (/_usage). Always present; fetches only when
     /// /_usage / ?refresh / --usage-aware actually run.
     pub usage: Arc<UsageTracker>,
+    /// Model/time statistics (/_usage?range=…). On-demand only.
+    pub stats: Arc<StatsTracker>,
     agent: ureq::Agent,
     /// Base URL of the upstream ("https://ollama.com"); injectable so tests
     /// can run hermetically against a local server.
@@ -133,9 +136,11 @@ impl Server {
             .https_only(https_only)
             .build();
         let usage = Arc::new(UsageTracker::new(pool.clone(), upstream));
+        let stats = Arc::new(StatsTracker::new(pool.clone(), upstream));
         Server {
             pool,
             usage,
+            stats,
             agent,
             upstream: upstream.trim_end_matches('/').to_string(),
         }
@@ -205,18 +210,50 @@ impl Server {
             return (200, 0, None, None);
         }
         if path == "_usage" {
-            let force = query.is_some_and(|q| {
-                q.split('&').any(|kv| {
-                    let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
-                    k == "refresh" && v != "0" && v != "false"
-                })
-            });
+            let force = query_param(query, "refresh").is_some_and(|v| v != "0" && v != "false");
+            let range = match query_param(query, "range") {
+                None => None,
+                Some(raw) => match StatsRange::parse(raw) {
+                    Some(r) => Some(r),
+                    None => {
+                        let body = serde_json::json!({
+                            "error": format!(
+                                "invalid range {raw:?} (want one of 24h, 7d, 30d)"
+                            )
+                        })
+                        .to_string();
+                        json_response(req, 400, &body, None);
+                        return (400, 0, None, None);
+                    }
+                },
+            };
+            if let Some(group_by) = query_param(query, "group_by") {
+                if range.is_none() {
+                    let body = serde_json::json!({
+                        "error": "group_by requires a range (24h, 7d or 30d)"
+                    })
+                    .to_string();
+                    json_response(req, 400, &body, None);
+                    return (400, 0, None, None);
+                }
+                if group_by != "model" {
+                    let body = serde_json::json!({
+                        "error": format!(
+                            "invalid group_by {group_by:?} (the only supported value is \"model\")"
+                        )
+                    })
+                    .to_string();
+                    json_response(req, 400, &body, None);
+                    return (400, 0, None, None);
+                }
+            }
             let snap = if force {
                 self.usage.refresh()
             } else {
                 self.usage.get()
             };
-            let body = usage_json(&snap, &self.pool);
+            let stats = range.map(|r| self.stats.get(r, force));
+            let body = usage_json(&snap, &self.pool, stats.as_deref());
             json_response(req, 200, &body, None);
             return (200, 0, None, None);
         }
@@ -926,13 +963,116 @@ fn curated_response_headers(resp: &ureq::Response) -> Vec<(String, String)> {
     out
 }
 
+/// First value of `name` in a raw query string (`?a=1&b=2`). No
+/// percent-decoding: the values we read (ranges, `model`, flags) are
+/// plain ASCII.
+fn query_param<'a>(query: Option<&'a str>, name: &str) -> Option<&'a str> {
+    query?.split('&').find_map(|kv| {
+        let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
+        (k == name).then_some(v)
+    })
+}
+
+/// One account-level row mirroring a key row's numbers, without
+/// key-specific fields.
+fn account_json(
+    account: &crate::pool::AccountInfo,
+    snap: &crate::usage::UsageSnapshot,
+) -> serde_json::Value {
+    let row = account
+        .key_indices
+        .iter()
+        .find_map(|&i| snap.keys.iter().find(|k| k.index == i));
+    match row {
+        Some(row) => {
+            let mut v = serde_json::to_value(row).unwrap_or_default();
+            if let Some(o) = v.as_object_mut() {
+                o.remove("index");
+                o.remove("suffix");
+                o.insert("account".into(), serde_json::json!(account.name));
+                o.insert("keys".into(), serde_json::json!(account.key_count()));
+                o.insert("tier".into(), serde_json::json!(account.tier));
+            }
+            v
+        }
+        None => serde_json::json!({
+            "account": account.name,
+            "keys": account.key_count(),
+            "tier": account.tier,
+            "ok": false,
+            "error": "no usage data",
+        }),
+    }
+}
+
+/// Render the optional `models` section: per-account model × time usage
+/// from `/api/usage`, plus a pool total summed per account.
+fn models_json(snap: &StatsSnapshot) -> serde_json::Value {
+    let updated = snap.updated_unix();
+    let age_s = snap.fetched_at.elapsed().as_secs();
+    let stale = age_s >= STATS_TTL.as_secs();
+    let window = snap.window();
+    let accounts: Vec<serde_json::Value> = snap
+        .accounts
+        .iter()
+        .map(|a| {
+            let mut v = serde_json::json!({
+                "account": a.account,
+                "keys": a.keys,
+                "ok": a.ok,
+            });
+            if let Some(as_of) = a.as_of {
+                v["as_of"] = serde_json::json!(as_of);
+            }
+            if let Some(err) = &a.error {
+                v["error"] = serde_json::json!(err);
+            }
+            if let Some(u) = &a.usage {
+                v["totals"] = serde_json::to_value(&u.totals).unwrap_or_default();
+                v["buckets"] = serde_json::to_value(&u.buckets).unwrap_or_default();
+            }
+            v
+        })
+        .collect();
+    let (granularity, from, until) = match window {
+        Some(w) => (
+            serde_json::json!(w.granularity),
+            serde_json::json!(w.from),
+            serde_json::json!(w.until),
+        ),
+        None => (
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+        ),
+    };
+    let totals = serde_json::to_value(snap.pool_totals()).unwrap_or_default();
+    serde_json::json!({
+        "range": snap.range.as_str(),
+        "granularity": granularity,
+        "group_by": "model",
+        "from": from,
+        "until": until,
+        "updated": updated,
+        "age_s": age_s,
+        "stale": stale,
+        "accounts": accounts,
+        "pool": { "totals": totals },
+    })
+}
+
 /// Render a usage snapshot as the /_usage response body: envelope with
-/// freshness, one row per pool key (ok:data or ok:false + error), and a
-/// pool-wide capacity-weighted aggregate. Key count comes from the pool so a
-/// snapshot older than a keys-file change (impossible — keys are fixed at
-/// startup, but be defensive) rows as failures rather than truncating
-/// silently.
-fn usage_json(snap: &crate::usage::UsageSnapshot, pool: &Pool) -> String {
+/// freshness, per-account rows, one row per pool key (ok:data or
+/// ok:false + error), and a pool-wide capacity-weighted aggregate. Key
+/// count comes from the pool so a snapshot older than a keys-file change
+/// (impossible — keys are fixed at startup, but be defensive) rows as
+/// failures rather than truncating silently. When a range was requested,
+/// `models` carries the per-account model/time breakdown.
+fn usage_json(
+    snap: &crate::usage::UsageSnapshot,
+    pool: &Pool,
+    models: Option<&StatsSnapshot>,
+) -> String {
     let updated = snap.updated_unix();
     let age_s = snap.fetched_at.elapsed().as_secs();
     let concurrencies = pool.concurrencies();
@@ -965,11 +1105,16 @@ fn usage_json(snap: &crate::usage::UsageSnapshot, pool: &Pool) -> String {
             }),
         )
         .collect();
+    let accounts: Vec<serde_json::Value> = pool
+        .accounts()
+        .iter()
+        .map(|a| account_json(a, snap))
+        .collect();
     let agg = crate::usage::aggregate(snap, &concurrencies);
     // Re-fetch when the snapshot is older than the TTL but still served
     // (stale-while-revalidate): tell the client so it can decide.
     let stale = age_s >= crate::usage::USAGE_TTL.as_secs();
-    serde_json::json!({
+    let mut out = serde_json::json!({
         "updated": updated,
         "age_s": age_s,
         "stale": stale,
@@ -981,9 +1126,13 @@ fn usage_json(snap: &crate::usage::UsageSnapshot, pool: &Pool) -> String {
             "weekly_resets_at": agg.weekly_resets_at,
             "unit": crate::usage::AGGREGATE_UNIT,
         },
+        "accounts": accounts,
         "keys": keys,
-    })
-    .to_string()
+    });
+    if let Some(m) = models {
+        out["models"] = models_json(m);
+    }
+    out.to_string()
 }
 
 fn reason_phrase(status: u16) -> &'static str {
