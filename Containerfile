@@ -7,7 +7,7 @@
 #
 # Build:  docker build -t ollamux .
 # Run (keys via env):
-#   docker run -p 11435:11435 -e OLLAMUX_KEYS="key-one key-two" ollamux
+#   docker run -p 11435:11435 -e OLLAMUX_KEYS="key-one:3@you" ollamux
 # Run (keys via mounted file):
 #   docker run -p 11435:11435 -v ./keys:/keys:ro -e OLLAMUX_KEYS_FILE=/keys ollamux
 #

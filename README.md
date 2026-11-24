@@ -22,8 +22,9 @@ OpenAI SDK ──┼──> ollamux :11435 ──> https://ollama.com
 cargo install --path .
 
 # 2. Add your keys (https://ollama.com/settings/keys)
+#    Format: KEY[:N]@ACCOUNT — the account label is required.
 mkdir -p ~/.config/ollamux
-printf '%s\n' 'your-key-one...' 'your-key-two...' > ~/.config/ollamux/keys
+printf '%s\n' 'your-key...:3@you' > ~/.config/ollamux/keys
 chmod 600 ~/.config/ollamux/keys
 
 # 3. Point any Ollama client at it
@@ -39,7 +40,7 @@ ollama run gpt-oss:120b
 | AUR (prebuilt)      | `paru -S ollamux-bin`                                 |
 | Fedora/COPR         | `dnf copr enable j-stechmann/ollamux && dnf install ollamux` |
 | Debian (from release assets) | `apt install ./ollamux_0.1.0-1_amd64.deb`    |
-| Container           | `docker run -p 11435:11435 -e OLLAMUX_KEYS=… ghcr.io/j-stechmann/ollamux` |
+| Container           | `docker run -p 11435:11435 -e OLLAMUX_KEYS='key:3@you' ghcr.io/j-stechmann/ollamux` |
 | From source         | `cargo install --locked ollamux` (crates.io) or `cargo install --path .` |
 
 Prebuilt static binaries (x86_64/aarch64 musl) are attached to each
@@ -56,20 +57,40 @@ client = OpenAI(base_url="http://localhost:11435/v1", api_key="unused")
 
 One key per line in `~/.config/ollamux/keys` (respects `XDG_CONFIG_HOME`),
 or set `OLLAMUX_KEYS` (newline/comma-separated) to skip the file entirely.
-Blank lines and `#` comments are allowed.
+Blank lines and `#` comments (whole-line or trailing) are allowed.
 
-Optionally set a per-key concurrency limit with a `:N` suffix — the number of
-cloud models that account may run at once (free=1, pro=3, max=10):
+The format is `KEY[:N]@ACCOUNT`. **The account label is required** (a
+missing label is a startup error): balance and usage are account-scoped
+upstream, so ollamux needs the label to fetch each account once and to
+attribute the numbers correctly. Labels are 1–64 characters of
+`A-Z a-z 0-9 . _ -`. Keys sharing a label are treated as belonging to one
+ollama.com account.
+
+Optionally set a concurrency limit with a `:N` suffix — the number of
+cloud models the account may run at once (free=1, pro=3, max=10; default
+3):
 
 ```
-your-free-key...:1
-your-pro-key...:3           # default when no suffix is given
-your-max-key...:10
+your-free-key...:1@free-acct
+your-pro-key...:3@pro-acct      # 3 is the default when no suffix is given
+your-max-key...:10@max-acct
 ```
 
-The proxy keeps at most N requests in flight per key (matching Ollama
-Cloud's per-plan concurrency limits) and queues the rest briefly rather
-than hammering upstream. Requests that wait too long get an honest `429`.
+A group of friends can pool separate accounts; each account gets its own
+usage rows and model statistics:
+
+```
+alice-key-1...:1@alice
+alice-key-2...:1@alice
+bob-key...:10@bob
+```
+
+The proxy keeps at most N requests in flight per key and queues the rest
+briefly rather than hammering upstream. Requests that wait too long get
+an honest `429`. Note that slots are still counted **per key**, while
+Ollama Cloud's concurrency limit is **per account**: two `:3` keys under
+one label allow up to 6 in flight, and ollamux warns about that at
+startup. Use one key per account for a strict plan cap.
 
 ## Endpoints
 
@@ -77,8 +98,8 @@ than hammering upstream. Requests that wait too long get an honest `429`.
 | --------------- | ----------------------------------------------- |
 | `/api/*`       | Proxied to `https://ollama.com` with rotation    |
 | `/v1/*`        | Proxied (OpenAI-compatible surface) with rotation|
-| `/_keys`       | Per-key health JSON (suffixes only, no secrets)  |
-| `/_usage`      | Per-key usage JSON + pool-capacity aggregate (`?refresh=1` forces a refresh, at most one fetch attempt per 5 s) |
+| `/_keys`       | Per-key health JSON (suffixes/account labels only, no secrets) |
+| `/_usage`      | Per-account + per-key balance JSON and pool aggregate; add `?range=24h\|7d\|30d` for per-account model/time statistics (`group_by=model` optional; `?refresh=1` forces a refresh, at most one fetch attempt per 5 s) |
 | `/_health`     | `{"ok":…, "keys":…, "total_slots":…}`            |
 
 Everything else answers `404` with a hint — this is **not** a local Ollama
@@ -94,8 +115,9 @@ error envelope.
 
 Ollama Cloud publishes plan usage on the **documented** endpoint
 `GET https://ollama.com/api/balance` (docs.ollama.com/api/balance), one
-request per key. Legacy plans (session/weekly limits) answer with what
-*remains* of each window's allowance, reset instants included:
+request per **account** (not per key). Legacy plans (session/weekly
+limits) answer with what *remains* of each window's allowance, reset
+instants included:
 
 ```json
 {"included":{"session":{"remaining_percent":75,"resets_at":"2026-10-01T07:00:00Z"},
@@ -105,73 +127,65 @@ request per key. Legacy plans (session/weekly limits) answer with what
 
 Credit plans answer with USD amounts instead (`included.balance_usd`,
 `included.allowance_usd`, `included.period`, `purchased.balance_usd`).
-Rate limit: 10 requests per minute per user, shared across API keys —
-the docs recommend polling once per minute, which ollamux's passive
-60 s TTL respects for pools of up to ~10 keys. Larger pools fan out
-one GET per key in parallel, so a single round can burst over the
-shared per-user limit; a 429'd key keeps its last good row (an `as_of`
-timestamp marks when that data was fetched) and sits out the next
-round — or the server's `Retry-After`, capped at 5 min — so large
-pools rotate the fetch budget across keys instead of losing data.
-Transient failures (429, 5xx, network blips) carry the last good row;
-persistent ones (unauthorized, endpoint gone, payload drift) surface
-as per-key error strings, never a crash. (Proxied `/api/usage`
-requests are NOT
-special: they go through normal key rotation and reflect whichever key
-served them — use `/_usage` for the per-account picture.)
+Rate limit: 10 requests per minute **per user**, shared across that
+user's API keys and devices — the docs recommend polling once per minute,
+which ollamux's passive 60 s TTL respects for pools of up to ~10
+accounts. A 429'd account keeps its last good row (an `as_of` timestamp
+marks when that data was fetched) and sits out the next round — or the
+server's `Retry-After`, capped at 5 min — so large pools rotate the
+fetch budget across accounts instead of losing data. Transient failures
+(429, 5xx, network blips) carry the last good row; persistent ones
+(unauthorized, endpoint gone, payload drift) surface as per-account
+error strings, never a crash.
 
 ```sh
 curl -s localhost:11435/_usage | jq .
-curl -s 'localhost:11435/_usage?refresh=1' | jq .   # force a refresh
+curl -s 'localhost:11435/_usage?refresh=1' | jq .              # force a refresh
+curl -s 'localhost:11435/_usage?range=7d' | jq .               # + model/time stats
+curl -s 'localhost:11435/_usage?range=30d&group_by=model' | jq .
 ```
 
 Forced refreshes are rate-limited to at most one upstream fetch attempt
 per 5 s (a `?refresh=1` inside that window serves the cached snapshot —
-`stale` keeps reflecting the 60 s TTL, not this guard). Note this guard
-is independent of the TTL: a forced-refresh loop fetches up to 12
-times/min per key, over the upstream rate limit even for a single key.
-The guard counts
+`stale` keeps reflecting the 60 s TTL, not this guard). The guard counts
 *attempts*, not successes: while the upstream is failing (failed rounds
 keep the last good snapshot), polling loops back off instead of fanning
 out on every request.
 
-`/_usage` fans out to the balance endpoint with every configured key
-(one GET per key, in parallel; keys in 429 backoff sit the round out)
-and answers with one row per key (suffixes
-only, never secrets): on legacy plans the used fraction of each window —
-`session`/`weekly` in 0.0–1.0 (upstream's remaining percent, inverted),
-one-decimal `*_pct` mirrors, and `session_resets_at`/`weekly_resets_at`
-for countdowns — or, on credit-plan keys, `included_usd`/`allowance_usd`
-and `purchased_usd` with no percent windows, or a per-key error
-otherwise. Rows carried forward from a previous round (the key's latest
-fetch failed transiently or was skipped in 429 backoff) carry `as_of`,
-the unix time of their original fetch — absent means fresh this round.
-Each row also carries the key's plan `tier`, inferred from
-its per-key concurrency (`KEY:N` — free=1, pro=3, max=10; more
-concurrency than normal is the next tier up). Responses are cached for
-60 s (`updated`/`age_s`/`stale` fields tell you the age); `/_keys` embeds
-the latest known usage per key from the same cache — it never triggers an
-upstream call itself, and usage checks never touch key health (a 401
-there is reported, not treated as a dead key).
+`/_usage` fans out to the balance endpoint with every distinct
+`@account` (one GET per account, in parallel; accounts in 429 backoff sit
+the round out). It answers with an `accounts` array plus one row per key
+(suffixes and account labels only, never secrets): on legacy plans the
+used fraction of each window — `session`/`weekly` in 0.0–1.0 (upstream's
+remaining percent, inverted), one-decimal `*_pct` mirrors, and
+`session_resets_at`/`weekly_resets_at` for countdowns — or, on
+credit-plan keys, `included_usd`/`allowance_usd` and `purchased_usd` with
+no percent windows, or an error otherwise. Rows carried forward from a
+previous round carry `as_of`, the unix time of their original fetch —
+absent means fresh this round. Each key row also carries its `account`
+label and the account's plan `tier`, inferred from the concurrency
+suffix (`:N` — free=1, pro=3, max=10; more concurrency than normal is the
+next tier up). Responses are cached for 60 s (`updated`/`age_s`/`stale`
+fields tell you the age); `/_keys` embeds the latest known usage per key
+from the same cache — it never triggers an upstream call itself, and
+usage checks never touch key health (a 401 there is reported, not treated
+as a dead key).
 
 The envelope's `aggregate` is the capacity-weighted mean of every
-legacy-plan reporting key's usage fraction, weighted by its tier's cap —
-free ×1, pro ×50, max ×250 (pro has 50× free's usage cap, max 5× pro's) —
-so it reads as *the fraction of the pool's combined capacity in use* and
-stays in 0.0–1.0 like the per-key numbers: a single-key pool reproduces
-that key's own fraction, and applications built for the per-key range
-need no adjustment. All keys contribute, including ones currently on
+legacy-plan reporting **account's** usage fraction, weighted by its
+tier's cap — free ×1, pro ×50, max ×250 (pro has 50× free's usage cap,
+max 5× pro's) — so it reads as *the fraction of the pool's combined
+capacity in use* and stays in 0.0–1.0 like the per-key numbers. Weighting
+is per account: two keys under one `@label` contribute once, never
+double-counted. All accounts contribute, including ones currently on
 cooldown (usage fetching is health-blind) and ones whose latest fetch
 failed transiently (carried rows keep contributing their last known good
-fraction); a dead key (401/403) is
-expected to fail its own usage fetch the same way and contributes
-nothing (its weight is excluded from the denominator, so it never
-dilutes the number). Windows nobody reported are `null`, never 0; when
-every reporting key of a window carries the same `resets_at`, the
-aggregate publishes it (`session_resets_at`/`weekly_resets_at`) so
-consumers get one honest reset instant for the pool. Credit-plan rows
-carry no window fractions and sit out the aggregate (their unit is USD,
-not a fraction of an allowance).
+fraction); an unauthorized account contributes nothing (its weight is
+excluded from the denominator). Windows nobody reported are `null`, never
+0; when every reporting account of a window carries the same `resets_at`,
+the aggregate publishes it. Credit-plan rows carry no window fractions
+and sit out the aggregate (their unit is USD, not a fraction of an
+allowance).
 
 ```json
 {"updated":1756620000,"age_s":3,"stale":false,
@@ -179,21 +193,83 @@ not a fraction of an allowance).
  "aggregate":{"session":0.807,"weekly":0.418,
               "session_resets_at":"2026-10-09T00:00:00Z",
               "unit":"pool capacity fraction"},
+ "accounts":[
+   {"account":"alice","keys":2,"ok":true,"tier":"pro",
+    "session":0.037,"weekly":0.007,"session_pct":3.7,"weekly_pct":0.7},
+   {"account":"bob","keys":1,"ok":true,"tier":"max",
+    "session":0.81,"weekly":0.42,"session_pct":81.0,"weekly_pct":42.0,
+    "as_of":1756619955}],
  "keys":[
-   {"index":0,"suffix":"1234","ok":true,"tier":"free",
+   {"index":0,"suffix":"1234","account":"alice","ok":true,"tier":"pro",
     "session":0.037,"weekly":0.007,"session_pct":3.7,"weekly_pct":0.7,
     "session_resets_at":"2026-10-09T00:00:00Z",
     "weekly_resets_at":"2026-10-12T00:00:00Z"},
-   {"index":1,"suffix":"5678","ok":true,"tier":"max",
+   {"index":1,"suffix":"5678","account":"alice","ok":true,"tier":"pro",
+    "session":0.037,"weekly":0.007,"session_pct":3.7,"weekly_pct":0.7},
+   {"index":2,"suffix":"9012","account":"bob","ok":true,"tier":"max",
     "session":0.81,"weekly":0.42,"session_pct":81.0,"weekly_pct":42.0,
     "session_resets_at":"2026-10-09T00:00:00Z",
     "weekly_resets_at":"2026-10-12T00:00:00Z",
     "as_of":1756619955}]}
 ```
 
-(In the example, key `5678`'s latest fetch failed transiently — its data
-was fetched 45 s before the snapshot completed, hence `as_of`; key
-`1234` is fresh and carries no `as_of`.)
+(In the example, bob's latest fetch failed transiently — its data was
+fetched 45 s before the snapshot completed, hence `as_of`; alice's rows
+are fresh and carry no `as_of`.)
+
+## Model and time statistics
+
+Add `?range=24h`, `?range=7d` or `?range=30d` to `/_usage` and ollamux
+also calls the documented cloud usage endpoint
+`GET https://ollama.com/api/usage` (docs.ollama.com/api/cloud-usage),
+once per account, with `group_by=model`. The envelope gains a `models`
+section: per-account `totals` and UTC `buckets` carrying request counts,
+tokens and USD cost, plus a per-model `groups` breakdown. `24h` is hourly
+(25 buckets), `7d`/`30d` are daily; the current bucket has
+`partial: true`.
+
+```json
+{"range":"7d","granularity":"day","group_by":"model",
+ "from":"2026-09-24T00:00:00Z","until":"2026-10-01T02:30:00Z",
+ "updated":1756620000,"age_s":3,"stale":false,
+ "accounts":[
+   {"account":"alice","keys":2,"ok":true,
+    "totals":{"request_count":16,"usage_usd":0.0268,
+              "input_tokens":116000,"cached_input_tokens":60000,"output_tokens":15000,
+              "groups":[{"model":"gpt-oss:120b","request_count":16,
+                         "usage_usd":0.0268,"input_tokens":116000,
+                         "cached_input_tokens":60000,"output_tokens":15000}]},
+    "buckets":[{"from":"2026-09-30T00:00:00Z","until":"2026-10-01T00:00:00Z",
+                "groups":[{"model":"gpt-oss:120b","request_count":8,
+                           "usage_usd":0.0134,"input_tokens":58000,
+                           "cached_input_tokens":30000,"output_tokens":7500}]}]}],
+ "pool":{"totals":{"request_count":16,"usage_usd":0.0268}}}
+```
+
+Things to know:
+
+- The breakdown is **per account**, because the endpoint is
+  account-scoped: two keys under one `@label` cannot be separated
+  upstream.
+- Up to 10 models appear in `groups` (ranked by cost, or request count on
+  legacy plans); the rest are combined into `remainder`. `totals` always
+  covers everything.
+- There is **no per-request log** — the finest time resolution is one
+  hour, and prompts/completions are never exposed. Custom ranges and
+  per-API-key/per-member breakdowns are listed as "coming soon" by
+  Ollama.
+- "New usage may take time to appear" (upstream's own caveat). The
+  `updated`/`age_s`/`stale` fields describe ollamux's cache, not
+  reporting lag.
+- Members of one Ollama **team** share an account and balance, so they
+  cannot be separated by the documented API; separate accounts are
+  required for per-person statistics.
+- `group_by=model` is the only supported grouping; anything else is a
+  `400`. The stats cache is per `(account, range)` with the same 60 s TTL,
+  5 s forced-refresh guard and 429 carry/backoff behavior as balance.
+- Proxied `/api/usage` requests are **not** special: they go through
+  normal key rotation and reflect whichever key served them — use
+  `/_usage` for the pooled, per-account picture.
 
 ## Quota-aware key selection
 
