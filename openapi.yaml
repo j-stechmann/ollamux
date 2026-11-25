@@ -5,7 +5,7 @@
 # verbatim to https://ollama.com — request and response bodies are not
 # rewritten — so the schemas below document the *well-known* Ollama /
 # OpenAI-compatible shapes plus ollamux's own introspection endpoints
-# (/_keys, /_usage, /_health) and its proxy-generated error envelope.
+# (/_keys, /_usage, /_stats, /_health) and its proxy-generated error envelope.
 openapi: 3.0.3
 info:
   title: ollamux
@@ -86,9 +86,10 @@ tags:
       completions, models, …). All /v1/* paths are proxied verbatim.
   - name: introspection
     description: >
-      ollamux-local endpoints for per-key health, usage, and liveness. These
-      are answered in-memory and never touch the upstream (/_usage may fetch
-      ollama.com/api/balance, but /_keys never does).
+      ollamux-local endpoints for per-key health, usage, local statistics
+      and liveness. These are answered in-memory and never touch the
+      upstream (/_usage may fetch ollama.com/api/balance; /_stats and
+      /_keys never do).
 paths:
   /_health:
     get:
@@ -215,15 +216,70 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/OllamaError'}
+  /_stats:
+    get:
+      tags: [introspection]
+      summary: Local per-request token and request statistics
+      description: >
+        Counters measured from traffic that passed through ollamux (not
+        from ollama.com): request counts, upstream-reported input/cached/
+        output tokens, wall duration, retries and final status, aggregated
+        into lifetime totals, per key (account label + fingerprint), account,
+        model, endpoint, HTTP status, and UTC hour/day buckets.
+        Token counts come from the response body
+        (`prompt_eval_count`/`prompt_eval_cached_count`/`eval_count`, or
+        OpenAI-compatible `usage.*` including Responses
+        `input_tokens`/`output_tokens` and cached details). Streaming
+        NDJSON/SSE is sniffed incrementally without delaying forwarding.
+        Successful (2xx) requests on token-bearing endpoints carrying no
+        counters increment `requests_without_usage`; no input/output split
+        is synthesized (total-only usage is treated as missing).
+        Purely in-memory (plus the persisted file) — never calls upstream.
+        `range` selects the bucket series only: `24h` hourly (current
+        partial hour + 24 previous), `7d`/`30d` daily; the current bucket is `partial`. Counters persist by
+        default under `$OLLAMUX_STATS_FILE` / `$XDG_STATE_HOME/ollamux/stats.json`
+        (override with `--stats-file`, disable entirely with `--no-stats`,
+        which returns `enabled: false`). `range` scopes only `buckets` and
+        `window_totals`; `totals` and all dimension rows are lifetime
+        (`totals_scope: lifetime`). Rows are capped at 512 historical keys,
+        256 accounts, 256 models and 128 endpoints; stats files over
+        16 MiB are left untouched.
+      operationId: getStats
+      parameters:
+        - name: range
+          in: query
+          required: false
+          description: Bucket granularity and window. Default `24h`; 24h is the current partial hour plus 24 previous, 7d/30d are daily buckets.
+          schema:
+            type: string
+            enum: [24h, 7d, 30d]
+            default: 24h
+      responses:
+        '200':
+          description: >
+            Local aggregates. `since` is the first observation ever
+            (persisted); `started_at`/`uptime_s` describe this process.
+            `keys` carries configured keys even before traffic and marks
+            historical rows `present: false`.
+          headers:
+            X-Ollamux: {$ref: '#/components/headers/X-Ollamux'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/LocalStatsEnvelope'}
+        '400':
+          description: Invalid `range` (returned before any work).
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/OllamaError'}
   /:
     get:
       tags: [introspection]
       summary: Unknown-path hint (404)
       description: >
-        Everything outside `/api/*`, `/v1/*`, `/_keys`, `/_usage` and
-        `/_health` answers 404 with a hintful JSON body — the top confusion
-        is expecting a local Ollama server. Shown here for `/`; any unknown
-        path behaves identically.
+        Everything outside `/api/*`, `/v1/*`, `/_keys`, `/_usage`,
+        `/_stats` and `/_health` answers 404 with a hintful JSON body — the
+        top confusion is expecting a local Ollama server. Shown here for
+        `/`; any unknown path behaves identically.
       operationId: getRoot
       responses:
         '404':
@@ -665,7 +721,7 @@ components:
     X-Ollamux-Key:
       description: >
         Suffix of the pool key that served the request. Present only when a
-        pool key served it (never on /_keys, /_usage, /_health, 404 hints,
+        pool key served it (never on /_keys, /_usage, /_stats, /_health, 404 hints,
         or no-auth paths such as /api/tags).
       schema: {type: string, example: '1234'}
     X-Ollamux-Retries:
@@ -787,6 +843,195 @@ components:
         input_tokens: {type: integer, description: Input tokens, including cached input.}
         cached_input_tokens: {type: integer, description: Input tokens read from cache (included in input_tokens).}
         output_tokens: {type: integer}
+    LocalMetrics:
+      type: object
+      required:
+        - requests
+        - ok
+        - errors
+        - requests_without_usage
+        - input_tokens
+        - cached_input_tokens
+        - output_tokens
+        - total_tokens
+        - duration_ms
+        - retries
+      properties:
+        requests: {type: integer, description: Client-visible requests counted.}
+        ok: {type: integer, description: Requests whose final status was below 400.}
+        errors: {type: integer, description: Requests whose final status was 400 or above.}
+        requests_without_usage:
+          type: integer
+          description: >
+            Successful (2xx) requests to token-bearing endpoints (chat,
+            generate, embed; native and OpenAI-compatible, including
+            Responses) whose response carried no token counters. They
+            contribute zero tokens; no input/output split is synthesized.
+            Metadata/management endpoints such as `/api/show`,
+            `/api/ps`, `/api/embeddings` and 3xx responses are not counted
+            here.
+        input_tokens: {type: integer, description: Upstream-reported input tokens, including cached input.}
+        cached_input_tokens:
+          type: integer
+          description: >
+            Upstream-reported cached input tokens, from
+            `prompt_tokens_details.cached_tokens` /
+            `input_tokens_details.cached_tokens` (OpenAI-compatible) or
+            `prompt_eval_cached_count` (native).
+        output_tokens: {type: integer}
+        total_tokens: {type: integer, description: input_tokens + output_tokens.}
+        duration_ms: {type: integer, description: Summed wall time of the included requests.}
+        avg_ms: {type: number, nullable: true, description: duration_ms / requests (null when no requests).}
+        retries: {type: integer, description: Failover attempts made by the included requests.}
+    LocalKeyRow:
+      allOf:
+        - $ref: '#/components/schemas/LocalMetrics'
+        - type: object
+          required: [account, id, suffix, present]
+          properties:
+            account:
+              type: string
+              description: 'Account label from the keys file (`(unattributed)` for requests with no key, `<other>` for overflow history).'
+            id:
+              type: string
+              description: 'Stable non-secret key fingerprint used for identity across restarts (`(unattributed)` for no-key traffic, `<other>` for overflow history).'
+            suffix: {type: string, description: 'Last characters of the key — never the secret (`(unattributed)` for no-key traffic, `<other>` for overflow history).'}
+            present:
+              type: boolean
+              description: True when the key is in the current pool; false for historical rows retained after a keys-file change.
+    LocalAccountRow:
+      allOf:
+        - $ref: '#/components/schemas/LocalMetrics'
+        - type: object
+          required: [account]
+          properties:
+            account:
+              type: string
+              description: 'Account label (`(unattributed)` for requests with no key, `<other>` for overflow history).'
+    LocalModelRow:
+      allOf:
+        - $ref: '#/components/schemas/LocalMetrics'
+        - type: object
+          required: [model]
+          properties:
+            model:
+              type: string
+              description: >
+                Model from the request body (`(none)` when absent or
+                unparseable), or `<other>` when the 256-name cap is
+                exceeded.
+    LocalEndpointRow:
+      allOf:
+        - $ref: '#/components/schemas/LocalMetrics'
+        - type: object
+          required: [endpoint]
+          properties:
+            endpoint: {type: string, description: 'Proxied path group, e.g. `api/chat` or `v1/chat/completions`; `<other>` once the 128-endpoint cap is exceeded.'}
+    LocalBucket:
+      allOf:
+        - $ref: '#/components/schemas/LocalMetrics'
+        - type: object
+          required: [from, until, partial]
+          properties:
+            from: {type: string, format: date-time, description: Inclusive UTC start.}
+            until: {type: string, format: date-time, description: Exclusive UTC end.}
+            partial: {type: boolean, description: True for the current, still-in-progress bucket.}
+    LocalStatsEnvelope:
+      type: object
+      required:
+        - source
+        - enabled
+        - version
+        - since
+        - since_iso
+        - started_at
+        - uptime_s
+        - range
+        - granularity
+        - totals
+        - keys
+        - accounts
+        - models
+        - endpoints
+        - by_status
+        - buckets
+        - persistence
+        - totals_scope
+        - window_totals
+      properties:
+        source: {type: string, enum: [local]}
+        enabled:
+          type: boolean
+          description: False when `--no-stats` / `OLLAMUX_NO_STATS` disables counting; counters/rows are empty, while envelope metadata (since, uptime, range, persistence) is still present.
+        version: {type: integer, description: Persisted schema version.}
+        since: {type: integer, description: Unix seconds of the first-ever observation (persisted).}
+        since_iso: {type: string, format: date-time}
+        started_at: {type: integer, description: Unix seconds when this process started.}
+        uptime_s: {type: integer}
+        saved_at:
+          type: integer
+          nullable: true
+          description: Unix seconds of the last successful persistence flush (null before the first flush or with --no-stats).
+        pending_flush: {type: boolean}
+        persistence:
+          type: string
+          enum: [file, memory, blocked, disabled, error]
+          description: >
+            `file` = persisted; `memory` = an in-memory meter;
+            `blocked` = persistence disabled because the target is
+            foreign, corrupt, newer-versioned, oversized, non-regular,
+            unwritable, or owned by another live instance (the process
+            runs in memory); `disabled` = --no-stats /
+            OLLAMUX_NO_STATS (nothing is counted); `error` = the most
+            recent flush failed (`last_flush_error` has details).
+        persistence_note:
+          type: string
+          nullable: true
+          description: Explanation for a blocked stats file (or a preserved/unreadable one).
+        last_flush_error:
+          type: string
+          nullable: true
+          description: Most recent persistence write failure, cleared by a successful flush.
+        range:
+          type: string
+          enum: [24h, 7d, 30d]
+          description: Bucket/window range; does not scope totals or dimensions.
+        granularity: {type: string, enum: [hour, day]}
+        totals_scope:
+          type: string
+          enum: [lifetime]
+          description: Totals and dimension rows are lifetime, not range-scoped.
+        totals: {$ref: '#/components/schemas/LocalMetrics'}
+        window:
+          type: object
+          nullable: true
+          description: The bucket window covered by `window_totals`.
+          properties:
+            from: {type: string, format: date-time}
+            until: {type: string, format: date-time}
+        window_totals:
+          allOf:
+            - $ref: '#/components/schemas/LocalMetrics'
+          description: Sum of the selected buckets (`range` window), not lifetime.
+        keys:
+          type: array
+          items: {$ref: '#/components/schemas/LocalKeyRow'}
+        accounts:
+          type: array
+          items: {$ref: '#/components/schemas/LocalAccountRow'}
+        models:
+          type: array
+          items: {$ref: '#/components/schemas/LocalModelRow'}
+        endpoints:
+          type: array
+          items: {$ref: '#/components/schemas/LocalEndpointRow'}
+        by_status:
+          type: object
+          additionalProperties: {type: integer}
+          description: Final recorded status code → request count (499 denotes a mid-stream client abort, 502 an upstream failure after headers).
+        buckets:
+          type: array
+          items: {$ref: '#/components/schemas/LocalBucket'}
     UsageGroup:
       allOf:
         - $ref: '#/components/schemas/UsageMetrics'
@@ -1056,7 +1301,7 @@ components:
           type: string
           description: >
             Explanation that ollamux serves only /api/*, /v1/*, /_keys,
-            /_usage, /_health and is not a local Ollama server.
+            /_usage, /_stats, /_health and is not a local Ollama server.
 
     # ----- error envelope -----
     ErrorEnvelope:

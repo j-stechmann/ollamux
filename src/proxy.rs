@@ -6,6 +6,9 @@
 //! `std::mem::replace`d out exactly once, at the moment a response is
 //! sent. Until then it can be reused across failover attempts.
 
+use crate::meter::{
+    Meter, Sample, TeeReader, UsageCounts, UsageSniffer, captured_usage, key_fingerprint,
+};
 use crate::pool::{Pool, Reject};
 use crate::stats::{Range as StatsRange, STATS_TTL, StatsSnapshot, StatsTracker};
 use crate::usage::UsageTracker;
@@ -35,6 +38,20 @@ const CHUNK: usize = 16 * 1024;
 const SNIPPET: u64 = 256;
 
 const UPSTREAM: &str = "https://ollama.com";
+
+/// Upstream for the binary constructors. Debug builds honor
+/// `OLLAMUX_UPSTREAM` so integration tests can exercise shutdown with a
+/// local slow server; release builds always use the real endpoint.
+fn default_upstream() -> String {
+    #[cfg(debug_assertions)]
+    {
+        std::env::var("OLLAMUX_UPSTREAM").unwrap_or_else(|_| UPSTREAM.to_string())
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        UPSTREAM.to_string()
+    }
+}
 
 /// Self-identification for every response: lets an agent (or human with
 /// curl) tell ollamux apart from a real Ollama server or a CDN error page.
@@ -73,7 +90,24 @@ fn is_no_auth_path(path: &str) -> bool {
         .any(|p| p.trim_start_matches('/') == path)
 }
 
+/// Paths whose successful responses are expected to carry token counters.
+/// This is deliberately a whitelist: any other proxied path (`/api/show`,
+/// `/api/ps`, `/api/pull`, arbitrary `/api/...`) legitimately returns no
+/// usage, and must not inflate `requests_without_usage`.
+fn expects_usage(path: &str) -> bool {
+    crate::meter::is_token_endpoint(path)
+}
+
 static REQ_ID: AtomicUsize = AtomicUsize::new(1);
+
+/// RAII counter for in-flight `handle` calls.
+struct ActiveGuard<'a>(&'a AtomicUsize);
+
+impl Drop for ActiveGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 pub struct Server {
     pub pool: Arc<Pool>,
@@ -82,6 +116,11 @@ pub struct Server {
     pub usage: Arc<UsageTracker>,
     /// Model/time statistics (/_usage?range=…). On-demand only.
     pub stats: Arc<StatsTracker>,
+    /// Local per-request token/request accounting (/_stats).
+    pub meter: Arc<Meter>,
+    /// Requests currently inside `handle` (used by shutdown to flush only
+    /// after in-flight work has recorded its counters).
+    active: AtomicUsize,
     agent: ureq::Agent,
     /// Base URL of the upstream ("https://ollama.com"); injectable so tests
     /// can run hermetically against a local server.
@@ -89,8 +128,27 @@ pub struct Server {
 }
 
 impl Server {
+    /// Production constructor with in-memory local statistics. The CLI
+    /// wires persistence explicitly through [`Server::with_meter`], so
+    /// embedding this server never writes to a user's state directory.
     pub fn new(pool: Arc<Pool>) -> Server {
-        Self::with_upstream(pool, UPSTREAM)
+        Self::build(pool, &default_upstream(), Arc::new(Meter::in_memory()))
+    }
+
+    /// Constructor with an explicit meter (the CLI resolves --stats-file /
+    /// --no-stats before building the server). The caller owns the
+    /// persistence lifecycle: call [`Meter::spawn_flusher`] and
+    /// [`Meter::flush`] on shutdown (the CLI does both). A Meter should be
+    /// owned by one Server: `build` applies that Server's present-key set.
+    pub fn with_meter(pool: Arc<Pool>, meter: Arc<Meter>) -> Server {
+        Self::build(pool, &default_upstream(), meter)
+    }
+
+    /// Test seam: custom upstream plus an explicit meter (used to exercise
+    /// `--no-stats` and persistence end-to-end).
+    #[doc(hidden)]
+    pub fn with_upstream_and_meter(pool: Arc<Pool>, upstream: &str, meter: Arc<Meter>) -> Server {
+        Self::build(pool, upstream, meter)
     }
 
     /// Spawn the quota-aware background poller (opt-in via --usage-aware):
@@ -117,9 +175,14 @@ impl Server {
     }
 
     /// Test seam: point the proxy at a different (e.g. local) upstream.
-    /// HTTPS-only enforcement follows the scheme of `upstream`.
+    /// HTTPS-only enforcement follows the scheme of `upstream`. Tests get
+    /// an in-memory meter so they never touch the user's stats file.
     #[doc(hidden)]
     pub fn with_upstream(pool: Arc<Pool>, upstream: &str) -> Server {
+        Self::build(pool, upstream, Arc::new(Meter::in_memory()))
+    }
+
+    fn build(pool: Arc<Pool>, upstream: &str, meter: Arc<Meter>) -> Server {
         let slots = pool.total_slots().max(4) as usize;
         let https_only = upstream.starts_with("https://");
         let agent = ureq::AgentBuilder::new()
@@ -137,10 +200,22 @@ impl Server {
             .build();
         let usage = Arc::new(UsageTracker::new(pool.clone(), upstream));
         let stats = Arc::new(StatsTracker::new(pool.clone(), upstream));
+        let present: Vec<(String, String, String)> = (0..pool.len())
+            .map(|i| {
+                (
+                    pool.account_of(i).to_string(),
+                    key_fingerprint(pool.secret_of(i)),
+                    pool.suffix_of(i),
+                )
+            })
+            .collect();
+        meter.set_present(&present);
         Server {
             pool,
             usage,
             stats,
+            meter,
+            active: AtomicUsize::new(0),
             agent,
             upstream: upstream.trim_end_matches('/').to_string(),
         }
@@ -148,6 +223,8 @@ impl Server {
 
     /// Handle a single incoming request: route, proxy, and record usage.
     pub fn handle(&self, req: tiny_http::Request) {
+        self.active.fetch_add(1, Ordering::SeqCst);
+        let _active = ActiveGuard(&self.active);
         let id = REQ_ID.fetch_add(1, Ordering::Relaxed);
         let started = Instant::now();
         let method = req.method().as_str().to_string();
@@ -172,6 +249,12 @@ impl Server {
                 started.elapsed().as_millis(),
             );
         }
+    }
+
+    /// Number of requests currently inside `handle` (shutdown waits for
+    /// this to reach zero before its final stats flush).
+    pub fn active_requests(&self) -> usize {
+        self.active.load(Ordering::SeqCst)
     }
 
     /// Returns (client-visible status, retries used, key suffix if proxied,
@@ -257,6 +340,40 @@ impl Server {
             json_response(req, 200, &body, None);
             return (200, 0, None, None);
         }
+        if path == "_stats" {
+            let range = match query_param(query, "range") {
+                None => StatsRange::H24,
+                Some(raw) => match StatsRange::parse(raw) {
+                    Some(r) => r,
+                    None => {
+                        let body = serde_json::json!({
+                            "error": format!(
+                                "invalid range {raw:?} (want one of 24h, 7d, 30d)"
+                            )
+                        })
+                        .to_string();
+                        json_response(req, 400, &body, None);
+                        return (400, 0, None, None);
+                    }
+                },
+            };
+            let present: Vec<(String, String, String)> = if self.meter.enabled() {
+                (0..self.pool.len())
+                    .map(|i| {
+                        (
+                            self.pool.account_of(i).to_string(),
+                            key_fingerprint(self.pool.secret_of(i)),
+                            self.pool.suffix_of(i),
+                        )
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let body = self.meter.render(range, &present).to_string();
+            json_response(req, 200, &body, None);
+            return (200, 0, None, None);
+        }
         if path == "_health" {
             let body = serde_json::json!({
                 "service": "ollamux",
@@ -278,7 +395,7 @@ impl Server {
         json_response(
             req,
             404,
-            r#"{"error":"ollamux (key-rotating proxy for Ollama Cloud, https://ollama.com) serves only /api/*, /v1/*, /_keys, /_usage, /_health — this is not a local Ollama server and has no local models. If you meant a local Ollama, point your client at port 11434 instead; for Ollama Cloud, use /api/… or /v1/… here (models: GET /api/tags; per-key usage: GET /_usage)."}"#,
+            r#"{"error":"ollamux (key-rotating proxy for Ollama Cloud, https://ollama.com) serves only /api/*, /v1/*, /_keys, /_usage, /_stats, /_health — this is not a local Ollama server and has no local models. If you meant a local Ollama, point your client at port 11434 instead; for Ollama Cloud, use /api/… or /v1/… here (models: GET /api/tags; per-key usage: GET /_usage)."}"#,
             None,
         );
         (404, 0, None, None)
@@ -293,6 +410,7 @@ impl Server {
         query: Option<&str>,
         is_v1: bool,
     ) -> (u16, usize, Option<String>, Option<&'static str>) {
+        let started = Instant::now();
         let no_auth = is_no_auth_path(sub_path);
 
         // 1. Buffer the body (needed for replay across failover attempts).
@@ -315,6 +433,15 @@ impl Server {
                 };
                 let json = error_json(is_v1, &msg, status);
                 json_response(req, status, &json, None);
+                self.record_request(
+                    None,
+                    None,
+                    sub_path,
+                    status,
+                    0,
+                    started,
+                    UsageCounts::default(),
+                );
                 return (status, 0, None, None);
             }
         };
@@ -322,6 +449,13 @@ impl Server {
         // identity read the same tree.
         let parsed: Option<serde_json::Value> = serde_json::from_slice(&body).ok();
         let streaming = wants_stream(parsed.as_ref(), is_v1);
+        // Local accounting label: the model actually requested, before the
+        // 16 MiB body tree is dropped.
+        let model = parsed
+            .as_ref()
+            .and_then(|v| v.get("model"))
+            .and_then(|m| m.as_str())
+            .map(str::to_string);
 
         // 2. Conversation identity for prompt-cache affinity. `None` =
         // no affinity (non-affine path, unparseable body, missing
@@ -353,12 +487,24 @@ impl Server {
                 key: None,
                 no_auth: true,
                 streaming,
+                capture_usage: self.meter.enabled() && expects_usage(sub_path),
                 retries: 0,
                 identity: None,
                 pinned_before: false,
             };
             return match self.attempt(&cx, &mut req) {
-                Attempt::Sent(status) => (status, 0, None, None),
+                Attempt::Sent { status, usage } => {
+                    self.record_request(
+                        None,
+                        model.as_deref(),
+                        sub_path,
+                        status,
+                        0,
+                        started,
+                        usage,
+                    );
+                    (status, 0, None, None)
+                }
                 Attempt::Retryable(reason) => {
                     let json = error_json(
                         is_v1,
@@ -369,6 +515,15 @@ impl Server {
                         502,
                     );
                     json_response(req, 502, &json, None);
+                    self.record_request(
+                        None,
+                        model.as_deref(),
+                        sub_path,
+                        502,
+                        0,
+                        started,
+                        UsageCounts::default(),
+                    );
                     (502, 0, None, None)
                 }
             };
@@ -377,8 +532,18 @@ impl Server {
         let (mut permit, mut key) = match self.pool.admit_affine(WAIT_TIMEOUT, identity) {
             Ok(a) => a,
             Err(rej) => {
+                let status = rej.status;
                 send_reject(req, &rej, is_v1);
-                return (rej.status, 0, None, None);
+                self.record_request(
+                    None,
+                    model.as_deref(),
+                    sub_path,
+                    status,
+                    0,
+                    started,
+                    UsageCounts::default(),
+                );
+                return (status, 0, None, None);
             }
         };
 
@@ -389,13 +554,14 @@ impl Server {
             key: Some(key),
             no_auth,
             streaming,
+            capture_usage: self.meter.enabled() && expects_usage(sub_path),
             retries,
             identity,
             pinned_before,
         };
         loop {
             match self.attempt(&cx, &mut req) {
-                Attempt::Sent(status) => {
+                Attempt::Sent { status, usage } => {
                     if let Some(k) = cx.key {
                         self.pool.settle(k, status < 400);
                         // Pin on confirmed success only. Unlike settle's
@@ -419,6 +585,16 @@ impl Server {
                     } else {
                         None
                     };
+                    drop(permit);
+                    self.record_request(
+                        cx.key,
+                        model.as_deref(),
+                        sub_path,
+                        status,
+                        retries,
+                        started,
+                        usage,
+                    );
                     return (status, retries, sfx, aff_s);
                 }
                 Attempt::Retryable(reason) => {
@@ -436,6 +612,16 @@ impl Server {
                         );
                         let json = error_json(is_v1, &msg, 502);
                         json_response(req, 502, &json, None);
+                        drop(permit);
+                        self.record_request(
+                            cx.key,
+                            model.as_deref(),
+                            sub_path,
+                            502,
+                            retries,
+                            started,
+                            UsageCounts::default(),
+                        );
                         return (502, retries, Some(self.pool.suffix_of(key)), None);
                     }
                     retries += 1;
@@ -457,13 +643,63 @@ impl Server {
                             }
                         }
                         Err(rej) => {
+                            let status = rej.status;
                             send_reject(req, &rej, is_v1);
-                            return (rej.status, retries, None, None);
+                            self.record_request(
+                                None,
+                                model.as_deref(),
+                                sub_path,
+                                status,
+                                retries,
+                                started,
+                                UsageCounts::default(),
+                            );
+                            return (status, retries, None, None);
                         }
                     }
                 }
             }
         }
+    }
+
+    /// Record one client-visible outcome in the local meter. Key identity
+    /// is the account label + stable fingerprint (indices shift when the
+    /// keys file changes), and token counts are whatever the upstream
+    /// reported.
+    #[allow(clippy::too_many_arguments)]
+    fn record_request(
+        &self,
+        key: Option<usize>,
+        model: Option<&str>,
+        endpoint: &str,
+        status: u16,
+        retries: usize,
+        started: Instant,
+        usage: UsageCounts,
+    ) {
+        if !self.meter.enabled() {
+            return;
+        }
+        let key = key.map(|k| {
+            (
+                self.pool.account_of(k),
+                self.pool.suffix_of(k),
+                key_fingerprint(self.pool.secret_of(k)),
+            )
+        });
+        let key = key
+            .as_ref()
+            .map(|(account, suffix, id)| (&account[..], &suffix[..], &id[..]));
+        self.meter.record(Sample {
+            key,
+            model,
+            endpoint,
+            status,
+            retries,
+            duration: started.elapsed(),
+            usage,
+            usage_expected: expects_usage(endpoint),
+        });
     }
 
     /// One upstream attempt. `req` is left intact on `Retryable` (so the
@@ -477,6 +713,7 @@ impl Server {
             key,
             no_auth,
             streaming,
+            capture_usage,
             retries,
             identity,
             pinned_before,
@@ -520,6 +757,7 @@ impl Server {
                 reader: Box::new(reader),
                 key: *key,
                 retries: *retries,
+                capture_usage: *capture_usage,
                 affinity,
                 pool: &self.pool,
             })
@@ -531,6 +769,7 @@ impl Server {
                 reader: Box::new(reader),
                 key: *key,
                 retries: *retries,
+                capture_usage: *capture_usage,
                 affinity,
                 pool: &self.pool,
             })
@@ -667,7 +906,10 @@ impl Server {
         resp = resp.with_header(hv("X-Ollamux-Retries", &retries.to_string()));
         resp = resp.with_header(identity_header());
         let _ = req.respond(resp);
-        Attempt::Sent(if read_err { 502 } else { status })
+        Attempt::Sent {
+            status: if read_err { 502 } else { status },
+            usage: UsageCounts::default(),
+        }
     }
 
     /// Non-streaming success relay via tiny_http: it sets framing
@@ -685,11 +927,27 @@ impl Server {
         }
         hs.push(hv("X-Ollamux-Retries", &cx.retries.to_string()));
         hs.push(identity_header());
+        // Tee token-bearing bodies into a bounded tail so counters can be
+        // read without changing a byte the client receives. Metadata
+        // responses bypass the copy entirely.
+        let (reader, captured): (Box<dyn std::io::Read>, _) = if cx.capture_usage {
+            let (tee, cap) = TeeReader::new(cx.reader);
+            (Box::new(tee), Some(cap))
+        } else {
+            (cx.reader, None)
+        };
         let resp =
-            tiny_http::Response::new(tiny_http::StatusCode(cx.status), hs, cx.reader, None, None);
-        match cx.req.respond(resp) {
-            Ok(()) => Attempt::Sent(cx.status),
-            Err(_) => Attempt::Sent(502),
+            tiny_http::Response::new(tiny_http::StatusCode(cx.status), hs, reader, None, None);
+        let status = match cx.req.respond(resp) {
+            Ok(()) => cx.status,
+            Err(_) => 502,
+        };
+        Attempt::Sent {
+            status,
+            usage: captured
+                .as_ref()
+                .map(|c| captured_usage(c))
+                .unwrap_or_default(),
         }
     }
 
@@ -727,14 +985,25 @@ impl Server {
             head.push_str("Transfer-Encoding: chunked\r\n\r\n");
         }
         if w.write_all(head.as_bytes()).is_err() || w.flush().is_err() {
-            return Attempt::Sent(500);
+            return Attempt::Sent {
+                status: 500,
+                usage: UsageCounts::default(),
+            };
         }
         let mut reader = cx.reader.take(CHUNK as u64 * 1_000_000);
         let mut buf = vec![0u8; CHUNK];
+        let mut sniffer = if cx.capture_usage {
+            Some(UsageSniffer::new())
+        } else {
+            None
+        };
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
+                    if let Some(sniffer) = sniffer.as_mut() {
+                        sniffer.feed(&buf[..n]);
+                    }
                     let ok = if http10 {
                         w.write_all(&buf[..n]).is_ok() && w.flush().is_ok()
                     } else {
@@ -744,8 +1013,19 @@ impl Server {
                             && w.flush().is_ok()
                     };
                     if !ok {
-                        // Client disconnected mid-stream.
-                        return Attempt::Sent(200);
+                        // Client disconnected mid-stream. Headers already
+                        // went out, so record the conventional aborted code
+                        // rather than a successful 200.
+                        if let Some(sniffer) = sniffer.as_mut() {
+                            sniffer.finish();
+                        }
+                        return Attempt::Sent {
+                            status: 499,
+                            usage: sniffer
+                                .as_ref()
+                                .map(UsageSniffer::usage)
+                                .unwrap_or_default(),
+                        };
                     }
                 }
                 Err(e) => {
@@ -759,7 +1039,16 @@ impl Server {
                     if cx.pool.verbose() {
                         eprintln!("ollamux: upstream died mid-stream: {e}");
                     }
-                    return Attempt::Sent(502);
+                    if let Some(sniffer) = sniffer.as_mut() {
+                        sniffer.finish();
+                    }
+                    return Attempt::Sent {
+                        status: 502,
+                        usage: sniffer
+                            .as_ref()
+                            .map(UsageSniffer::usage)
+                            .unwrap_or_default(),
+                    };
                 }
             }
         }
@@ -767,7 +1056,16 @@ impl Server {
             let _ = w.write_all(b"0\r\n\r\n");
             let _ = w.flush();
         }
-        Attempt::Sent(status)
+        if let Some(sniffer) = sniffer.as_mut() {
+            sniffer.finish();
+        }
+        Attempt::Sent {
+            status,
+            usage: sniffer
+                .as_ref()
+                .map(UsageSniffer::usage)
+                .unwrap_or_default(),
+        }
     }
 }
 
@@ -781,6 +1079,8 @@ struct AttemptCx<'a> {
     key: Option<usize>,
     no_auth: bool,
     streaming: bool,
+    /// Only token-bearing endpoints get body sniffing/tailing.
+    capture_usage: bool,
     retries: usize,
     identity: Option<u64>,
     /// Whether a usable pin existed before admission (header "hit"/"miss").
@@ -810,6 +1110,7 @@ struct AffOut<'a> {
     reader: Box<dyn std::io::Read>,
     key: Option<usize>,
     retries: usize,
+    capture_usage: bool,
     affinity: &'a str,
     /// Pool back-reference for suffix rendering (the relays are free
     /// functions on the impl but must not take `&self` — see arg count).
@@ -819,7 +1120,9 @@ struct AffOut<'a> {
 /// One upstream attempt's outcome.
 enum Attempt {
     /// The Request was consumed and something was sent (any status).
-    Sent(u16),
+    /// `usage` is whatever token counters the relay observed (default when
+    /// no response body carried any).
+    Sent { status: u16, usage: UsageCounts },
     /// Nothing sent to the client; `req` is still usable; try the next key.
     Retryable(String),
 }

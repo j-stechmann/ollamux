@@ -100,6 +100,7 @@ startup. Use one key per account for a strict plan cap.
 | `/v1/*`        | Proxied (OpenAI-compatible surface) with rotation|
 | `/_keys`       | Per-key health JSON (suffixes/account labels only, no secrets) |
 | `/_usage`      | Per-account + per-key balance JSON and pool aggregate; add `?range=24h\|7d\|30d` for per-account model/time statistics (`group_by=model` optional; `?refresh=1` forces a refresh, at most one fetch attempt per 5 s) |
+| `/_stats`      | Local per-request counters (requests, upstream-reported tokens, duration, retries) by key/account/model/endpoint and UTC hour/day bucket; `?range=24h\|7d\|30d` (default `24h`) |
 | `/_health`     | `{"ok":…, "keys":…, "total_slots":…}`            |
 
 Everything else answers `404` with a hint — this is **not** a local Ollama
@@ -108,8 +109,8 @@ model list, not local models.
 
 The full API surface is described in [`openapi.yaml`](openapi.yaml)
 (OpenAPI 3.0): the proxied Ollama/OpenAI paths, the `/_keys`, `/_usage`,
-`/_health` introspection endpoints, and ollamux's response headers and
-error envelope.
+`/_stats`, `/_health` introspection endpoints, and ollamux's response
+headers and error envelope.
 
 ## Usage introspection
 
@@ -271,6 +272,105 @@ Things to know:
   normal key rotation and reflect whichever key served them — use
   `/_usage` for the pooled, per-account picture.
 
+## Local token statistics
+
+Add `?range=24h`, `?range=7d` or `?range=30d` to `GET /_stats` (default
+`24h`) for counters measured from the traffic that actually passed
+through ollamux. Unlike `/_usage` (which mirrors account-scoped numbers
+from ollama.com), this is per **key**, per **account**, per **model**, per
+**endpoint**, and in UTC hour/day buckets. `24h` renders 25 hourly
+buckets (the current partial hour plus 24 previous); `7d`/`30d` render
+daily buckets.
+
+Token counts come from the upstream response body —
+`prompt_eval_count`/`eval_count`/`prompt_eval_cached_count` on Ollama's
+native API, `usage.prompt_tokens`/`completion_tokens` (plus
+`prompt_tokens_details.cached_tokens`) on Chat Completions, and
+`usage.input_tokens`/`output_tokens` (plus
+`input_tokens_details.cached_tokens`, including the
+`response.completed` SSE event) on the Responses API. No token counts
+are synthesized: a successful (2xx) request to a token-bearing endpoint
+(`/api/chat`, `/api/generate`, `/api/embed`, the OpenAI-compatible
+chat/completion/embedding/Responses paths) whose response carried no
+counters — for example `/v1/*` streaming without a usage chunk —
+increments `requests_without_usage` and contributes 0 tokens. (When
+`total_tokens` accompanies exactly one explicit side, the other side is
+derived; a total-only object is treated as missing.)
+Metadata/management paths (`/api/tags`, `/api/show`, `/api/ps`,
+`/api/embeddings`, …) and 3xx responses are never counted as "missing
+usage". Streaming responses are sniffed line by line as they pass
+through (bounded per-chunk work; no whole-body buffering), so latency is
+affected only by that bounded scanning.
+
+`range` scopes **only** the bucket series and `window_totals`;
+`totals` and every dimension row are lifetime (`totals_scope`).
+
+```json
+{"source":"local","enabled":true,"version":2,"since":1756620000,
+ "since_iso":"2025-08-31T06:00:00Z","started_at":1756620000,"uptime_s":3600,
+ "saved_at":1756623600,"pending_flush":false,
+ "persistence":"file","persistence_note":null,"last_flush_error":null,
+ "range":"24h","granularity":"hour","totals_scope":"lifetime",
+ "window":{"from":"2026-10-08T23:00:00Z","until":"2026-10-09T00:00:00Z"},
+ "window_totals":{"requests":1,"input_tokens":2400,"output_tokens":300},
+ "totals":{"requests":42,"ok":40,"errors":2,"requests_without_usage":3,
+           "input_tokens":120000,"cached_input_tokens":0,"output_tokens":15000,
+           "duration_ms":98765,"retries":1,"total_tokens":135000,"avg_ms":2351.5},
+ "keys":[{"account":"alice","id":"3f2c9a0b1d4e5f6789abcdef01234567","suffix":"1234",
+          "present":true,"requests":42,"input_tokens":120000,
+          "output_tokens":15000}],
+ "accounts":[{"account":"alice","requests":42}],
+ "models":[{"model":"gpt-oss:120b","requests":42}],
+ "endpoints":[{"endpoint":"api/chat","requests":42}],
+ "by_status":{"200":40,"429":2},
+ "buckets":[{"from":"2026-10-08T23:00:00Z","until":"2026-10-09T00:00:00Z",
+             "partial":false,"requests":1,"input_tokens":2400}]}
+```
+
+Things to know:
+
+- `present` distinguishes currently configured keys from historical rows
+  kept after a keys-file change. Configured keys with no traffic yet
+  appear with zero counters.
+- The breakdown is **per key**: identity is a stable non-secret
+  fingerprint (`id`) of the full key, so two keys under one `@account`
+  are separable here even if their four-character display suffixes
+  collide, which the upstream statistics endpoint cannot do.
+- Counters are **persisted** by default at
+  `$OLLAMUX_STATS_FILE`, else `$XDG_STATE_HOME/ollamux/stats.json`, else
+  `~/.local/state/ollamux/stats.json` (a HOME-less environment falls back
+  to `./ollamux-stats.json`). `--stats-file PATH` overrides the location;
+  `--no-stats` (or `OLLAMUX_NO_STATS=1`) genuinely disables counting and
+  persistence — `/_stats` reports `"enabled":false` with empty rows — and
+  an explicit `--stats-file`/`--no-stats` wins over the environment
+  variable. The file is written atomically every 5 s and after the
+  shutdown drain; requests still in flight when the 5 s drain deadline
+  expires are force-closed and their counters cannot be recorded. A
+  corrupt, foreign, non-regular, newer-versioned or larger-than-16-MiB
+  file (including a symlink) is left untouched (`persistence` reports
+  `"blocked"`), so a mistyped `--stats-file` cannot silently destroy
+  another file. A file is
+  adopted only when it carries the `ollamux-stats` marker and the current
+  schema version. Only recognized native/Chat/Responses usage shapes are
+  read; valid JSON in an unknown wrapper is not scanned (avoiding false
+  positives). Write failures are logged, surfaced as `last_flush_error`, and
+  reported as `persistence:"error"` until a successful flush.
+- Retention is fixed: 25 hourly and 31 daily buckets, pruned on load and
+  on each recorded request, plus at most 512 historical key rows, 256
+  accounts, 256 models and 128 endpoints (overflow folds into `<other>`).
+  Currently configured keys are always retained even if they exceed the
+  historical-key budget. Client-chosen paths cannot grow memory or the
+  file without bound. There is no per-request log and no prompt/completion
+  content.
+- A second instance that tries to use the same stats file runs with
+  `persistence:"blocked"` (advisory lock on unix; last-writer-wins without
+  a lock elsewhere). Each flush also re-checks the target's marker/version
+  and uses a unique temp file; cooperating instances are protected by the
+  lock and the marker/version is rechecked before each rename.
+- Local counters are additive to the upstream reporting above: they
+  answer "which key and model served what, when", while `/_usage` answers
+  "what does ollama.com think this account has consumed".
+
 ## Quota-aware key selection
 
 ```sh
@@ -348,8 +448,10 @@ a mysterious upstream one — see `/_keys` for per-key state.
   (which key served it), `X-Ollamux-Retries` and `X-Ollamux-Affinity`
   (prompt-cache affinity: `hit`/`miss`/`off`; present only when a key
   served the request).
-- `SIGINT` (ctrl-c) drains in-flight requests for up to 5 s, then exits;
-  press again to force-quit.
+- `SIGINT` (ctrl-c) and `SIGTERM` (systemd/Docker stop) drain for up to
+  5 s, then exit; signal again to force-quit. During the drain workers
+  continue serving queued/in-flight (and newly arriving) requests until
+  the deadline; anything still running then is force-closed.
 - Request bodies are buffered up to 16 MiB (needed for replay across
   failover); larger bodies get `413`.
 - Binds `127.0.0.1:11435` by default (`--addr` to change). The default port
@@ -357,13 +459,17 @@ a mysterious upstream one — see `/_keys` for per-key state.
 
 ## Limitations (on purpose)
 
-- Usage introspection is read-only reporting; there is no token accounting
-  or historical dashboard — `/_usage` mirrors what ollama.com exposes per
-  account (the only derived figure is the capacity-weighted pool
-  `aggregate`, which ollama.com itself does not publish).
+- Usage introspection against ollama.com is read-only reporting; there is
+  no historical dashboard upstream — `/_usage` mirrors what ollama.com
+  exposes per account (the only derived figure is the capacity-weighted
+  pool `aggregate`, which ollama.com itself does not publish). Locally
+  observed counters (requests, upstream-reported tokens, duration) live
+  at `/_stats`; they are aggregated by key/account/model/endpoint and
+  hour/day, with no per-request log or prompt content.
 - No request rewriting: models must exist on ollama.com.
 - A dead key stays dead until restart (`/_keys` shows why). Restarting is
-  cheap: it's stateless.
+  cheap: routing state is in-memory (only the local `/_stats` counters are
+  persisted).
 - Localhost trust model: anything that can reach the port can use your
   quota. Don't expose it beyond loopback.
 
@@ -403,5 +509,5 @@ cargo fmt --check
 - Upstream redirects are not followed (the proxy classifies or relays
   them verbatim); query strings are forwarded to upstream untouched.
 - Relayed upstream error bodies are byte-exact (no truncation).
-- SIGINT shutdown is signal-mask based: the first ctrl-c starts the
-  drain, the second force-quits (exit code 130).
+- SIGINT/SIGTERM shutdown is signal-mask based: the first signal starts
+  the drain, the second force-quits (exit code 130).

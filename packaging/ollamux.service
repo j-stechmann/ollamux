@@ -23,6 +23,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 ExecStart=/usr/bin/ollamux --addr 127.0.0.1:11435 --keys ${CREDENTIALS_DIRECTORY}/ollamux-keys $OLLAMUX_OPTS
+Environment=OLLAMUX_STATS_FILE=/var/lib/ollamux/stats.json
 EnvironmentFile=-/etc/default/ollamux
 LoadCredential=ollamux-keys:/etc/ollamux/keys
 
@@ -34,6 +35,9 @@ CapabilityBoundingSet=
 AmbientCapabilities=
 PrivateTmp=yes
 PrivateDevices=yes
+# Writable state for local /_stats counters; survives restarts and is
+# owned by the DynamicUser.
+StateDirectory=ollamux
 ProtectSystem=strict
 ProtectHome=yes
 ProtectKernelTunables=yes
@@ -55,9 +59,10 @@ SystemCallErrorNumber=EPERM
 SystemCallArchitectures=native
 UMask=0077
 
-# Statelessness: ollamux keeps all key state in memory and is designed to
-# be restarted freely; disk access is not needed (credentials arrive by
-# fd), so the whole filesystem tree is invisible via ProtectSystem=strict.
+# Routing state is in memory and the service can be restarted freely;
+# /var/lib/ollamux holds only the local /_stats counters (StateDirectory,
+# written every 5 s and after the shutdown drain). Credentials arrive by
+# fd, so the rest of the filesystem stays invisible via ProtectSystem=strict.
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=15s

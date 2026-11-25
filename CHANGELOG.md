@@ -5,6 +5,79 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Local per-request statistics at `GET /_stats?range=24h|7d|30d`: request
+  counts, upstream-reported input/cached/output tokens, duration, retries
+  and status, aggregated per key (account + fingerprint), account, model,
+  endpoint, status and UTC hour/day bucket. Unlike `/_usage`, the numbers
+  are measured from traffic through ollamux (so they are key-scoped, not
+  just account-scoped) and per-model attribution uses the model in the
+  request body.
+- Token counts come from the upstream response body (`prompt_eval_count`/
+  `eval_count`/`prompt_eval_cached_count`; OpenAI-compatible `usage.*`,
+  including Chat Completions, embeddings and Responses
+  `input_tokens`/`output_tokens` plus cached details). Streaming NDJSON/SSE
+  is sniffed incrementally without delaying forwarding (SSE
+  `response.completed` usage is included). Token-bearing responses with no
+  counters are recorded as `requests_without_usage`; no input/output split
+  is synthesized.
+- Counters persist by default at `$OLLAMUX_STATS_FILE`, else
+  `$XDG_STATE_HOME/ollamux/stats.json`, else
+  `~/.local/state/ollamux/stats.json` (HOME-less: `./ollamux-stats.json`),
+  written atomically every 5 s and after the shutdown drain (requests
+  still in flight when the drain deadline expires are force-closed and
+  cannot be recorded). `--stats-file PATH` overrides the location; `--no-stats`
+  / `OLLAMUX_NO_STATS=1` genuinely disables counting and persistence
+  (`/_stats` reports `enabled:false` and no rows). Foreign/corrupt/
+  newer-versioned files are preserved (see below).
+- Retention is bounded: 25 hourly and 31 daily buckets, no per-request log
+  and no prompt/completion content. At most 512 historical key rows, 256
+  accounts, 256 models and 128 endpoints are retained (overflow folds into
+  `<other>`); stats files larger than 16 MiB are left untouched with
+  persistence blocked. Key rows survive keys-file changes and are marked
+  `present: false` when no longer configured.
+- Cardinality is bounded for the client-controlled dimensions too: models
+  (256) and endpoints (128) fold overflow into `<other>`, including when
+  loading an older file.
+- A stats file is adopted only when it carries the
+  `"ollamux-stats"` marker and the current schema version. Foreign,
+  corrupt, oversized, non-regular or newer-versioned files are left
+  untouched and persistence is disabled (`persistence: "blocked"`), so a
+  mistyped `--stats-file` (including a keys/config file) cannot silently
+  destroy another file. Flushes re-check the marker/version immediately before
+  writing, and an advisory unix lock gives a second instance `blocked`
+  rather than stale last-writer-wins.
+- Per-key identity uses a stable non-secret fingerprint of the full key in
+  addition to the four-character display suffix, so keys with colliding
+  suffixes under one account no longer merge. Unattributed traffic
+  (no-auth, admission rejects, body-read errors) has an explicit
+  `(unattributed)` key/account row so per-key sums reconcile with totals.
+- `range` scopes only the bucket series and new `window_totals`; `totals`
+  and dimension rows are lifetime (`totals_scope: "lifetime"`).
+- Endpoint/model cardinality caps evict the least-recently-seen unpinned
+  row into `<other>` instead of first-come lockout; token-bearing endpoints
+  are pinned, and current keys are prioritised when the key history is
+  capped.
+- SIGINT **and SIGTERM** now share the graceful drain/final flush, so
+  systemd/Docker stop persists completed requests. The shipped systemd
+  unit uses `StateDirectory=ollamux` + `/var/lib/ollamux/stats.json` and
+  the container image defaults to a writable `/var/lib/ollamux` volume.
+- Persistence write failures are logged when the error message changes and
+  exposed as `last_flush_error` in `/_stats`, rather than being silently
+  discarded. Flushes use a unique temp file per process/attempt so
+  concurrent instances cannot tear each other's writes.
+- `requests_without_usage` is now limited to successful (2xx) requests to
+  token-bearing endpoints (`api/chat`, `api/generate`, `api/embed`, the
+  OpenAI-compatible generation/embedding/Responses paths);
+  `/api/show`, `/api/ps`, `/api/embeddings` and other management
+  endpoints no longer inflate it.
+- Explicit `--stats-file` / `--no-stats` flags take precedence over
+  `OLLAMUX_NO_STATS`. `Server::new` remains side-effect-free (in-memory
+  statistics); the CLI opts into persistence via `Server::with_meter`.
+
 ## [0.9.0] - 2026-11-24
 
 ### Changed
