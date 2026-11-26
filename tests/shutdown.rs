@@ -1,9 +1,71 @@
 //! Shutdown-signal integration: SIGTERM must drain and persist stats.
 
 #[cfg(unix)]
+fn spawn_ollamux(
+    bin: &str,
+    stats: &std::path::Path,
+    extra_env: &[(&str, String)],
+) -> (std::process::Child, String) {
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    // A probe port can be taken by another process between `drop(probe)`
+    // and the child's bind. Retry on a fresh port rather than failing the
+    // test on that unrelated race.
+    let mut last = String::from("no attempt");
+    for _ in 0..10 {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+
+        let mut cmd = Command::new(bin);
+        cmd.env_remove("OLLAMUX_NO_STATS")
+            .env_remove("OLLAMUX_STATS_FILE")
+            .env("OLLAMUX_KEYS", "abc:1@alice")
+            .args([
+                "--addr",
+                &addr.to_string(),
+                "--stats-file",
+                stats.to_str().unwrap(),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        for (name, value) in extra_env {
+            cmd.env(name, value);
+        }
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(e) => {
+                last = format!("spawn failed: {e}");
+                continue;
+            }
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if ureq::get(&format!("http://{addr}/_health")).call().is_ok() {
+                return (child, addr.to_string());
+            }
+            if let Ok(Some(status)) = child.try_wait() {
+                last = format!("child exited early: {status:?}");
+                break;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                last = "startup timed out".to_string();
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+    panic!("ollamux did not start after retries: {last}");
+}
+
+#[cfg(unix)]
 #[test]
 fn sigterm_flushes_stats_before_exit() {
-    use std::process::{Command, Stdio};
+    use std::process::Command;
     use std::time::{Duration, Instant};
 
     let bin = env!("CARGO_BIN_EXE_ollamux");
@@ -18,37 +80,7 @@ fn sigterm_flushes_stats_before_exit() {
     std::fs::create_dir_all(&dir).unwrap();
     let stats = dir.join("stats.json");
 
-    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = probe.local_addr().unwrap();
-    drop(probe);
-
-    let mut child = Command::new(bin)
-        .env_remove("OLLAMUX_NO_STATS")
-        .env_remove("OLLAMUX_STATS_FILE")
-        .env("OLLAMUX_KEYS", "abc:1@alice")
-        .args([
-            "--addr",
-            &addr.to_string(),
-            "--stats-file",
-            stats.to_str().unwrap(),
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn ollamux");
-
-    // Wait for the listener.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        if ureq::get(&format!("http://{addr}/_health")).call().is_ok() {
-            break;
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            panic!("ollamux did not start");
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
+    let mut child = spawn_ollamux(bin, &stats, &[]).0;
 
     let status = Command::new("kill")
         .arg("-TERM")
@@ -75,11 +107,11 @@ fn sigterm_flushes_stats_before_exit() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-#[cfg(all(unix, debug_assertions))]
+#[cfg(all(unix, any(debug_assertions, feature = "test-upstream")))]
 #[test]
 fn sigterm_waits_for_an_inflight_request() {
     use std::io::{Read, Write};
-    use std::process::{Command, Stdio};
+    use std::process::Command;
     use std::time::{Duration, Instant};
 
     // Slow local upstream: notifies when the request is in flight, then
@@ -113,37 +145,11 @@ fn sigterm_waits_for_an_inflight_request() {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let stats = dir.join("stats.json");
-    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = probe.local_addr().unwrap();
-    drop(probe);
-
-    let mut child = Command::new(bin)
-        .env_remove("OLLAMUX_NO_STATS")
-        .env_remove("OLLAMUX_STATS_FILE")
-        .env("OLLAMUX_KEYS", "abc:1@alice")
-        .env("OLLAMUX_UPSTREAM", format!("http://{upstream_addr}"))
-        .args([
-            "--addr",
-            &addr.to_string(),
-            "--stats-file",
-            stats.to_str().unwrap(),
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn ollamux");
-
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        if ureq::get(&format!("http://{addr}/_health")).call().is_ok() {
-            break;
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            panic!("ollamux did not start");
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
+    let (mut child, addr) = spawn_ollamux(
+        bin,
+        &stats,
+        &[("OLLAMUX_UPSTREAM", format!("http://{upstream_addr}"))],
+    );
 
     let client = std::thread::spawn(move || {
         ureq::post(&format!("http://{addr}/api/chat"))

@@ -108,6 +108,11 @@ pub struct Metrics {
     pub ok: u64,
     #[serde(default)]
     pub errors: u64,
+    /// Requests the client aborted after the response had started (status
+    /// 499). Tracked separately from `errors`: the upstream key served the
+    /// request, so an abort is neither a success nor a server-side failure.
+    #[serde(default)]
+    pub client_aborts: u64,
     /// Successful requests whose response carried no token counts.
     #[serde(default)]
     pub requests_without_usage: u64,
@@ -129,7 +134,9 @@ pub struct Metrics {
 impl Metrics {
     fn apply(&mut self, s: &Sample<'_>) {
         self.requests = self.requests.saturating_add(1);
-        if s.status < 400 {
+        if s.status == 499 {
+            self.client_aborts = self.client_aborts.saturating_add(1);
+        } else if s.status < 400 {
             self.ok = self.ok.saturating_add(1);
         } else {
             self.errors = self.errors.saturating_add(1);
@@ -151,6 +158,7 @@ impl Metrics {
         self.requests = self.requests.saturating_add(other.requests);
         self.ok = self.ok.saturating_add(other.ok);
         self.errors = self.errors.saturating_add(other.errors);
+        self.client_aborts = self.client_aborts.saturating_add(other.client_aborts);
         self.requests_without_usage = self
             .requests_without_usage
             .saturating_add(other.requests_without_usage);
@@ -406,6 +414,12 @@ pub struct Meter {
     /// Last write failure, cleared by a successful flush. Surfaced in
     /// `/_stats` so a broken path is not silently ignored forever.
     last_flush_error: Mutex<Option<String>>,
+    /// Metadata of the file this process last wrote. When the target still
+    /// matches it, the pre-rename marker/version re-read is skipped: the
+    /// file can only be the one we just wrote. Any change (including a
+    /// non-cooperating writer) invalidates the stamp and restores the full
+    /// check.
+    last_written: Mutex<Option<TargetStamp>>,
     /// Advisory cross-process owner lock (unix), held while persistence is
     /// active. Cleared when persistence becomes blocked.
     #[cfg(unix)]
@@ -631,6 +645,7 @@ impl Meter {
             blocked: AtomicBool::new(false),
             persistence_note: Mutex::new(None),
             last_flush_error: Mutex::new(None),
+            last_written: Mutex::new(None),
             #[cfg(unix)]
             lock_file: Mutex::new(None),
             started: Instant::now(),
@@ -941,8 +956,14 @@ impl Meter {
                 return Err(err);
             }
         };
-        match write_atomic(path, &bytes) {
-            Ok(WriteOutcome::Written) => {
+        // The last file we wrote is expected to still be at the target.
+        // `write_atomic` re-stats immediately before the rename: a match
+        // skips the full marker/version parse, anything else takes the full
+        // check.
+        let expected = lock(&self.last_written).clone();
+        match write_atomic(path, &bytes, expected.as_ref()) {
+            Ok(WriteOutcome::Written(stamp)) => {
+                *lock(&self.last_written) = stamp;
                 self.saved_at.store(now, Ordering::Relaxed);
                 *lock(&self.last_flush_error) = None;
                 *lock(&self.persistence_note) = None;
@@ -1459,6 +1480,27 @@ fn acquire_owner_lock(_path: &Path) -> io::Result<OwnerLock> {
     Ok(OwnerLock::Acquired(None))
 }
 
+/// Lightweight identity of the target file, used to skip the full
+/// marker/version re-read when the file is still the one this process
+/// wrote. `modified` is `Option` so a platform without mtime support
+/// simply never produces a trusted stamp.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TargetStamp {
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+fn target_stamp(path: &Path) -> Option<TargetStamp> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if !meta.file_type().is_file() {
+        return None;
+    }
+    Some(TargetStamp {
+        len: meta.len(),
+        modified: meta.modified().ok(),
+    })
+}
+
 /// True when the target is absent or is a valid current stats file. A
 /// foreign/corrupt/newer/oversized/non-regular file must never be
 /// overwritten.
@@ -1481,11 +1523,24 @@ fn target_is_ours(path: &Path) -> io::Result<bool> {
 static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 enum WriteOutcome {
-    Written,
+    /// The rename succeeded; the stamp describes the bytes just written
+    /// (taken from the temp file before the rename, so it is never the
+    /// metadata of an unrelated file that appeared at the target).
+    Written(Option<TargetStamp>),
     TargetChanged,
 }
 
-fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<WriteOutcome> {
+/// `expected` is the stamp of the file this process last wrote (if any).
+/// Immediately before the rename, the target is re-statted: a match means
+/// it is still that validated file, so the expensive full marker/version
+/// re-read can be skipped. Anything else (including no prior write, a
+/// deleted/replaced file, or mismatched metadata) takes the full check, so
+/// the protection does not weaken for a changed or foreign target.
+fn write_atomic(
+    path: &Path,
+    bytes: &[u8],
+    expected: Option<&TargetStamp>,
+) -> io::Result<WriteOutcome> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)?;
@@ -1500,18 +1555,31 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<WriteOutcome> {
     drop(f);
     // Check as late as possible, immediately before the rename. The owner
     // lock protects cooperating instances; this narrows the window for a
-    // non-cooperating writer after the temp file was written.
-    match target_is_ours(path) {
-        Ok(true) => {}
-        Ok(false) => {
-            let _ = std::fs::remove_file(&tmp);
-            return Ok(WriteOutcome::TargetChanged);
-        }
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(e);
+    // non-cooperating writer after the temp file was written. A matching
+    // stamp means this exact file was already validated as ours.
+    let current = target_stamp(path);
+    let unchanged = match (expected, current.as_ref()) {
+        (Some(known), Some(now)) => known == now,
+        _ => false,
+    };
+    if !unchanged {
+        match target_is_ours(path) {
+            Ok(true) => {}
+            Ok(false) => {
+                let _ = std::fs::remove_file(&tmp);
+                return Ok(WriteOutcome::TargetChanged);
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e);
+            }
         }
     }
+    // Capture the identity of the bytes we are about to publish from the
+    // temp file, before it is renamed: the target then has the same inode
+    // and metadata, and the stamp can never describe an unrelated file that
+    // raced into the target after the rename.
+    let written = target_stamp(&tmp);
     if let Err(e) = std::fs::rename(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
@@ -1521,7 +1589,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<WriteOutcome> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         let _ = std::fs::File::open(parent).and_then(|d| d.sync_all());
     }
-    Ok(WriteOutcome::Written)
+    Ok(WriteOutcome::Written(written))
 }
 
 /// Create a unique sibling temp file. The name includes the PID and a
@@ -2097,6 +2165,21 @@ mod tests {
     }
 
     #[test]
+    fn client_aborts_are_counted_separately_from_errors() {
+        let m = Meter::in_memory();
+        let mut s = sample(None, UsageCounts::default());
+        s.status = 499;
+        m.record_at(s, now());
+        let v = m.render_at(Range::H24, &[], now());
+        assert_eq!(v["totals"]["requests"], 1);
+        assert_eq!(v["totals"]["ok"], 0);
+        assert_eq!(v["totals"]["errors"], 0);
+        assert_eq!(v["totals"]["client_aborts"], 1);
+        assert_eq!(v["totals"]["requests_without_usage"], 0);
+        assert_eq!(v["by_status"]["499"], 1);
+    }
+
+    #[test]
     fn model_cardinality_is_capped() {
         let m = Meter::in_memory();
         for i in 0..(MODEL_CAP + 20) {
@@ -2373,6 +2456,38 @@ mod tests {
         let v = m.render_at(Range::H24, &[], now());
         assert_eq!(v["persistence"], "blocked");
         assert!(v["persistence_note"].as_str().unwrap().contains("changed"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn cached_target_stamp_does_not_hide_a_replacement() {
+        let dir = std::env::temp_dir().join(format!(
+            "ollamux-meter-stamp-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("stats.json");
+        let m = Meter::open(path.clone());
+        m.record_at(sample(None, UsageCounts::default()), now());
+        m.flush().unwrap();
+        assert!(path.exists(), "first write creates the file");
+
+        // Replace the file we just wrote. The cached stamp must not let the
+        // next flush skip the marker/version check and clobber it.
+        let foreign = br#"{"name":"not stats"}"#;
+        std::fs::write(&path, foreign).unwrap();
+        m.record_at(sample(None, UsageCounts::default()), now());
+        m.flush().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), foreign);
+        assert_eq!(
+            m.render_at(Range::H24, &[], now())["persistence"],
+            "blocked"
+        );
 
         let _ = std::fs::remove_dir_all(dir);
     }

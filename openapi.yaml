@@ -234,6 +234,9 @@ paths:
         Successful (2xx) requests on token-bearing endpoints carrying no
         counters increment `requests_without_usage`; no input/output split
         is synthesized (total-only usage is treated as missing).
+        A request the client aborts after the response has started is
+        recorded as status 499 and counted under `client_aborts`, not
+        `errors`; `ok + errors + client_aborts` equals `requests`.
         Purely in-memory (plus the persisted file) — never calls upstream.
         `range` selects the bucket series only: `24h` hourly (current
         partial hour + 24 previous), `7d`/`30d` daily; the current bucket is `partial`. Counters persist by
@@ -849,6 +852,7 @@ components:
         - requests
         - ok
         - errors
+        - client_aborts
         - requests_without_usage
         - input_tokens
         - cached_input_tokens
@@ -858,8 +862,18 @@ components:
         - retries
       properties:
         requests: {type: integer, description: Client-visible requests counted.}
-        ok: {type: integer, description: Requests whose final status was below 400.}
-        errors: {type: integer, description: Requests whose final status was 400 or above.}
+        ok: {type: integer, description: Requests whose final status was below 400 (excluding client aborts).}
+        errors:
+          type: integer
+          description: >
+            Requests whose final status was 400 or above, excluding client
+            aborts (499). `ok + errors + client_aborts` equals `requests`.
+        client_aborts:
+          type: integer
+          description: >
+            Requests the client aborted after the response had started (mid-stream
+            disconnect, recorded as status 499). The upstream key served the
+            request, so these are tracked separately from `errors`.
         requests_without_usage:
           type: integer
           description: >

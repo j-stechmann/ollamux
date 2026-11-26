@@ -47,9 +47,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   corrupt, oversized, non-regular or newer-versioned files are left
   untouched and persistence is disabled (`persistence: "blocked"`), so a
   mistyped `--stats-file` (including a keys/config file) cannot silently
-  destroy another file. Flushes re-check the marker/version immediately before
-  writing, and an advisory unix lock gives a second instance `blocked`
-  rather than stale last-writer-wins.
+  destroy another file. Flushes re-stat the target immediately before the
+  rename and re-read its marker/version unless it is still the file this
+  process just wrote, and an advisory unix lock gives a second instance
+  `blocked` rather than stale last-writer-wins.
 - Per-key identity uses a stable non-secret fingerprint of the full key in
   addition to the four-character display suffix, so keys with colliding
   suffixes under one account no longer merge. Unattributed traffic
@@ -74,6 +75,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   OpenAI-compatible generation/embedding/Responses paths);
   `/api/show`, `/api/ps`, `/api/embeddings` and other management
   endpoints no longer inflate it.
+- Mid-stream client aborts are counted as `client_aborts` (status `499`),
+  separately from `errors` (`ok + errors + client_aborts` equals
+  `requests`). An abort still credits the serving key with a success, so a
+  client going away cannot leave a key one strike away from an unrelated
+  cooldown.
 - Explicit `--stats-file` / `--no-stats` flags take precedence over
   `OLLAMUX_NO_STATS`. `Server::new` remains side-effect-free (in-memory
   statistics); the CLI opts into persistence via `Server::with_meter`.

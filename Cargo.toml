@@ -26,6 +26,9 @@ serde_json = "1"
 [features]
 default = []
 net = []
+# Test-only: expose the OLLAMUX_UPSTREAM seam in release builds so the
+# shutdown/drain integration test can run under `cargo test --release`.
+test-upstream = []
 
 [profile.release]
 lto = true

@@ -41,13 +41,14 @@ const UPSTREAM: &str = "https://ollama.com";
 
 /// Upstream for the binary constructors. Debug builds honor
 /// `OLLAMUX_UPSTREAM` so integration tests can exercise shutdown with a
-/// local slow server; release builds always use the real endpoint.
+/// local slow server; release builds always use the real endpoint unless
+/// built with the test-only `test-upstream` feature.
 fn default_upstream() -> String {
-    #[cfg(debug_assertions)]
+    #[cfg(any(debug_assertions, feature = "test-upstream"))]
     {
         std::env::var("OLLAMUX_UPSTREAM").unwrap_or_else(|_| UPSTREAM.to_string())
     }
-    #[cfg(not(debug_assertions))]
+    #[cfg(not(any(debug_assertions, feature = "test-upstream")))]
     {
         UPSTREAM.to_string()
     }
@@ -96,6 +97,15 @@ fn is_no_auth_path(path: &str) -> bool {
 /// usage, and must not inflate `requests_without_usage`.
 fn expects_usage(path: &str) -> bool {
     crate::meter::is_token_endpoint(path)
+}
+
+/// Whether a client-visible outcome should credit the serving key with a
+/// success. A mid-stream abort (499) is the client going away after the
+/// upstream response had already started: the key did not fail, so it must
+/// clear any pending strikes just like a 2xx rather than leaving them to
+/// trigger an unrelated cooldown later.
+fn key_outcome_is_success(status: u16) -> bool {
+    status < 400 || status == 499
 }
 
 static REQ_ID: AtomicUsize = AtomicUsize::new(1);
@@ -563,12 +573,12 @@ impl Server {
             match self.attempt(&cx, &mut req) {
                 Attempt::Sent { status, usage } => {
                     if let Some(k) = cx.key {
-                        self.pool.settle(k, status < 400);
-                        // Pin on confirmed success only. Unlike settle's
-                        // `< 400` (which credits 3xx relays as key-health
-                        // successes), a 3xx means the API never processed
-                        // the prompt — nothing was cached upstream, so it
-                        // must not pin.
+                        self.pool.settle(k, key_outcome_is_success(status));
+                        // Pin on confirmed success only. A 3xx means the API
+                        // never processed the prompt — nothing was cached
+                        // upstream — and a 499 client abort means the client
+                        // went away without finishing the stream, so neither
+                        // re-pins the conversation.
                         if status < 300 {
                             if let Some(id) = identity {
                                 self.pool.pin(id, k);
@@ -1467,4 +1477,24 @@ fn reason_phrase(status: u16) -> &'static str {
 fn hv(name: &str, value: &str) -> tiny_http::Header {
     tiny_http::Header::from_bytes(name.as_bytes(), value.as_bytes())
         .expect("static header name/value")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::key_outcome_is_success;
+
+    #[test]
+    fn client_abort_still_credits_the_key() {
+        // 2xx/3xx are successes; a mid-stream client abort (499) is not the
+        // key's fault and must clear strikes; 4xx/5xx are not successes.
+        for status in [200u16, 204, 302, 499] {
+            assert!(key_outcome_is_success(status), "{status} should credit");
+        }
+        for status in [400u16, 401, 429, 500, 502] {
+            assert!(
+                !key_outcome_is_success(status),
+                "{status} should not credit"
+            );
+        }
+    }
 }

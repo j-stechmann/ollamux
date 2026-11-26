@@ -1539,6 +1539,7 @@ fn stats_counts_native_and_openai_tokens_per_key_and_model() {
     assert_eq!(v["totals"]["requests"], 2, "{body}");
     assert_eq!(v["totals"]["ok"], 2);
     assert_eq!(v["totals"]["errors"], 0);
+    assert_eq!(v["totals"]["client_aborts"], 0);
     assert_eq!(v["totals"]["input_tokens"], 220);
     assert_eq!(v["totals"]["output_tokens"], 54);
     assert_eq!(v["totals"]["cached_input_tokens"], 40);

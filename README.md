@@ -311,9 +311,10 @@ affected only by that bounded scanning.
  "saved_at":1756623600,"pending_flush":false,
  "persistence":"file","persistence_note":null,"last_flush_error":null,
  "range":"24h","granularity":"hour","totals_scope":"lifetime",
- "window":{"from":"2026-10-08T23:00:00Z","until":"2026-10-09T00:00:00Z"},
+ "window":{"from":"2026-10-07T23:00:00Z","until":"2026-10-09T00:00:00Z"},
  "window_totals":{"requests":1,"input_tokens":2400,"output_tokens":300},
- "totals":{"requests":42,"ok":40,"errors":2,"requests_without_usage":3,
+ "totals":{"requests":42,"ok":40,"errors":2,"client_aborts":0,
+           "requests_without_usage":3,
            "input_tokens":120000,"cached_input_tokens":0,"output_tokens":15000,
            "duration_ms":98765,"retries":1,"total_tokens":135000,"avg_ms":2351.5},
  "keys":[{"account":"alice","id":"3f2c9a0b1d4e5f6789abcdef01234567","suffix":"1234",
@@ -332,6 +333,10 @@ Things to know:
 - `present` distinguishes currently configured keys from historical rows
   kept after a keys-file change. Configured keys with no traffic yet
   appear with zero counters.
+- A request the client aborts after the response has started is recorded
+  as status `499` and counted under `client_aborts` (not `errors`); the
+  serving key is still credited with a success because the upstream had
+  produced the response. `ok + errors + client_aborts` equals `requests`.
 - The breakdown is **per key**: identity is a stable non-secret
   fingerprint (`id`) of the full key, so two keys under one `@account`
   are separable here even if their four-character display suffixes
@@ -364,9 +369,10 @@ Things to know:
   content.
 - A second instance that tries to use the same stats file runs with
   `persistence:"blocked"` (advisory lock on unix; last-writer-wins without
-  a lock elsewhere). Each flush also re-checks the target's marker/version
-  and uses a unique temp file; cooperating instances are protected by the
-  lock and the marker/version is rechecked before each rename.
+  a lock elsewhere). Each flush uses a unique temp file and re-stats the
+  target immediately before the rename: if it is still the file this
+  process just wrote it is trusted, otherwise its marker/version is
+  re-read (and a foreign/corrupt/newer target blocks persistence).
 - Local counters are additive to the upstream reporting above: they
   answer "which key and model served what, when", while `/_usage` answers
   "what does ollama.com think this account has consumed".

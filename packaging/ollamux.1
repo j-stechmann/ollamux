@@ -230,7 +230,10 @@ endpoints such as /api/show, /api/ps and /api/embeddings are not counted
 as missing usage.
 .PP
 Only the bucket series and window_totals are range-scoped; totals and all
-dimension rows are lifetime (totals_scope:"lifetime"). Key identity is a
+dimension rows are lifetime (totals_scope:"lifetime"). A request the
+client aborts after the response has started is recorded as status 499 and
+counted under client_aborts, separately from errors (the serving key is
+still credited with a success). Key identity is a
 stable non-secret fingerprint in addition to the four-character display
 suffix.
 .PP
