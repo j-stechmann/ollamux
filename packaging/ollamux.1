@@ -10,6 +10,9 @@ ollamux \- key-rotating reverse proxy for the Ollama Cloud API
 .RB [ \-\-keys
 .IR PATH ]
 .RB [ \-\-usage-aware[= PCT ]]
+.RB [ \-\-stats-file
+.IR PATH ]
+.RB [ \-\-no-stats ]
 .RB [ \-v ]
 .br
 .B ollamux
@@ -61,6 +64,23 @@ Also settable via
 the flag wins when both are given. An invalid threshold is a usage
 error (exit 2). The usage data is polled every 60 seconds.
 .TP
+.BR \-\-stats-file " " \fIPATH\fR
+Where local request/token counters are persisted. Default, in order:
+.B $OLLAMUX_STATS_FILE\fR, then
+.B $XDG_STATE_HOME/ollamux/stats.json\fR, then
+.IR ~/.local/state/ollamux/stats.json ,
+else
+.IR ./ollamux-stats.json .
+The file is written atomically every 5 seconds and after the shutdown
+drain; requests still running when the drain deadline expires are
+force-closed and cannot be recorded.
+.TP
+.B \-\-no-stats
+Genuinely disable local counting and persistence (also
+.BR OLLAMUX_NO_STATS=1 ;
+explicit flags win). /_stats then reports enabled:false and retains no
+key, model or endpoint names.
+.TP
 .BR \-h ", " \-\-help
 Print usage and exit.
 .TP
@@ -110,6 +130,7 @@ l l.
 /v1/*|Proxied (OpenAI-compatible surface) with rotation
 /_keys|Per-key health JSON (key suffixes and account labels only, no secrets; tier + embeds latest known usage when a usage snapshot exists)
 /_usage|Per-account and per-key usage JSON + pool aggregate (balance, one fetch per account, 60s cache); ?range=24h,7d,30d adds per-account model/time stats; ?refresh=1 forces (one attempt per 5s)
+/_stats|Local per-request counters: requests, upstream-reported tokens, duration and retries by key/account/model/endpoint, in UTC hour/day buckets; ?range=24h,7d,30d (default 24h)
 /_health|Liveness JSON: {"ok":...,"keys":...,"total_slots":...}
 .TE
 .PP
@@ -186,6 +207,55 @@ array; the rest are combined under
 The endpoint has no per-request log, and custom ranges plus per-API-key
 or per-member breakdowns are not yet published upstream. Members of one
 Ollama team share an account and cannot be separated.
+.SH LOCAL TOKEN STATISTICS
+.B GET /_stats
+answers with counters measured from traffic through ollamux (unlike
+.BR /_usage ,
+which mirrors account-scoped numbers from ollama.com): request counts,
+input/cached/output tokens, wall duration, retries and final status,
+aggregated per key (account label + fingerprint), account, model, endpoint,
+HTTP status, and UTC hour/day buckets. The optional query
+.B ?range=24h|7d|30d
+selects the bucket series (default 24h: the current partial hour plus
+24 previous, i.e. 25 hourly buckets; 7d/30d are daily).
+.PP
+Token counts are read from the upstream response body
+(prompt_eval_count/eval_count/prompt_eval_cached_count on the native API;
+the OpenAI-compatible usage object on /v1/*, including Responses
+input_tokens/output_tokens). No counts are synthesized; a successful (2xx)
+response on a token-bearing endpoint that carried no counters increments
+requests_without_usage and contributes zero tokens. Streaming NDJSON and
+SSE are sniffed incrementally with bounded per-chunk work. Management
+endpoints such as /api/show, /api/ps and /api/embeddings are not counted
+as missing usage.
+.PP
+Only the bucket series and window_totals are range-scoped; totals and all
+dimension rows are lifetime (totals_scope:"lifetime"). A request the
+client aborts after the response has started is recorded as status 499 and
+counted under client_aborts, separately from errors (the serving key is
+still credited with a success). Key identity is a
+stable non-secret fingerprint in addition to the four-character display
+suffix.
+.PP
+Counters persist across restarts (see
+.BR \-\-stats-file ).
+Retention is bounded to 25 hourly and 31 daily buckets, 512 historical
+key rows, 256 accounts, 256 models and 128 endpoints (overflow folds into
+.BR <other> );
+there is no per-request log and no prompt or completion content is
+stored. A file is adopted only when it carries the ollamux-stats marker
+and the current schema version; corrupt, foreign, non-regular,
+larger-than-16-MiB or newer-versioned files (and symlinked paths, which
+are treated as non-regular) are left untouched and this process runs in
+memory instead of overwriting them
+(shown as persistence:"blocked" in /_stats). Write failures are logged
+and reported as last_flush_error. Flushes use unique temp files and an
+advisory unix owner lock, so a second instance is blocked rather than
+tearing the file. Write failures set last_flush_error and
+persistence:"error" until a successful flush. Configured keys with no
+traffic yet appear with zero counters, and historical rows from a previous keys file are marked
+present:false. With --no-stats, /_stats reports enabled:false and
+retains no counters or names.
 .SH QUOTA-AWARE KEY SELECTION
 With
 .B \-\-usage-aware[= \fIPCT \fR]
@@ -215,8 +285,11 @@ Response headers identify the serving key
 .B SIGINT
 (ctrl-c) or
 .B SIGTERM
-starts a graceful drain of in-flight requests for up to 5 seconds
-before exit; a second signal force-quits immediately (exit code 130).
+starts a graceful drain for up to 5 seconds before exit; workers keep
+serving queued and in-flight requests until the deadline (an instance
+that stays idle for about 0.3 seconds exits early), then anything still
+running is force-closed. A second signal force-quits immediately (exit
+code 130).
 .SH SECURITY
 The proxy has no authentication: anything that can reach the listen
 address can use your API quota. The default binds the loopback
@@ -234,6 +307,18 @@ Conventional location for system-wide deployments (see
 .BR systemd.unit (5)
 and the shipped
 .IR ollamux.service ).
+.TP
+.I $OLLAMUX_STATS_FILE
+Local token/request statistics, when set.
+.TP
+.I $XDG_STATE_HOME/ollamux/stats.json
+Default statistics location (else
+.IR ~/.local/state/ollamux/stats.json ,
+else
+.IR ./ollamux-stats.json ).
+.TP
+.I $XDG_STATE_HOME/ollamux/stats.json.lock
+Advisory cross-process owner lock for the statistics file.
 .SH ENVIRONMENT
 .TP
 .B OLLAMUX_KEYS
@@ -247,8 +332,18 @@ equivalent to
 .BR \-\-usage-aware= \fIPCT \fR.
 The command-line flag wins when both are set.
 .TP
+.B OLLAMUX_STATS_FILE
+Overrides the statistics-file location (see
+.BR \-\-stats-file ).
+.TP
+.B OLLAMUX_NO_STATS
+Disables local counting and persistence; explicit stats flags win.
+.TP
 .B XDG_CONFIG_HOME
 Base directory for the default keys location.
+.TP
+.B XDG_STATE_HOME
+Base directory for the default statistics location.
 .TP
 .B OLLAMA_HOST
 Not read by ollamux; exported by clients to point them at the proxy
@@ -266,7 +361,7 @@ Command-line usage error.
 Startup failure: unparseable or missing keys, unbindable address.
 .TP
 .B 130
-Interrupted: second SIGINT during drain.
+Interrupted: second termination signal during drain.
 .SH SEE ALSO
 The project README at
 .IR https://github.com/j-stechmann/ollamux .

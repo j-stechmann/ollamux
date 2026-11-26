@@ -29,6 +29,10 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --locked
       - run: cargo test --locked --no-default-features
+      # The in-flight drain test needs the OLLAMUX_UPSTREAM seam, which is
+      # debug-only by default; build a release binary with the test feature
+      # so the shipped profile is exercised too.
+      - run: cargo test --locked --release --features test-upstream --test shutdown
 
   packaging-lint:
     name: packaging-lint

@@ -2,7 +2,7 @@
 //!
 //! tiny_http listener, ureq upstream client, per-key concurrency slots,
 //! invisible pre-first-byte failover. No signal-handling dependencies:
-//! SIGINT is awaited with `sigwait` on a dedicated thread (unix).
+//! SIGINT/SIGTERM are awaited with `sigwait` on a dedicated thread (unix).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,6 +23,10 @@ struct Config {
     usage_aware: Option<u32>,
     /// Prompt-cache affinity (default on; --no-affinity disables).
     affinity: bool,
+    /// Local token statistics persistence (default on).
+    stats_enabled: bool,
+    /// Explicit --stats-file target (None = default state path).
+    stats_path: Option<std::path::PathBuf>,
 }
 
 /// Slots are per key today, while Ollama Cloud's concurrency limit is
@@ -56,13 +60,13 @@ fn warn_multi_key_accounts(keys: &ollamux::Keys) {
 
 fn main() {
     // FIRST THING, before any thread can exist (theirs or ours): block
-    // SIGINT. POSIX threads inherit the caller's mask, so every thread
-    // spawned later (tiny_http's accept thread, ollamux workers, the sigwait
-    // thread) starts with SIGINT blocked and the signal stays
+    // SIGINT/SIGTERM. POSIX threads inherit the caller's mask, so every
+    // thread spawned later (tiny_http's accept thread, ollamux workers, the
+    // sigwait thread) starts with them blocked and the signals stay
     // process-pending for `sigwait`. Doing this after spawning left those
     // threads eligible for default delivery: instant death, no drain.
     #[cfg(unix)]
-    block_sigint_before_threading();
+    block_termination_signals_before_threading();
 
     let cfg = match parse_args(std::env::args().skip(1)) {
         Ok(Some(cfg)) => cfg,
@@ -98,7 +102,30 @@ fn main() {
     }
     // Prompt-cache affinity is on by default; --no-affinity / env disables.
     pool.set_affinity_enabled(cfg.affinity);
-    let proxy = Arc::new(ollamux::proxy::Server::new(pool.clone()));
+    // Local token/request statistics: persisted by default, resolved before
+    // the server starts so the file is loaded before any request lands.
+    let meter = if cfg.stats_enabled {
+        let path = cfg
+            .stats_path
+            .clone()
+            .unwrap_or_else(ollamux::Meter::default_path);
+        if cfg.verbose {
+            eprintln!("ollamux: local stats: {}", path.display());
+        }
+        let present: Vec<(String, String, String)> = (0..pool.len())
+            .map(|i| {
+                (
+                    pool.account_of(i).to_string(),
+                    ollamux::key_fingerprint(pool.secret_of(i)),
+                    pool.suffix_of(i),
+                )
+            })
+            .collect();
+        Arc::new(ollamux::Meter::open_with_present(path, &present))
+    } else {
+        Arc::new(ollamux::Meter::disabled())
+    };
+    let proxy = Arc::new(ollamux::proxy::Server::with_meter(pool.clone(), meter));
 
     let addr = cfg.addr.clone();
     let tiny = match tiny_http::Server::http(addr.as_str()) {
@@ -121,7 +148,13 @@ fn main() {
     }
 
     let stop = Arc::new(AtomicBool::new(false));
-    spawn_workers(tiny.clone(), proxy.clone(), stop.clone());
+    // Workers keep accepting during the drain; this second flag is set after
+    // the drain loop (quiet window or DRAIN deadline), so the main thread
+    // never blocks on a request.
+    let worker_stop = Arc::new(AtomicBool::new(false));
+    let workers = spawn_workers(tiny.clone(), proxy.clone(), worker_stop.clone());
+    // Persist local counters periodically and once more on shutdown.
+    proxy.meter.spawn_flusher(stop.clone());
 
     // Quota-aware poller: only exists when the feature is enabled.
     if cfg.usage_aware.is_some() {
@@ -137,44 +170,48 @@ fn main() {
 
     let verbose = cfg.verbose;
     let stop_ctrl = stop.clone();
-    install_sigint(move || {
+    install_termination_handler(move || {
         stop_ctrl.store(true, Ordering::SeqCst);
         if verbose {
             eprintln!(
-                "ollamux: shutting down (draining up to {}s; ctrl-c again to force quit)",
+                "ollamux: shutting down (draining up to {}s; signal again to force quit)",
                 DRAIN.as_secs()
             )
         }
     });
 
-    // --- main loop: accept until stopped, then drain ---
+    // --- main loop: workers own request handling; main only watches stop ---
     while !stop.load(Ordering::Relaxed) {
-        match tiny.recv_timeout(Duration::from_millis(250)) {
-            Ok(Some(request)) => dispatch(request, &proxy),
-            Ok(None) => {}
-            Err(e) => {
-                if verbose {
-                    eprintln!("ollamux: recv error: {e}")
-                }
-            }
-        }
+        std::thread::sleep(Duration::from_millis(250));
     }
 
+    // Drain: workers continue serving queued/in-flight requests until the
+    // deadline. A quiet window (longer than workers' 250 ms recv timeout)
+    // lets an idle shutdown finish early.
     let deadline = std::time::Instant::now() + DRAIN;
+    let mut quiet_since: Option<std::time::Instant> = None;
     while std::time::Instant::now() < deadline {
-        match tiny.try_recv() {
-            Ok(Some(request)) => dispatch(request, &proxy),
-            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
-            Err(_) => break,
+        if proxy.active_requests() == 0 {
+            let since = *quiet_since.get_or_insert_with(std::time::Instant::now);
+            if since.elapsed() >= Duration::from_millis(300) {
+                break;
+            }
+        } else {
+            quiet_since = None;
         }
+        std::thread::sleep(Duration::from_millis(25));
     }
     if verbose {
         eprintln!("ollamux: bye");
     }
-}
-
-fn dispatch(request: tiny_http::Request, proxy: &Arc<ollamux::proxy::Server>) {
-    proxy.handle(request);
+    // Stop workers, then give them the rest of the DRAIN window to finish
+    // (their recv timeout is 250 ms), and persist whatever completed. A
+    // request still running when DRAIN expires is force-closed.
+    worker_stop.store(true, Ordering::SeqCst);
+    while !workers.iter().all(|w| w.is_finished()) && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let _ = proxy.meter.flush();
 }
 
 /// One blocking dispatcher thread per worker; tiny_http's recv() is shared
@@ -182,32 +219,38 @@ fn dispatch(request: tiny_http::Request, proxy: &Arc<ollamux::proxy::Server>) {
 fn spawn_workers(
     tiny: Arc<tiny_http::Server>,
     proxy: Arc<ollamux::proxy::Server>,
-    stop: Arc<AtomicBool>,
-) {
+    worker_stop: Arc<AtomicBool>,
+) -> Vec<std::thread::JoinHandle<()>> {
     let workers = proxy.pool.total_slots().clamp(4, 64) as usize;
+    let mut handles = Vec::with_capacity(workers);
     for _ in 0..workers {
         let tiny = Arc::clone(&tiny);
         let proxy = Arc::clone(&proxy);
-        let stop = Arc::clone(&stop);
-        std::thread::spawn(move || {
-            while !stop.load(Ordering::Relaxed) {
+        let worker_stop = Arc::clone(&worker_stop);
+        handles.push(std::thread::spawn(move || {
+            while !worker_stop.load(Ordering::SeqCst) {
                 match tiny.recv_timeout(Duration::from_millis(250)) {
                     Ok(Some(request)) => proxy.handle(request),
                     Ok(None) => {}
                     Err(_) => break,
                 }
             }
-        });
+        }));
     }
+    handles
 }
 
 fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Config>, String> {
+    let stats_env_off =
+        std::env::var("OLLAMUX_NO_STATS").is_ok_and(|v| !v.is_empty() && v != "0" && v != "false");
     let mut cfg = Config {
         addr: DEFAULT_ADDR.to_string(),
         keys_path: None,
         verbose: false,
         usage_aware: None,
         affinity: true,
+        stats_enabled: !stats_env_off,
+        stats_path: None,
     };
     let mut it = args.peekable();
     // Splits `--opt=value` into (`--opt`, Some(`value`)); plain `--opt`
@@ -254,6 +297,15 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Config>, Stri
             }
             "-v" | "--verbose" => cfg.verbose = true,
             "--no-affinity" => cfg.affinity = false,
+            "--no-stats" => cfg.stats_enabled = false,
+            "--stats-file" => {
+                let path = value()?;
+                if path.is_empty() {
+                    return Err("--stats-file requires a non-empty path".to_string());
+                }
+                cfg.stats_path = Some(std::path::PathBuf::from(path));
+                cfg.stats_enabled = true;
+            }
             "--usage-aware" => {
                 // `--usage-aware=PCT`, `--usage-aware PCT`, or bare
                 // `--usage-aware` (default threshold). A following token
@@ -300,7 +352,8 @@ fn print_help() {
         "ollamux {} — key-rotating proxy for the Ollama Cloud API
 
 USAGE:
-    ollamux [--addr HOST:PORT] [--keys PATH] [--usage-aware[=PCT]] [--no-affinity] [-v]
+    ollamux [--addr HOST:PORT] [--keys PATH] [--usage-aware[=PCT]] [--no-affinity]
+            [--stats-file PATH] [--no-stats] [-v]
 
 OPTIONS:
     -a, --addr <HOST:PORT>   Listen address [default: {DEFAULT_ADDR}]
@@ -315,6 +368,14 @@ OPTIONS:
                              pinned to the API key that warmed ollama.com's
                              server-side prompt cache (faster first tokens).
                              Also via OLLAMUX_NO_AFFINITY=1 (flag wins).
+    --stats-file <PATH>      Where to persist local token/request counters
+                             (default: $OLLAMUX_STATS_FILE, else
+                             $XDG_STATE_HOME/ollamux/stats.json, else
+                             ~/.local/state/ollamux/stats.json, else
+                             ./ollamux-stats.json). Written atomically
+                             every 5 s and after the shutdown drain.
+    --no-stats               Disable local counters and persistence
+                             (also OLLAMUX_NO_STATS=1; explicit flags win).
     -v, --verbose            Verbose stderr (startup banner, per-request log,
                              key cooldowns/deaths, upstream snippets)
     -h, --help               This help
@@ -341,6 +402,11 @@ ENDPOINTS:
                     per-account model/time statistics (group_by=model
                     optional); ?refresh=1 forces, at most one attempt
                     per 5 s
+    /_stats         local, per-request counters observed by ollamux:
+                    requests, upstream-reported tokens, duration, broken
+                    down by key/account/model/endpoint and UTC hour/day.
+                    ?range=24h|7d|30d (default 24h). Read-only, instant,
+                    in-memory (plus the persisted file)
     /_health        liveness JSON
 
 USAGE SOURCE:
@@ -358,15 +424,16 @@ USAGE SOURCE:
     );
 }
 
-// --- SIGINT via sigwait (no external crates, no async-signal-unsafe work) ---
+// --- SIGINT/SIGTERM via sigwait (no crates, no async-signal-unsafe work) ---
 //
-// Correct delivery requires SIGINT blocked in every thread. `main` calls
-// `block_sigint_before_threading()` before spawning; POSIX guarantees each
-// `spawn`ed thread inherits that mask, so the signal can only ever become
-// process-pending and is consumed exclusively by the `sigwait` below.
+// Correct delivery requires both signals blocked in every thread. `main`
+// calls `block_termination_signals_before_threading()` before spawning;
+// POSIX guarantees each `spawn`ed thread inherits that mask, so the
+// signals can only become process-pending and are consumed exclusively by
+// the `sigwait` below.
 
 #[cfg(unix)]
-fn block_sigint_before_threading() {
+fn block_termination_signals_before_threading() {
     #[repr(C)]
     struct SigSet([u64; 16]);
 
@@ -377,28 +444,32 @@ fn block_sigint_before_threading() {
     }
 
     const SIGINT: i32 = 2;
+    const SIGTERM: i32 = 15;
     const SIG_BLOCK: i32 = 0;
 
     unsafe {
         let mut set = SigSet([0; 16]);
         sigemptyset(&mut set);
         sigaddset(&mut set, SIGINT);
+        sigaddset(&mut set, SIGTERM);
         let rc = pthread_sigmask(SIG_BLOCK, &set, std::ptr::null_mut());
         if rc != 0 {
-            eprintln!("ollamux: warning: cannot block SIGINT ({rc}); ctrl-c will hard-exit");
+            eprintln!(
+                "ollamux: warning: cannot block SIGINT/SIGTERM ({rc}); shutdown signals will hard-exit"
+            );
         }
     }
 }
 
-fn install_sigint<F>(notify: F)
+fn install_termination_handler<F>(notify: F)
 where
     F: Fn() + Send + 'static,
 {
-    std::thread::spawn(move || sigint_thread(notify));
+    std::thread::spawn(move || signal_thread(notify));
 }
 
 #[cfg(unix)]
-fn sigint_thread<F: Fn()>(notify: F) {
+fn signal_thread<F: Fn()>(notify: F) {
     #[repr(C)]
     struct SigSet([u64; 16]);
     unsafe extern "C" {
@@ -409,28 +480,30 @@ fn sigint_thread<F: Fn()>(notify: F) {
     }
 
     const SIGINT: i32 = 2;
+    const SIGTERM: i32 = 15;
     const SIG_BLOCK: i32 = 0;
 
     unsafe {
-        // Idempotent belt-and-braces: this thread also blocks SIGINT in
-        // case it was EVER started from a non-blocked context (e.g. tests).
+        // Idempotent belt-and-braces: this thread also blocks the signals
+        // in case it was EVER started from a non-blocked context (tests).
         let mut set = SigSet([0; 16]);
         sigemptyset(&mut set);
         sigaddset(&mut set, SIGINT);
+        sigaddset(&mut set, SIGTERM);
         let mut old = SigSet([0; 16]);
         sigprocmask(SIG_BLOCK, &set, &mut old);
 
         let mut sig: i32 = 0;
         sigwait(&set, &mut sig);
         notify();
-        // Second SIGINT: immediate exit.
+        // Second termination signal: immediate exit.
         sigwait(&set, &mut sig);
         std::process::exit(130);
     }
 }
 
 #[cfg(not(unix))]
-fn sigint_thread<F: Fn()>(_notify: F) {
+fn signal_thread<F: Fn()>(_notify: F) {
     loop {
         std::thread::park();
     }
@@ -440,14 +513,17 @@ fn sigint_thread<F: Fn()>(_notify: F) {
 mod tests {
     use super::*;
 
+    /// Environment variables are process-global; serialize the two tests
+    /// that mutate them even though the harness runs tests in parallel.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// The env var must disable affinity on its own — a regression guard:
     /// this check once lived inside `if !cfg.affinity`, making the env var
     /// silently inert unless the flag was also passed.
     #[test]
     fn env_var_disables_affinity_without_flag() {
-        // SAFETY: tests run single-threaded with respect to env mutation
-        // within this test binary's `parse_args` calls; other tests in
-        // this binary do not read OLLAMUX_NO_AFFINITY.
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: ENV_LOCK serializes env mutation in this test binary.
         // (Rust 2024: env access in tests is unsafe.)
         unsafe { std::env::set_var("OLLAMUX_NO_AFFINITY", "1") };
         let cfg = parse_args(std::iter::empty()).expect("args parse");
@@ -459,5 +535,33 @@ mod tests {
         assert!(cfg.is_some_and(|c| c.affinity), "'0' must not disable");
 
         unsafe { std::env::remove_var("OLLAMUX_NO_AFFINITY") };
+    }
+
+    #[test]
+    fn explicit_stats_flags_win_over_the_no_stats_env() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: ENV_LOCK serializes env mutation in this test binary.
+        unsafe { std::env::set_var("OLLAMUX_NO_STATS", "1") };
+        let cfg = parse_args(std::iter::empty())
+            .expect("args parse")
+            .expect("not help/version");
+        assert!(!cfg.stats_enabled, "env alone disables stats");
+
+        let args = [
+            "--stats-file".to_string(),
+            "/tmp/ollamux-test.json".to_string(),
+        ];
+        let cfg = parse_args(args.into_iter())
+            .expect("args parse")
+            .expect("not help/version");
+        assert!(
+            cfg.stats_enabled,
+            "an explicit --stats-file must win over the env"
+        );
+
+        let args = ["--stats-file".to_string(), String::new()];
+        assert!(parse_args(args.into_iter()).is_err(), "empty path rejected");
+
+        unsafe { std::env::remove_var("OLLAMUX_NO_STATS") };
     }
 }

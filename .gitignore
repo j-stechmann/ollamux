@@ -3,6 +3,10 @@ Cargo.lock.bak
 *.log
 dist/
 vendor/
+# HOME-less fallback location for local /_stats counters
+ollamux-stats.json
+ollamux-stats.json.lock
+.ollamux-stats.json.*.tmp
 
 # updpkgsums/makepkg download sources into the package dirs; never commit them
 packaging/aur/*/*.tar.gz

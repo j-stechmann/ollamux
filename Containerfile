@@ -10,6 +10,9 @@
 #   docker run -p 11435:11435 -e OLLAMUX_KEYS="key-one:3@you" ollamux
 # Run (keys via mounted file):
 #   docker run -p 11435:11435 -v ./keys:/keys:ro -e OLLAMUX_KEYS_FILE=/keys ollamux
+# Persist local /_stats counters across recreation:
+#   docker run -p 11435:11435 -v ollamux-state:/var/lib/ollamux -e OLLAMUX_KEYS="..." ollamux
+# Or disable them entirely with -e OLLAMUX_NO_STATS=1.
 #
 # OLLAMUX_KEYS_FILE is a convenience wrapper below; the binary itself only
 # reads OLLAMUX_KEYS, or a keys file path.
@@ -21,10 +24,12 @@ COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY tests ./tests
 # --locked: fail the image build if Cargo.lock is out of sync.
-RUN cargo build --release --locked && strip target/release/ollamux
+RUN cargo build --release --locked && strip target/release/ollamux && \
+    mkdir -p /state && chown 65532:65532 /state
 
 FROM scratch
 COPY --from=build /src/target/release/ollamux /ollamux
+COPY --from=build --chown=65532:65532 /state /var/lib/ollamux
 # GPL-2.0-or-later requires offering source; the image label points at
 # the repo which is the corresponding source for every pushed tag.
 LABEL org.opencontainers.image.title="ollamux" \
@@ -33,6 +38,10 @@ LABEL org.opencontainers.image.title="ollamux" \
       org.opencontainers.image.source="https://github.com/j-stechmann/ollamux" \
       org.opencontainers.image.url="https://ghcr.io/j-stechmann/ollamux"
 USER 65532:65532
+# Persist /_stats counters here; mount a named volume for durability
+# across container recreation. Set OLLAMUX_NO_STATS=1 to disable.
+ENV OLLAMUX_STATS_FILE=/var/lib/ollamux/stats.json
+VOLUME ["/var/lib/ollamux"]
 EXPOSE 11435
 # Loopback default is meaningless inside a container (published ports
 # DNAT to the container IP), so default to all-interfaces here; the

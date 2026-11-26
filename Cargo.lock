@@ -251,6 +251,7 @@ dependencies = [
 name = "ollamux"
 version = "0.9.0"
 dependencies = [
+ "ring",
  "serde",
  "serde_json",
  "tiny_http",

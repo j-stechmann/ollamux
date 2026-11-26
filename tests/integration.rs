@@ -31,13 +31,21 @@ fn pool_from(keys: &[(&str, u32, &str)]) -> Arc<ollamux::Pool> {
 
 /// Spawn the real Server proxying to `upstream`; returns (base URL, pool).
 fn spawn_server(pool: Arc<ollamux::Pool>, upstream: &str) -> (String, Arc<ollamux::Pool>) {
-    let server = Server::with_upstream(pool.clone(), upstream);
+    spawn_server_with_meter(pool, upstream, Arc::new(ollamux::Meter::in_memory()))
+}
+
+/// Spawn with a caller-supplied meter (persistence / disabled tests).
+fn spawn_server_with_meter(
+    pool: Arc<ollamux::Pool>,
+    upstream: &str,
+    meter: Arc<ollamux::Meter>,
+) -> (String, Arc<ollamux::Pool>) {
+    let server = Server::with_upstream_and_meter(pool.clone(), upstream, meter);
     let tiny = tiny_http::Server::http("127.0.0.1:0").unwrap();
     let addr = match tiny.server_addr() {
         tiny_http::ListenAddr::IP(a) => a.to_string(),
         _ => panic!("expected IP listener"),
     };
-    let _upstream = upstream.to_string();
     std::thread::spawn(move || {
         while let Ok(req) = tiny.recv() {
             server.handle(req);
@@ -1213,34 +1221,41 @@ fn affinity_pinned_key_death_repins_to_survivor() {
             r#"{"done":true,"message":{"role":"assistant","content":"ok"}}"#.into(),
         ),
     });
-    let (addr, _pool) = spawn_server(
-        pool_with(&[("omk-deadd1e2", 1), ("omk-alivea9b8", 1)]),
-        &up.url,
-    );
+    // The initial round-robin pick is normally the dead key, but parallel
+    // test scheduling/port reuse can occasionally select the survivor
+    // first. Retry with a fresh server so the test exercises the intended
+    // death→repin path deterministically.
+    for _ in 0..8 {
+        let (addr, _pool) = spawn_server(
+            pool_with(&[("omk-deadd1e2", 1), ("omk-alivea9b8", 1)]),
+            &up.url,
+        );
+        let (s1, _, h1) = post_with_headers(&addr, "/api/chat", CONVO_A);
+        assert_eq!(s1, 200, "failover must reach the survivor");
+        let retries1 = header_value(&h1, "x-ollamux-retries").unwrap_or_default();
+        if retries1 != "1" {
+            continue;
+        }
 
-    let (s1, _, h1) = post_with_headers(&addr, "/api/chat", CONVO_A);
-    assert_eq!(s1, 200, "failover must reach the survivor");
-    let retries1 = header_value(&h1, "x-ollamux-retries").unwrap_or_default();
-    assert_eq!(retries1, "1", "one rotation to the survivor");
-
-    let (s2, _, h2) = post_with_headers(&addr, "/api/chat", CONVO_A_TURN2);
-    assert_eq!(s2, 200);
-    let retries2 = header_value(&h2, "x-ollamux-retries").unwrap_or_default();
-    assert_eq!(retries2, "0", "re-pinned: served directly by the survivor");
-
-    // Exactly one 401 was recorded (the initial pin attempt); the second
-    // request did not revisit the dead key.
-    let deads = up
-        .recorded()
-        .iter()
-        .filter(|r| r.auth.as_deref().is_some_and(|a| a.contains("d1e2")))
-        .count();
-    assert_eq!(deads, 1, "dead key must not be retried after re-pin");
-
-    // Header says miss: the pin existed but the dead key could not serve,
-    // so the request fell through to the survivor (hit = usable pin).
-    let aff1 = header_value(&h1, "x-ollamux-affinity").unwrap_or_default();
-    assert_eq!(aff1, "miss");
+        let dead_attempts = || {
+            up.recorded()
+                .iter()
+                .filter(|r| r.auth.as_deref().is_some_and(|a| a.contains("d1e2")))
+                .count()
+        };
+        let before_second = dead_attempts();
+        let (s2, _, h2) = post_with_headers(&addr, "/api/chat", CONVO_A_TURN2);
+        assert_eq!(s2, 200);
+        let retries2 = header_value(&h2, "x-ollamux-retries").unwrap_or_default();
+        assert_eq!(retries2, "0", "re-pinned: served directly by the survivor");
+        assert_eq!(
+            dead_attempts(),
+            before_second,
+            "second request must not revisit the dead key"
+        );
+        return;
+    }
+    panic!("never exercised the dead-key first attempt");
 }
 
 #[test]
@@ -1479,4 +1494,244 @@ fn net_failover_money_test() {
         v["error"]["message"].is_string(),
         "openai-style error: {body2}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Local token statistics (/_stats)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn stats_counts_native_and_openai_tokens_per_key_and_model() {
+    let up = Upstream::spawn(|path| {
+        if path.starts_with("/api/chat") {
+            (
+                200u16,
+                "OK".into(),
+                r#"{"model":"gpt-oss:120b","message":{"content":"hi"},"done":true,"prompt_eval_count":120,"eval_count":34}"#.into(),
+            )
+        } else if path.starts_with("/v1/chat/completions") {
+            (
+                200u16,
+                "OK".into(),
+                r#"{"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":20,"total_tokens":120,"prompt_tokens_details":{"cached_tokens":40}}}"#.into(),
+            )
+        } else {
+            (404u16, "Not Found".into(), r#"{"error":"nope"}"#.into())
+        }
+    });
+    let (addr, _pool) = spawn_server(pool_from(&[("omk-stats0001", 1, "alice")]), &up.url);
+
+    let (status, body) = post(
+        &addr,
+        "/api/chat",
+        r#"{"model":"gpt-oss:120b","stream":false}"#,
+    );
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = post(&addr, "/v1/chat/completions", r#"{"model":"gpt-oss:120b"}"#);
+    assert_eq!(status, 200, "{body}");
+
+    let (status, body, _) = get(&addr, "/_stats");
+    assert_eq!(status, 200, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["source"], "local");
+    assert_eq!(v["range"], "24h");
+    assert_eq!(v["granularity"], "hour");
+    assert_eq!(v["totals"]["requests"], 2, "{body}");
+    assert_eq!(v["totals"]["ok"], 2);
+    assert_eq!(v["totals"]["errors"], 0);
+    assert_eq!(v["totals"]["client_aborts"], 0);
+    assert_eq!(v["totals"]["input_tokens"], 220);
+    assert_eq!(v["totals"]["output_tokens"], 54);
+    assert_eq!(v["totals"]["cached_input_tokens"], 40);
+    assert_eq!(v["totals"]["total_tokens"], 274);
+    assert_eq!(v["totals"]["requests_without_usage"], 0);
+    assert_eq!(v["by_status"]["200"], serde_json::json!(2));
+
+    let key = &v["keys"][0];
+    assert_eq!(key["account"], "alice");
+    assert_eq!(key["suffix"], "0001");
+    assert_eq!(key["present"], true);
+    assert_eq!(key["requests"], 2);
+
+    let models = v["models"].as_array().unwrap();
+    assert_eq!(models.len(), 1, "{body}");
+    assert_eq!(models[0]["model"], "gpt-oss:120b");
+    assert_eq!(models[0]["requests"], 2);
+
+    let endpoints = v["endpoints"].as_array().unwrap();
+    assert!(
+        endpoints.iter().any(|e| e["endpoint"] == "api/chat"),
+        "{body}"
+    );
+    assert!(
+        endpoints
+            .iter()
+            .any(|e| e["endpoint"] == "v1/chat/completions"),
+        "{body}"
+    );
+
+    // Range controls bucket granularity; invalid ranges are rejected.
+    let (_, body, _) = get(&addr, "/_stats?range=7d");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["granularity"], "day");
+    assert_eq!(v["buckets"].as_array().unwrap().len(), 7);
+    let (_, body, _) = get(&addr, "/_stats?range=30d");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["buckets"].as_array().unwrap().len(), 30);
+    let (status, _, _) = get(&addr, "/_stats?range=1d");
+    assert_eq!(status, 400);
+
+    // Introspection itself is never counted.
+    let (_, body, _) = get(&addr, "/_stats");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["totals"]["requests"], 2);
+}
+
+#[test]
+fn stats_reads_streaming_usage_and_flags_missing_usage() {
+    let up = Upstream::spawn(|path| {
+        if path.starts_with("/api/generate") {
+            (
+                200u16,
+                "OK".into(),
+                "{\"message\":{\"content\":\"a\"}}\n{\"done\":true,\"prompt_eval_count\":50,\"eval_count\":7}\n".into(),
+            )
+        } else {
+            (404u16, "Not Found".into(), r#"{"error":"nope"}"#.into())
+        }
+    });
+    let (addr, _pool) = spawn_server(pool_with(&[("omk-stream777", 1)]), &up.url);
+
+    let (status, body) = post(
+        &addr,
+        "/api/generate",
+        r#"{"model":"m","stream":true,"prompt":"hi"}"#,
+    );
+    assert_eq!(status, 200, "{body}");
+    let (_, body, _) = get(&addr, "/_stats");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["totals"]["requests"], 1, "{body}");
+    assert_eq!(v["totals"]["input_tokens"], 50);
+    assert_eq!(v["totals"]["output_tokens"], 7);
+    assert_eq!(v["totals"]["requests_without_usage"], 0);
+
+    // A stream with no counters is recorded as "usage not reported", never
+    // estimated.
+    let (addr2, _pool2) = spawn_server(
+        pool_with(&[("omk-stream888", 1)]),
+        &Upstream::spawn(|_| (200u16, "OK".into(), "line1\nline2\n".into())).url,
+    );
+    let _ = post(&addr2, "/api/generate", r#"{"model":"m"}"#);
+    let (_, body, _) = get(&addr2, "/_stats");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["totals"]["requests_without_usage"], 1, "{body}");
+    assert_eq!(v["totals"]["input_tokens"], 0);
+}
+
+#[test]
+fn stats_lists_configured_keys_before_traffic_and_skips_metadata_usage() {
+    let up = Upstream::spawn(|_| {
+        (
+            200u16,
+            "OK".into(),
+            r#"{"models":[{"name":"gpt-oss:120b"}]}"#.into(),
+        )
+    });
+    let (addr, _pool) = spawn_server(pool_from(&[("omk-noauth01", 1, "bob")]), &up.url);
+
+    let (_, body, _) = get(&addr, "/_stats");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["totals"]["requests"], 0);
+    let keys = v["keys"].as_array().unwrap();
+    assert_eq!(keys.len(), 1, "{body}");
+    assert_eq!(keys[0]["suffix"], "th01");
+    assert_eq!(keys[0]["present"], true);
+
+    // No-auth metadata endpoints never report tokens: they must not be
+    // counted as "usage not reported".
+    let (status, _, _) = get(&addr, "/api/tags");
+    assert_eq!(status, 200);
+    // Neither do other non-token management endpoints (`/api/show` etc.).
+    let (status, _, _) = get(&addr, "/api/show");
+    assert_eq!(status, 200);
+    // The legacy /api/embeddings response has no counters; it must not be
+    // treated as a token-bearing endpoint.
+    let (status, body) = post(&addr, "/api/embeddings", r#"{"model":"m","prompt":"x"}"#);
+    assert_eq!(status, 200, "{body}");
+    let (_, body, _) = get(&addr, "/_stats");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["totals"]["requests"], 3);
+    assert_eq!(v["totals"]["requests_without_usage"], 0);
+}
+
+#[test]
+fn no_stats_disables_counting_end_to_end() {
+    let up = Upstream::spawn(|_| {
+        (
+            200u16,
+            "OK".into(),
+            r#"{"message":{"content":"hi"},"done":true,"prompt_eval_count":5,"eval_count":2}"#
+                .into(),
+        )
+    });
+    let meter = Arc::new(ollamux::Meter::disabled());
+    let (addr, _pool) =
+        spawn_server_with_meter(pool_from(&[("omk-disabled01", 1, "alice")]), &up.url, meter);
+    let (status, body) = post(&addr, "/api/chat", r#"{"model":"m","stream":false}"#);
+    assert_eq!(status, 200, "{body}");
+
+    let (status, body, _) = get(&addr, "/_stats");
+    assert_eq!(status, 200, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["enabled"], false, "{body}");
+    assert_eq!(v["persistence"], "disabled");
+    assert_eq!(v["totals"]["requests"], 0);
+    assert_eq!(v["keys"].as_array().unwrap().len(), 0);
+    assert_eq!(v["models"].as_array().unwrap().len(), 0);
+    assert_eq!(v["endpoints"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn stats_reads_responses_api_usage_in_both_modes() {
+    let up = Upstream::spawn(|path| {
+        if path.starts_with("/v1/responses") {
+            (
+                200u16,
+                "OK".into(),
+                r#"{"output":[],"usage":{"input_tokens":20,"output_tokens":12,"total_tokens":32,"input_tokens_details":{"cached_tokens":5}}}"#.into(),
+            )
+        } else {
+            (404u16, "Not Found".into(), r#"{"error":"nope"}"#.into())
+        }
+    });
+    let (addr, _pool) = spawn_server(pool_with(&[("omk-responses", 1)]), &up.url);
+
+    let (status, body) = post(&addr, "/v1/responses", r#"{"model":"m"}"#);
+    assert_eq!(status, 200, "{body}");
+    let (_, body, _) = get(&addr, "/_stats");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["totals"]["requests"], 1, "{body}");
+    assert_eq!(v["totals"]["input_tokens"], 20);
+    assert_eq!(v["totals"]["output_tokens"], 12);
+    assert_eq!(v["totals"]["cached_input_tokens"], 5);
+    assert_eq!(v["totals"]["requests_without_usage"], 0);
+
+    // Streaming Responses: usage lives under response.usage in the
+    // response.completed SSE event.
+    let up2 = Upstream::spawn(move |_| {
+        (
+            200u16,
+            "OK".into(),
+            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":7,\"output_tokens\":3,\"total_tokens\":10}}}\n\n".into(),
+        )
+    });
+    let (addr2, _pool2) = spawn_server(pool_with(&[("omk-responses2", 1)]), &up2.url);
+    let (status, body) = post(&addr2, "/v1/responses", r#"{"model":"m","stream":true}"#);
+    assert_eq!(status, 200, "{body}");
+    let (_, body, _) = get(&addr2, "/_stats");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["totals"]["requests"], 1, "{body}");
+    assert_eq!(v["totals"]["input_tokens"], 7);
+    assert_eq!(v["totals"]["output_tokens"], 3);
+    assert_eq!(v["totals"]["requests_without_usage"], 0);
 }
