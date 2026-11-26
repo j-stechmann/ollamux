@@ -450,8 +450,9 @@ a mysterious upstream one — see `/_keys` for per-key state.
   served the request).
 - `SIGINT` (ctrl-c) and `SIGTERM` (systemd/Docker stop) drain for up to
   5 s, then exit; signal again to force-quit. During the drain workers
-  continue serving queued/in-flight (and newly arriving) requests until
-  the deadline; anything still running then is force-closed.
+  keep serving queued and in-flight requests until the deadline (an
+  instance that stays idle for ~0.3 s exits early); anything still
+  running at the deadline is force-closed.
 - Request bodies are buffered up to 16 MiB (needed for replay across
   failover); larger bodies get `413`.
 - Binds `127.0.0.1:11435` by default (`--addr` to change). The default port

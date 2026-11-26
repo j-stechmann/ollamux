@@ -283,9 +283,10 @@ Response headers identify the serving key
 (ctrl-c) or
 .B SIGTERM
 starts a graceful drain for up to 5 seconds before exit; workers keep
-serving queued/in-flight (and newly arriving) requests until the
-deadline, then anything still running is force-closed. A second signal
-force-quits immediately (exit code 130).
+serving queued and in-flight requests until the deadline (an instance
+that stays idle for about 0.3 seconds exits early), then anything still
+running is force-closed. A second signal force-quits immediately (exit
+code 130).
 .SH SECURITY
 The proxy has no authentication: anything that can reach the listen
 address can use your API quota. The default binds the loopback

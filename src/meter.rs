@@ -724,7 +724,7 @@ impl Meter {
                 bump_key(
                     keys,
                     "(unattributed)",
-                    "-",
+                    "(unattributed)",
                     "(unattributed)",
                     &s,
                     now,
@@ -1658,13 +1658,14 @@ fn absorb_usage(usage: &serde_json::Value, u: &mut UsageCounts) {
     let cached = usage
         .get("prompt_tokens_details")
         .and_then(|d| d.get("cached_tokens"))
+        .and_then(|x| x.as_u64())
         .or_else(|| {
             usage
                 .get("input_tokens_details")
                 .and_then(|d| d.get("cached_tokens"))
+                .and_then(|x| x.as_u64())
         })
-        .or_else(|| usage.get("cached_tokens"))
-        .and_then(|x| x.as_u64());
+        .or_else(|| usage.get("cached_tokens").and_then(|x| x.as_u64()));
     let total = usage.get("total_tokens").and_then(|x| x.as_u64());
 
     let mut have_input = false;
@@ -2086,9 +2087,12 @@ mod tests {
         let keys = v["keys"].as_array().unwrap();
         assert!(
             keys.iter().any(|r| {
-                r["account"] == "(unattributed)" && r["requests"] == serde_json::json!(2)
+                r["account"] == "(unattributed)"
+                    && r["suffix"] == "(unattributed)"
+                    && r["id"] == "(unattributed)"
+                    && r["requests"] == serde_json::json!(2)
             }),
-            "{v}"
+            "all three sentinels must match the documented shape: {v}"
         );
     }
 
@@ -2468,6 +2472,21 @@ mod tests {
         );
         assert!(u.reported);
         assert_eq!((u.input, u.output), (20, 12));
+    }
+
+    #[test]
+    fn null_cached_details_fall_back_to_the_next_cached_field() {
+        // A present-but-null cached field must not suppress a populated
+        // sibling: prompt_tokens_details wins only when it resolves to a
+        // number, then input_tokens_details, then the top-level field.
+        let u = parse_body_usage(
+            br#"{"usage":{"prompt_tokens":100,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":null},"input_tokens_details":{"cached_tokens":40}}}"#,
+        );
+        assert_eq!(u.cached, 40);
+        let u = parse_body_usage(
+            br#"{"usage":{"prompt_tokens":100,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":null},"input_tokens_details":{"cached_tokens":null},"cached_tokens":30}}"#,
+        );
+        assert_eq!(u.cached, 30);
     }
 
     #[test]
